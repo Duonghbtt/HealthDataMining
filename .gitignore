@@ -1,0 +1,43 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints
+
+# Environment / virtualenv
+env/
+venv/
+*.env
+*.venv
+*.pip
+*.conda
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Dataset lớn / tạm
+*.csv
+*.xlsx
+*.h5
+*.db
+*.sqlite
+data/
+datasets/
+
+# Output / models
+*.pkl
+*.joblib
+models/
+outputs/
+figures/
+charts/
+
+# VSCode / IDE settings
+.vscode/
+.idea/
