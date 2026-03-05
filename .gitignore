@@ -41,3 +41,6 @@ charts/
 # VSCode / IDE settings
 .vscode/
 .idea/
+
+# pkl
+*.pkl
