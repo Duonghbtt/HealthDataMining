@@ -42,5 +42,6 @@ charts/
 .vscode/
 .idea/
 
-# pkl
+artifacts/
 *.pkl
+*.log
