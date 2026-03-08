@@ -12,7 +12,7 @@
 
 *CS246 Data Mining + Recommender Systems · MIMIC-IV Dataset*
 
-[Tính năng](#-tính-năng) · [Kiến trúc](#-kiến-trúc-hệ-thống) · [Cài đặt](#-cài-đặt) · [Sử dụng](#-sử-dụng) · [Kết quả](#-kết-quả-thực-nghiệm) · [Nhóm](#-nhóm-thực-hiện)
+[Tính năng](#-tính-năng) · [Kiến trúc](#-kiến-trúc-hệ-thống) · [Cài đặt](#-cài-đặt) · [Nhóm](#-nhóm-thực-hiện)
 
 </div>
 
