@@ -273,7 +273,7 @@ clinrec/
 
 **Giảng viên hướng dẫn:** TS.Đặng Hoàng Long
 
-**Môn học:** CS246 - Mining Massive Datasets / Recommender Systems
+**Môn học:** Khai phá dữ liệu lớn
 
 **Trường:** Học viện Công nghệ Bưu chính Viễn thông (PTIT)
 
