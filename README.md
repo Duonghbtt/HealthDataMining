@@ -1,10 +1,13 @@
-# 🏥 Khai phá dữ liệu MIMIC-IV cho hỗ trợ quyết định lâm sàng
+# 🏥 ClinRec
 
 <div align="center">
 
+**Dynamic Temporal Patient Similarity + Safe Medication Recommendation**  
+**Cross-Patient Grouping + Counterfactual Explanation on MIMIC-IV**
+
 ![Python](https://img.shields.io/badge/Python-3.9+-3776AB?style=for-the-badge&logo=python&logoColor=white)
-![Scikit-learn](https://img.shields.io/badge/Scikit--learn-F7931E?style=for-the-badge&logo=scikit-learn&logoColor=white)
-![Streamlit](https://img.shields.io/badge/Streamlit-FF4B4B?style=for-the-badge&logo=streamlit&logoColor=white)
+![PyTorch](https://img.shields.io/badge/PyTorch-DeepLearning-EE4C2C?style=for-the-badge&logo=pytorch&logoColor=white)
+![Streamlit](https://img.shields.io/badge/Streamlit-Demo-FF4B4B?style=for-the-badge&logo=streamlit&logoColor=white)
 ![MIMIC-IV](https://img.shields.io/badge/Dataset-MIMIC--IV-00897B?style=for-the-badge)
 ![License](https://img.shields.io/badge/License-MIT-green?style=for-the-badge)
 
@@ -18,240 +21,300 @@
 
 ---
 
-## 📋 Tổng quan
+## 1. Tổng quan
 
-**ClinRec** là hệ thống hỗ trợ quyết định lâm sàng (Clinical Decision Support System) được xây dựng trên dữ liệu ICU thực tế từ bộ dữ liệu **MIMIC-IV**. Hệ thống tích hợp hai lớp kỹ thuật:
+**ClinRec** là một pipeline nghiên cứu end-to-end cho bài toán **safe medication recommendation** từ dữ liệu EHR nhiều lần khám. So với README cũ theo hướng tách rời các module khai phá dữ liệu và khuyến nghị, phiên bản hiện tại đã được cập nhật theo kiến trúc mở rộng mới:
 
-- **Lớp khai phá dữ liệu (CS246):** Similarity Search, Clustering, Frequent Pattern Mining
-- **Lớp khuyến nghị (RecSys):** Collaborative Filtering, Matrix Factorization, Sequential Recommendation
+- **Dynamic temporal patient similarity retrieval**
+- **Multi-granularity evidence selection**
+- **DDI-aware medication recommendation**
+- **Cross-patient grouping bằng hypergraph / clustering**
+- **Counterfactual + natural-language explanation**
 
-Khi bác sĩ nhập hồ sơ bệnh nhân mới, ClinRec tự động:
-1. Tìm các ca bệnh tương tự trong lịch sử
-2. Phân nhóm bệnh nhân theo đặc điểm bệnh lý
-3. Gợi ý phác đồ / thuốc phù hợp với giải thích rõ ràng
-4. Cảnh báo tương tác thuốc nguy hiểm
-5. Dự đoán xét nghiệm tiếp theo cần thực hiện
+Hệ thống không chỉ trả lời câu hỏi **"nên kê thuốc gì"**, mà còn hướng tới trả lời thêm:
 
-> ⚠️ **Lưu ý:** ClinRec là công cụ hỗ trợ nghiên cứu và học thuật, không thay thế quyết định lâm sàng của bác sĩ.
+1. **Ca nào trong lịch sử là bằng chứng?**
+2. **Bệnh nhân hiện tại thuộc nhóm lâm sàng nào?**
+3. **Nếu một vài đặc trưng thay đổi, khuyến nghị có đổi không?**
 
----
-
-## ✨ Tính năng
-
-| Module | Kỹ thuật | Chức năng |
-|--------|----------|-----------|
-| 🔍 **Patient Similarity** | Shingling · MinHash · LSH | Tìm Top-K bệnh nhân giống nhất |
-| 🗂️ **Patient Clustering** | K-means · Cosine Similarity | Phân nhóm bệnh nhân theo bệnh lý |
-| 📊 **Pattern Mining** | FP-Growth · Association Rules | Khai phá mẫu phác đồ phổ biến |
-| 💊 **Drug Recommender** | UserCF · ItemCF · SVD | Gợi ý thuốc cá nhân hóa + giải thích |
-| ⚠️ **Risk Alert** | Association Rules | Cảnh báo tương tác thuốc nguy hiểm |
-| 🔬 **Next Lab Predictor** | Markov Chain · Co-occurrence | Dự đoán xét nghiệm tiếp theo |
+> ⚠️ **Lưu ý:** Dự án phục vụ mục đích nghiên cứu và học thuật. Đây không phải là hệ thống triển khai lâm sàng thực tế và không thay thế quyết định chuyên môn của bác sĩ.
 
 ---
 
-## 🏗️ Kiến trúc hệ thống
+## 2. Bài toán
 
-```
-INPUT: Hồ sơ bệnh nhân mới
-         │
-         ├──────────────────────────────────────────┐
-         ▼                                          ▼
-┌─────────────────────┐              ┌──────────────────────┐
-│  MODULE 1           │              │  MODULE 2            │
-│  SIMILARITY (CS246) │              │  CLUSTERING (CS246)  │
-│  Shingling→MinHash  │              │  K-means + Cosine    │
-│  →LSH               │              │                      │
-│  Output: Top-K BN   │              │  Output: Cluster ID  │
-└──────────┬──────────┘              └───────────┬──────────┘
-           │                                     │
-           │         ┌───────────────────┐        │
-           │         │  MODULE 3         │        │
-           │         │  FP-GROWTH(CS246) │        │
-           │         │  Frequent Mining  │        │
-           │         │  Output: Rules    │        │
-           │         └────────┬──────────┘        │
-           │                  │                   │
-           └──────────────────┼───────────────────┘
-                              ▼
-              ┌───────────────────────────────┐
-              │   INTEGRATION LAYER           │
-              │   Similar patients +          │
-              │   Cluster context +           │
-              │   Association Rules           │
-              └───────────────┬───────────────┘
-                              │
-              ┌───────────────┴───────────────┐
-              ▼                               ▼
-  ┌───────────────────────┐     ┌─────────────────────────┐
-  │  MODULE 4             │     │  MODULE 6               │
-  │  RECOMMENDER (RecSys) │     │  SEQUENTIAL (RecSys)    │
-  │  UserCF+ItemCF+SVD    │     │  Markov Chain           │
-  │  Output: Top-N thuốc  │     │  Output: Next lab test  │
-  └───────────┬───────────┘     └─────────────────────────┘
-              │
-              ▼
-  ┌───────────────────────┐
-  │  MODULE 5             │
-  │  RISK ALERT           │
-  │  (CS246 + RecSys)     │
-  │  Output: ⚠️ Cảnh báo  │
-  └───────────────────────┘
-              │
-              ▼
-     STREAMLIT DASHBOARD
-  Gợi ý + Giải thích + Cảnh báo
-```
+Cho một bệnh nhân tại thời điểm $t$ với dữ liệu lâm sàng hiện tại và lịch sử trước đó:
+
+- diagnosis codes
+- procedure codes
+- lab results
+- vital signs
+- medication history
+- time features
+
+mục tiêu của hệ thống là dự đoán:
+
+- **tập thuốc phù hợp** cho lần khám hiện tại,
+- đồng thời cung cấp:
+  - **Top-K ca bệnh tương tự**,
+  - **group / cohort evidence**,
+  - **cảnh báo DDI**,
+  - **giải thích bằng evidence và counterfactual**.
 
 ---
 
-## 📊 Dataset — MIMIC-IV
+## 3. Đóng góp chính
 
-Dự án sử dụng **[MIMIC-IV](https://physionet.org/content/mimiciv/)** — bộ dữ liệu ICU lớn nhất thế giới công bố công khai cho nghiên cứu học thuật.
-
-| Bảng dữ liệu | Nội dung | Số bản ghi (ước tính) |
-|---|---|---|
-| `patients` | Thông tin cơ bản bệnh nhân | ~315,000 |
-| `admissions` | Lịch sử nhập viện | ~431,000 |
-| `diagnoses_icd` | Chẩn đoán ICD-9/10 | ~4,900,000 |
-| `prescriptions` | Đơn thuốc | ~15,000,000 |
-| `labevents` | Kết quả xét nghiệm | ~122,000,000 |
-| `procedures_icd` | Quy trình điều trị | ~670,000 |
-
-### Cách lấy dataset
-
-> MIMIC-IV yêu cầu đăng ký tài khoản PhysioNet và hoàn thành khóa đào tạo CITI.
-
-1. Đăng ký tại [PhysioNet.org](https://physionet.org/register/)
-2. Hoàn thành **CITI Data or Specimens Only Research** training (~2–3 giờ)
-3. Yêu cầu quyền truy cập MIMIC-IV tại [trang dự án](https://physionet.org/content/mimiciv/2.2/)
-4. Tải về và đặt vào thư mục `data/mimic-iv/`
+- Mã hóa **trạng thái bệnh nhân theo thời gian** thay vì xử lý từng visit độc lập.
+- Truy hồi **ca bệnh tương tự có điều kiện thời gian** bằng cosine similarity kết hợp temporal decay.
+- Chọn lọc **self-history**, **neighbor-history** và **group evidence** thay vì dùng toàn bộ lịch sử thô.
+- Tối ưu **drug recommendation đa nhãn có kiểm soát DDI**.
+- Mở rộng từ evidence mức cá thể sang **cross-patient grouping** bằng hypergraph.
+- Bổ sung **counterfactual explanation** để tăng interpretability và giảm over-reliance.
 
 ---
 
-## 🚀 Cài đặt
+## 4. Kiến trúc hệ thống
 
-### Yêu cầu hệ thống
-- Python 3.9+
-- RAM ≥ 16GB (để xử lý MIMIC-IV đầy đủ)
-- Disk ≥ 50GB
+### 4.1. Pipeline mức cao
 
-### 1. Clone repository
-
-```bash
-git clone https://github.com/your-username/clinrec.git
-cd clinrec
+```text
+Input EHR tại thời điểm hiện tại
+  → Module 1. Clinical Input & Temporal Representation
+  → Module 2. Dynamic Patient State Encoder
+  → Module 3. Dynamic Patient Graph / Retrieval Index
+  → Module 4. Cross-Patient Hypergraph Grouping
+  → Module 5. Multi-Granularity Evidence Selection
+  → Module 6. Joint Drug Recommendation
+  → Module 7. Safety & DDI Control
+  → Module 8. Counterfactual + Natural-Language Explanation
+  → Output: Thuốc + ca tương tự + nhóm bệnh nhân + giải thích + cảnh báo DDI
 ```
 
-### 2. Tạo môi trường ảo
+### 4.2. Các module chính
 
-```bash
-python -m venv venv
-source venv/bin/activate        # Linux/Mac
-venv\Scripts\activate           # Windows
-```
+1. **Clinical Input & Temporal Representation**  
+   Chuẩn hóa diagnosis / procedure / labs / vitals / medication history / time features thành biểu diễn visit-level $z_{p}^{t}$.
 
-### 3. Cài đặt dependencies
+2. **Dynamic Patient State Encoder**  
+   Mã hóa chuỗi visits thành patient state động $h_{p}^{t}$ bằng GRU hoặc temporal encoder.
 
-```bash
-pip install -r requirements.txt
-```
+3. **Dynamic Patient Graph / Retrieval Index**  
+   Truy hồi Top-$K$ ca bệnh tương tự theo trạng thái động bằng cosine similarity, temporal decay và ANN/FAISS.
 
-### 4. Cấu hình đường dẫn dataset
+4. **Cross-Patient Hypergraph Grouping**  
+   Tạo group embedding, cluster hoặc hyperedge từ các neighbor và pattern lâm sàng để sinh cohort-level evidence.
 
-```bash
-cp config/config.example.yaml config/config.yaml
-# Chỉnh sửa đường dẫn MIMIC-IV trong config.yaml
-```
+5. **Multi-Granularity Evidence Selection**  
+   Chọn self-history, neighbor-history và group evidence ở mức visit và attribute.
+
+6. **Joint Drug Recommendation**  
+   Hợp nhất current state $h_{p}^{t}$ và selected evidences để dự đoán drug logits hoặc regimen context.
+
+7. **Safety & DDI Control**  
+   Thêm DDI-aware regularization và/hoặc constrained decoding để giảm tương tác thuốc nguy hiểm.
+
+8. **Counterfactual & NL Explanation**  
+   Sinh giải thích dạng evidence-based và nếu-thì bằng perturbation hoặc prototype comparison.
+
+### 4.3. Ký hiệu chính
+
+- Visit representation: $z_{p}^{t}$
+- Dynamic patient state: $h_{p}^{t}$
+- Medication probability vector: $\hat{y}_{p}^{t}$
+- Retrieved neighbor set: $\mathcal{N}_{p}^{t}$
+- Group embedding / cluster label: $c_{p}^{t}$ hoặc $g_{p}^{t}$
+- Selected evidence set: $\mathcal{E}_{p}^{t}$
+- Counterfactual explanation: $\mathrm{CF}_{p}^{t}$
+
+### 4.4. Input / Output toàn hệ thống
+
+**Input**
+
+$$
+x_{p}^{t} = \{\text{diagnosis},\ \text{procedure},\ \text{labs},\ \text{vitals},\ \text{medication history},\ \text{time features}\}
+$$
+
+$$
+\mathcal{D}_{\text{hist}} = \{X_{q}\}_{q=1}^{N}
+$$
+
+**Output**
+
+1. **Vector xác suất thuốc**
+
+$$
+\hat{y}_{p}^{t}
+$$
+
+2. **Top-$K$ ca tương tự**
+
+$$
+\mathcal{N}_{p}^{t} = \{(q, \tau, s)\}_{k=1}^{K}
+$$
+
+3. **Group embedding hoặc cluster label**
+
+$$
+c_{p}^{t} \quad \text{hoặc} \quad g_{p}^{t}
+$$
+
+4. **Selected self / neighbor / group evidence**
+
+$$
+\mathcal{E}_{p}^{t}
+$$
+
+5. **Counterfactual explanation + alternative recommendation**
+
+$$
+\mathrm{CF}_{p}^{t}
+$$
 
 ---
 
-## 📁 Cấu trúc thư mục
+## 5. Dataset
 
-```
+Dự án sử dụng **MIMIC-IV** từ PhysioNet.
+
+- Trang dataset: https://physionet.org/content/mimiciv/
+- Để truy cập cần tài khoản PhysioNet và hoàn thành training theo yêu cầu của dự án.
+
+### Các bảng thường dùng
+
+- `patients`
+- `admissions`
+- `icustays`
+- `transfers`
+- `diagnoses_icd`
+- `procedures_icd`
+- `labevents`
+- `chartevents`
+- `prescriptions`
+- `emar`, `emar_detail`, `pharmacy`
+
+> Dữ liệu gốc **không commit lên git**. Chỉ lưu trong `data/raw/mimic-iv/`.
+
+---
+
+## 6. Cấu trúc thư mục mới
+
+Cấu trúc dưới đây đã được cập nhật để khớp với bản **thuyết minh đầy đủ cấu trúc thư mục, chức năng file, luồng gọi và lộ trình xây dựng**.
+
+```text
 clinrec/
 ├── data/
-│   ├── mimic-iv/              # Dataset gốc (không commit lên git)
-│   │   ├── patients.csv
-│   │   ├── admissions.csv
-│   │   ├── diagnoses_icd.csv
-│   │   ├── prescriptions.csv
-│   │   └── labevents.csv
-│   └── test_data/             # Mock data để test nhanh
-│       ├── patients_db.json
-│       ├── module1_similarity_input.json
-│       ├── module2_clustering_input.json
-│       └── ...
-│
+│   ├── raw/
+│   │   └── mimic-iv/
+│   ├── interim/
+│   │   ├── cohort/
+│   │   ├── trajectories/
+│   │   └── vocab/
+│   ├── processed/
+│   │   ├── train/
+│   │   ├── val/
+│   │   ├── test/
+│   │   └── ddi/
+│   └── artifacts/
+│       ├── memory_bank/
+│       ├── faiss/
+│       └── hypergraph/
+├── configs/
+│   ├── data.yaml
+│   ├── model.yaml
+│   ├── train.yaml
+│   └── eval.yaml
 ├── src/
-│   ├── preprocessing/
-│   │   ├── data_loader.py     # Load & join MIMIC-IV tables
-│   │   ├── feature_engineer.py # ICD encoding, lab normalization
-│   │   └── cleaner.py
-│   │
-│   ├── module1_similarity/
-│   │   ├── shingling.py       # k-shingle generation
-│   │   ├── minhash.py         # MinHash signature matrix
-│   │   ├── lsh.py             # LSH banding + querying
-│   │   └── evaluate.py        # Precision vs brute-force
-│   │
-│   ├── module2_clustering/
-│   │   ├── kmeans_patient.py  # K-means on patient vectors
-│   │   ├── cluster_viz.py     # PCA + t-SNE visualization
-│   │   └── evaluate.py        # Silhouette, Davies-Bouldin
-│   │
-│   ├── module3_fpgrowth/
-│   │   ├── transactions.py    # Build transaction sets
-│   │   ├── fpgrowth_mine.py   # FP-Growth implementation
-│   │   ├── rules.py           # Association rule generation
-│   │   └── evaluate.py        # Support/confidence/lift analysis
-│   │
-│   ├── module4_recommender/
-│   │   ├── user_cf.py         # User-based Collaborative Filtering
-│   │   ├── item_cf.py         # Item-based Collaborative Filtering
-│   │   ├── svd_model.py       # Matrix Factorization (SVD)
-│   │   ├── hybrid.py          # SVD + Cluster context filter
-│   │   ├── explainer.py       # Generate recommendation explanations
-│   │   └── evaluate.py        # Precision@K, Recall@K, NDCG, Hit Rate
-│   │
-│   ├── module5_riskalert/
-│   │   ├── risk_rules.py      # Filter high-risk association rules
-│   │   └── alert_engine.py    # Match patient drugs to risk rules
-│   │
-│   └── module6_sequential/
-│       ├── markov_chain.py    # Build Markov transition matrix
-│       ├── cooccurrence.py    # Lab co-occurrence matrix
-│       └── evaluate.py        # Accuracy@1, Hit Rate@3
-│
-├── app/
-│   ├── streamlit_app.py       # Main Streamlit dashboard
-│   ├── components/
-│   │   ├── patient_input.py
-│   │   ├── similarity_panel.py
-│   │   ├── recommender_panel.py
-│   │   └── risk_panel.py
-│   └── assets/
-│
+│   ├── data/
+│   │   ├── load_mimic.py
+│   │   ├── build_cohort.py
+│   │   ├── build_trajectories.py
+│   │   ├── build_vocab.py
+│   │   ├── build_ddi_matrix.py
+│   │   └── dataset.py
+│   ├── features/
+│   │   ├── diagnosis_encoder.py
+│   │   ├── procedure_encoder.py
+│   │   ├── lab_processor.py
+│   │   ├── vital_processor.py
+│   │   └── medication_history.py
+│   ├── models/
+│   │   ├── patient_state_encoder.py
+│   │   ├── temporal_similarity.py
+│   │   ├── history_selector.py
+│   │   ├── fusion.py
+│   │   ├── medication_decoder.py
+│   │   ├── ddi_regularization.py
+│   │   └── full_model.py
+│   ├── retrieval/
+│   │   ├── memory_bank.py
+│   │   ├── topk_retriever.py
+│   │   ├── faiss_index.py
+│   │   └── dynamic_graph.py
+│   ├── graph/
+│   │   ├── hypergraph_builder.py
+│   │   ├── hypergraph_layers.py
+│   │   └── group_encoder.py
+│   ├── explainability/
+│   │   ├── attention_export.py
+│   │   ├── similar_case_report.py
+│   │   ├── counterfactual.py
+│   │   └── nl_explainer.py
+│   ├── training/
+│   │   ├── losses.py
+│   │   ├── trainer.py
+│   │   ├── train_core.py
+│   │   └── train_extended.py
+│   ├── evaluation/
+│   │   ├── metrics.py
+│   │   ├── evaluate_core.py
+│   │   ├── evaluate_ablation.py
+│   │   ├── evaluate_safety.py
+│   │   └── evaluate_subgroup.py
+│   └── utils/
+│       ├── seed.py
+│       ├── logger.py
+│       ├── io.py
+│       └── device.py
 ├── notebooks/
-│   ├── 01_EDA_MIMIC4.ipynb
-│   ├── 02_Module1_Similarity.ipynb
-│   ├── 03_Module2_Clustering.ipynb
-│   ├── 04_Module3_FPGrowth.ipynb
-│   ├── 05_Module4_Recommender.ipynb
-│   ├── 06_Module5_RiskAlert.ipynb
-│   └── 07_Module6_Sequential.ipynb
-│
+│   ├── 01_eda_mimic_iv.ipynb
+│   ├── 02_build_cohort.ipynb
+│   ├── 03_train_base.ipynb
+│   ├── 04_train_tempsim.ipynb
+│   ├── 05_train_full_core.ipynb
+│   ├── 06_hypergraph_extension.ipynb
+│   └── 07_counterfactual_cases.ipynb
+├── scripts/
+│   ├── preprocess.ps1
+│   ├── train_core.ps1
+│   ├── train_extended.ps1
+│   └── evaluate.ps1
 ├── tests/
-│   ├── test_module1.py
-│   ├── test_module2.py
-│   ├── test_module3.py
-│   ├── test_module4.py
-│   ├── test_module5.py
-│   └── test_module6.py
-│
-├── config/
-│   ├── config.example.yaml
-│   └── config.yaml            # (gitignored)
-│
+│   ├── test_data.py
+│   ├── test_encoder.py
+│   ├── test_retrieval.py
+│   ├── test_history_selector.py
+│   ├── test_fusion.py
+│   ├── test_decoder.py
+│   └── test_counterfactual.py
+├── app/
+│   ├── streamlit_app.py
+│   ├── pages/
+│   │   ├── 1_similar_cases.py
+│   │   ├── 2_recommendation.py
+│   │   ├── 3_safety_ddi.py
+│   │   └── 4_counterfactual.py
+│   └── components/
+│       ├── patient_form.py
+│       ├── similarity_panel.py
+│       ├── recommendation_panel.py
+│       └── explanation_panel.py
+├── outputs/
+│   ├── checkpoints/
+│   ├── logs/
+│   ├── predictions/
+│   ├── figures/
+│   └── reports/
 ├── requirements.txt
 ├── .gitignore
 └── README.md
@@ -259,25 +322,413 @@ clinrec/
 
 ---
 
+## 7. Luồng gọi chính giữa các module
 
+### 7.1. Pha dữ liệu
 
+```text
+load_mimic.py
+  → build_cohort.py
+  → build_vocab.py / build_ddi_matrix.py
+  → build_trajectories.py
+  → dataset.py
+```
 
-## 👥 Nhóm thực hiện
+### 7.2. Pha core model
 
-| Thành viên       | MSSV       | Phụ trách |
-|------------------|------------|---|
-| Bùi Đức Đại      | B22DCKH025 | Module 1 (Similarity) + Module 4 (Recommender)|
-| Đỗ Mạnh Cường    | B22DCKH011 | Module 2 (Clustering)|
-| Nguyễn Thế Dương | B22DCKH023 | Module 6 (Sequential)|
-| Nguyễn Văn Phúc  | B22DCKH089 | Module 3 (FP-Growth) + Module 5 (Risk Alert)|
+```text
+patient_state_encoder.py
+  → temporal_similarity.py
+  → memory_bank.py / topk_retriever.py
+  → history_selector.py
+  → fusion.py
+  → medication_decoder.py
+  → ddi_regularization.py
+  → full_model.py
+```
 
-**Giảng viên hướng dẫn:** TS.Đặng Hoàng Long
+### 7.3. Pha train
 
 **Môn học:** Khai phá dữ liệu lớn
 
-**Trường:** Học viện Công nghệ Bưu chính Viễn thông (PTIT)
+### 7.4. Pha đánh giá
+
+```text
+metrics.py
+  → evaluate_core.py
+  → evaluate_ablation.py / evaluate_safety.py / evaluate_subgroup.py
+```
+
+### 7.5. Pha mở rộng
+
+```text
+dynamic_graph.py
+  → hypergraph_builder.py
+  → hypergraph_layers.py
+  → group_encoder.py
+  → counterfactual.py
+  → nl_explainer.py
+```
+
+### 7.6. Pha demo
+
+```text
+streamlit_app.py
+  → pages/*
+  → components/*
+```
 
 ---
 
+## 8. Cài đặt môi trường
 
+### Yêu cầu tối thiểu
 
+- Python 3.9+
+- Khuyến nghị dùng môi trường ảo
+- RAM đủ lớn để xử lý cohort và trajectory từ MIMIC-IV
+- GPU là tùy chọn, nhưng hữu ích khi train extended model
+
+### Clone repo
+
+```bash
+git clone https://github.com/your-username/clinrec.git
+cd clinrec
+```
+
+### Tạo môi trường ảo
+
+```bash
+python -m venv .venv
+```
+
+**Windows**
+
+```bash
+.venv\Scripts\activate
+```
+
+**Linux / macOS**
+
+```bash
+source .venv/bin/activate
+```
+
+### Cài dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+---
+
+## 9. Chuẩn bị dữ liệu
+
+### Bước 1. Đặt MIMIC-IV vào đúng thư mục
+
+```text
+data/raw/mimic-iv/
+```
+
+### Bước 2. Kiểm tra cấu hình dữ liệu
+
+Chỉnh các file sau cho phù hợp với máy của bạn:
+
+- `configs/data.yaml`
+- `configs/model.yaml`
+- `configs/train.yaml`
+- `configs/eval.yaml`
+
+### Bước 3. Chạy preprocessing
+
+**PowerShell**
+
+```powershell
+./scripts/preprocess.ps1
+```
+
+Hoặc chạy từng bước bằng Python:
+
+```bash
+python -m src.data.build_cohort
+python -m src.data.build_vocab
+python -m src.data.build_ddi_matrix
+python -m src.data.build_trajectories
+```
+
+Sau bước này, các thư mục quan trọng cần xuất hiện:
+
+- `data/interim/cohort/`
+- `data/interim/trajectories/`
+- `data/interim/vocab/`
+- `data/processed/train/`
+- `data/processed/val/`
+- `data/processed/test/`
+- `data/processed/ddi/`
+
+---
+
+## 10. Huấn luyện
+
+### 10.1. Train bản core
+
+```powershell
+./scripts/train_core.ps1
+```
+
+hoặc:
+
+```bash
+python -m src.training.train_core
+```
+
+### 10.2. Train bản mở rộng
+
+```powershell
+./scripts/train_extended.ps1
+```
+
+hoặc:
+
+```bash
+python -m src.training.train_extended
+```
+
+### 10.3. Loss tổng quát
+
+$$
+\mathcal{L} = \mathcal{L}_{\text{pred}} + \lambda_{\text{ddi}}\,\mathcal{L}_{\text{ddi}} + \lambda_{\text{sim}}\,\mathcal{L}_{\text{sim}} + \lambda_{\text{cf}}\,\mathcal{L}_{\text{cf}}
+$$
+
+Trong đó:
+
+- $\mathcal{L}_{\text{pred}}$: prediction loss cho multi-label medication recommendation
+- $\mathcal{L}_{\text{ddi}}$: regularization cho drug-drug interaction
+- $\mathcal{L}_{\text{sim}}$: regularization cho retrieval / structure stability nếu dùng
+- $\mathcal{L}_{\text{cf}}$: loss cho explanation branch nếu huấn luyện đồng thời
+- $\lambda_{\text{ddi}}, \lambda_{\text{sim}}, \lambda_{\text{cf}}$: các hệ số trade-off giữa accuracy, safety, retrieval stability và explanation
+
+---
+
+## 11. Đánh giá
+
+### Các metric chính
+
+- Jaccard
+- F1 Score
+- PRAUC
+- DDI Rate
+- Avg #Drugs
+
+### Chạy đánh giá
+
+```powershell
+./scripts/evaluate.ps1
+```
+
+hoặc:
+
+```bash
+python -m src.evaluation.evaluate_core
+python -m src.evaluation.evaluate_ablation
+python -m src.evaluation.evaluate_safety
+python -m src.evaluation.evaluate_subgroup
+```
+
+### Các nhóm so sánh ablation
+
+- Base
+- TempSim
+- SelfSel
+- NbrSel
+- Full Core
+- Extended
+
+---
+
+## 12. Demo ứng dụng
+
+Sau khi đã có checkpoint ổn định:
+
+```bash
+streamlit run app/streamlit_app.py
+```
+
+Các trang chính:
+
+- `1_similar_cases.py`: hiển thị Top-K ca bệnh tương tự
+- `2_recommendation.py`: hiển thị thuốc gợi ý
+- `3_safety_ddi.py`: hiển thị cảnh báo DDI
+- `4_counterfactual.py`: hiển thị giải thích counterfactual
+
+---
+
+## 13. Lộ trình xây dựng khuyến nghị
+
+### Pha 1 — Khóa dữ liệu và tiền xử lý
+
+- `load_mimic.py`
+- `build_cohort.py`
+- `build_vocab.py`
+- `build_ddi_matrix.py`
+- `build_trajectories.py`
+- `dataset.py`
+
+**Điều kiện đạt:** cohort sạch, vocab ổn định, DDI matrix đúng kích thước, batch đầu tiên load được.
+
+### Pha 2 — Dựng baseline nhỏ nhất
+
+- `patient_state_encoder.py`
+- `medication_decoder.py`
+- `losses.py`
+- `metrics.py`
+
+**Điều kiện đạt:** train được 1–2 epoch, loss giảm, metric tính được.
+
+### Pha 3 — Thêm retrieval
+
+- `temporal_similarity.py`
+- `memory_bank.py`
+- `topk_retriever.py`
+
+**Điều kiện đạt:** Top-K hợp lý, phân biệt được static và temporal retrieval.
+
+### Pha 4 — Thêm selection và fusion
+
+- `history_selector.py`
+- `fusion.py`
+- `full_model.py`
+
+**Điều kiện đạt:** full core forward pass chạy end-to-end.
+
+### Pha 5 — Huấn luyện và đánh giá core
+
+- `trainer.py`
+- `train_core.py`
+- `evaluate_core.py`
+- `evaluate_ablation.py`
+- `evaluate_safety.py`
+
+**Điều kiện đạt:** có checkpoint tốt nhất, bảng metric, ablation và safety report.
+
+### Pha 6 — Mở rộng hypergraph và explanation
+
+- `dynamic_graph.py`
+- `hypergraph_builder.py`
+- `hypergraph_layers.py`
+- `group_encoder.py`
+- `counterfactual.py`
+- `nl_explainer.py`
+
+**Điều kiện đạt:** extended model có thêm cohort evidence và case study explainability.
+
+### Pha 7 — Script hóa, test hóa và demo
+
+- `scripts/*`
+- `tests/*`
+- `app/*`
+- `README.md`
+
+**Điều kiện đạt:** người khác clone repo vẫn có thể cài, chạy preprocess tối thiểu, train, evaluate và xem demo.
+
+---
+
+## 14. Kiểm thử
+
+Các test chính:
+
+- `tests/test_data.py`
+- `tests/test_encoder.py`
+- `tests/test_retrieval.py`
+- `tests/test_history_selector.py`
+- `tests/test_fusion.py`
+- `tests/test_decoder.py`
+- `tests/test_counterfactual.py`
+
+Khuyến nghị chạy test sớm theo từng pha thay vì để cuối kỳ.
+
+---
+
+## 15. Baselines và paper liên quan
+
+### Nhóm baseline / papers nên so sánh
+
+- GAMENet
+- SafeDrug
+- MICRON
+- COGNet
+- MoleRec
+- DAPSNet
+- VITA
+- RaVSNet
+- HypeMed
+
+### Gợi ý theo module
+
+- **Temporal encoding:** RETAIN, BEHRT, Med-BERT
+- **Temporal retrieval:** DAPSNet, RaVSNet, FAISS
+- **Hypergraph grouping:** HGNN, HypeMed, BH³-MedRec
+- **Evidence selection:** VITA, REFINE, COGNet
+- **DDI-aware objective:** SafeDrug, MoleRec
+- **Counterfactual explanation:** DiCE và các paper CF cho Clinical AI / EHR
+
+---
+
+## 16. Artifact đầu ra
+
+Sau khi train / evaluate, các kết quả được lưu tại:
+
+```text
+outputs/
+├── checkpoints/
+├── logs/
+├── predictions/
+├── figures/
+└── reports/
+```
+
+Đây là nơi lưu:
+
+- checkpoint tốt nhất
+- log huấn luyện
+- prediction export
+- biểu đồ loss / metric / ablation
+- báo cáo tổng hợp cuối cùng
+
+---
+
+## 17. Thành viên nhóm
+
+| Thành viên | Vai trò chính |
+|---|---|
+| Bùi Đức Đại | Data + Features + Patient State Encoder |
+| Đỗ Mạnh Cường | Temporal Similarity + Retrieval + Dynamic Graph |
+| Nguyễn Văn Phúc | History Selection + Fusion + Hypergraph + Ablation |
+| Nguyễn Thế Dương | Decoder + Training + Evaluation + Counterfactual + App |
+
+---
+
+## 18. Ghi chú sử dụng repo
+
+- Không commit dữ liệu gốc MIMIC-IV.
+- Không commit checkpoint lớn, log tạm, cache và file nhạy cảm.
+- Chỉ bắt đầu phần **hypergraph**, **counterfactual** và **app** sau khi core pipeline đã ổn định.
+- Logic production nên nằm trong `src/` và `scripts/`, không để notebook là nơi duy nhất chứa code chính.
+
+---
+
+## 19. License
+
+MIT License
+
+---
+
+## 20. Citation
+
+Nếu bạn sử dụng repo hoặc ý tưởng từ dự án này cho báo cáo / nghiên cứu, hãy trích dẫn repo và các paper baseline liên quan trong phần tài liệu tham khảo.
+
+---
+
+## 21. Disclaimer
+
+ClinRec là hệ thống nghiên cứu phục vụ học thuật. Mọi đầu ra của hệ thống chỉ mang tính chất hỗ trợ phân tích và không được xem là chỉ định lâm sàng thực tế.
