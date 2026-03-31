@@ -1,0 +1,18 @@
+model:
+  hidden_dim: 128
+  num_layers: 1
+  dropout: 0.1
+
+embedding:
+  diag_dim: 128
+  proc_dim: 128
+  drug_dim: 128
+  lab_dim: 64
+  vital_dim: 64
+
+sequence:
+  rnn_type: gru
+  bidirectional: false
+
+training:
+  device: cuda

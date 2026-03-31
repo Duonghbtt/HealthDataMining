@@ -28,14 +28,14 @@ features:
 spark:
   enabled: true
   master: local[4]
-  driver_memory: 3g
-  default_parallelism: 8
-  sql_shuffle_partitions: 24
+  driver_memory: 4g
+  default_parallelism: 4
+  sql_shuffle_partitions: 8
   adaptive_enabled: true
   adaptive_coalesce_enabled: true
   files_max_partition_bytes: 64m
   local_dir: /tmp/healthdm-spark
   stage_cache_dir: data/interim/spark_cache
   cache_codec: snappy
-  trajectory_rows_per_file: 2048
+  trajectory_rows_per_file: 8192
   max_open_shards_per_dataset: 2
