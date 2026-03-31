@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import gzip
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Iterator, Mapping
@@ -26,6 +27,46 @@ TABLE_PATHS = {
     "icustays": ("icu", "icustays.csv.gz"),
     "chartevents": ("icu", "chartevents.csv.gz"),
     "d_items": ("icu", "d_items.csv.gz"),
+}
+
+SPARK_DEFAULTS = {
+    "enabled": True,
+    "master": "local[4]",
+    "driver_memory": "3g",
+    "default_parallelism": 8,
+    "sql_shuffle_partitions": 24,
+    "adaptive_enabled": True,
+    "adaptive_coalesce_enabled": True,
+    "files_max_partition_bytes": "64m",
+    "local_dir": "/tmp/healthdm-spark",
+    "stage_cache_dir": "data/interim/spark_cache",
+    "cache_codec": "snappy",
+    "trajectory_rows_per_file": 2048,
+    "max_open_shards_per_dataset": 2,
+}
+
+SPARK_TABLE_COLUMNS = {
+    "icustays": ["subject_id", "hadm_id", "stay_id", "intime", "outtime"],
+    "patients": ["subject_id", "gender", "anchor_age", "anchor_year"],
+    "admissions": [
+        "subject_id",
+        "hadm_id",
+        "admission_type",
+        "insurance",
+        "language",
+        "marital_status",
+        "race",
+        "hospital_expire_flag",
+    ],
+    "diagnoses_icd": ["hadm_id", "icd_code", "icd_version"],
+    "procedures_icd": ["hadm_id", "chartdate", "icd_code", "icd_version"],
+    "labevents": ["hadm_id", "charttime", "itemid", "valuenum"],
+    "d_labitems": ["itemid", "label", "category", "fluid"],
+    "prescriptions": ["hadm_id", "drug", "formulary_drug_cd", "starttime", "stoptime"],
+    "emar": ["hadm_id", "medication", "charttime", "scheduletime", "storetime"],
+    "pharmacy": ["hadm_id", "medication", "starttime", "verifiedtime", "entertime"],
+    "chartevents": ["stay_id", "charttime", "itemid", "valuenum"],
+    "d_items": ["itemid", "label", "category", "unitname"],
 }
 
 
@@ -129,3 +170,66 @@ def coerce_event_time(row: Mapping[str, str], candidate_fields: Iterable[str]):
         if dt_value is not None:
             return dt_value
     return None
+
+
+def spark_config(config: Mapping[str, object]) -> dict[str, object]:
+    merged = dict(SPARK_DEFAULTS)
+    merged.update(config.get("spark", {}) or {})
+    return merged
+
+
+def spark_enabled(config: Mapping[str, object]) -> bool:
+    return bool(spark_config(config).get("enabled", True))
+
+
+def build_spark_session(config: Mapping[str, object], *, app_name: str):
+    spark_cfg = spark_config(config)
+    try:
+        from pyspark.sql import SparkSession
+    except ImportError as exc:
+        raise RuntimeError(
+            "PySpark is required for Spark preprocessing. Install requirements.txt first."
+        ) from exc
+
+    os.environ.setdefault("SPARK_LOCAL_IP", "127.0.0.1")
+    os.environ.setdefault("SPARK_LOCAL_HOSTNAME", "localhost")
+
+    builder = (
+        SparkSession.builder.appName(app_name)
+        .master(str(spark_cfg["master"]))
+        .config("spark.driver.memory", str(spark_cfg["driver_memory"]))
+        .config("spark.driver.host", "127.0.0.1")
+        .config("spark.driver.bindAddress", "127.0.0.1")
+        .config("spark.default.parallelism", str(spark_cfg["default_parallelism"]))
+        .config("spark.sql.shuffle.partitions", str(spark_cfg["sql_shuffle_partitions"]))
+        .config("spark.sql.adaptive.enabled", str(spark_cfg["adaptive_enabled"]).lower())
+        .config(
+            "spark.sql.adaptive.coalescePartitions.enabled",
+            str(spark_cfg["adaptive_coalesce_enabled"]).lower(),
+        )
+        .config("spark.sql.files.maxPartitionBytes", str(spark_cfg["files_max_partition_bytes"]))
+        .config("spark.local.dir", str(spark_cfg["local_dir"]))
+        .config("spark.sql.parquet.compression.codec", str(spark_cfg["cache_codec"]))
+    )
+    return builder.getOrCreate()
+
+
+def read_table_spark(
+    spark,
+    paths: MIMICDataPaths,
+    table_name: str,
+    *,
+    columns: Iterable[str] | None = None,
+):
+    requested = list(columns) if columns else list(SPARK_TABLE_COLUMNS.get(table_name, ()))
+    dataframe = (
+        spark.read.option("header", True)
+        .option("inferSchema", False)
+        .csv(str(paths.table_path(table_name)))
+    )
+    if requested:
+        missing = [column for column in requested if column not in dataframe.columns]
+        if missing:
+            raise KeyError(f"Missing columns in {table_name}: {missing}")
+        dataframe = dataframe.select(*requested)
+    return dataframe

@@ -114,6 +114,30 @@ def read_json(path: str | Path) -> Any:
         return json.load(handle)
 
 
+def stable_json_dumps(payload: Any) -> str:
+    return json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+
+
+def fingerprint_payload(payload: Any, *, digest_size: int = 16) -> str:
+    return hashlib.blake2b(
+        stable_json_dumps(payload).encode("utf-8"),
+        digest_size=digest_size,
+    ).hexdigest()
+
+
+def fingerprint_path(path: str | Path) -> str:
+    source = Path(path)
+    if not source.exists():
+        raise FileNotFoundError(f"Cannot fingerprint missing path: {source}")
+    stat = source.stat()
+    payload = {
+        "path": str(source.resolve()),
+        "size": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+    }
+    return fingerprint_payload(payload)
+
+
 def write_jsonl_gz(path: str | Path, records: Iterable[Mapping[str, Any]]) -> Path:
     destination = Path(path)
     ensure_dir(destination.parent)
@@ -185,3 +209,19 @@ def hours_between(start: datetime | None, end: datetime | None) -> float:
     if start is None or end is None:
         return 0.0
     return max((end - start).total_seconds() / 3600.0, 0.0)
+
+
+def write_parquet_pylist(path: str | Path, records: Sequence[Mapping[str, Any]]) -> Path:
+    destination = Path(path)
+    ensure_dir(destination.parent)
+    try:
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+    except ImportError as exc:
+        raise RuntimeError(
+            "pyarrow is required for parquet output. Install dependencies from requirements.txt first."
+        ) from exc
+
+    table = pa.Table.from_pylist(list(records))
+    pq.write_table(table, destination, compression="snappy")
+    return destination

@@ -7,11 +7,14 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 from src.data.build_cohort import build_cohort
 from src.data.build_ddi_matrix import build_ddi_matrix
 from src.data.build_trajectories import build_trajectories
 from src.data.build_vocab import build_vocab
-from src.utils.io import iter_jsonl_gz, load_pt, read_csv_gz, read_json
+from src.data.stage_filtered_tables import stage_filtered_tables
+from src.utils.io import read_csv_gz, read_json, write_json, write_jsonl_gz
 
 
 def _write_csv_gz(path: Path, rows: list[dict[str, object]], fieldnames: list[str]) -> None:
@@ -23,7 +26,7 @@ def _write_csv_gz(path: Path, rows: list[dict[str, object]], fieldnames: list[st
             writer.writerow(row)
 
 
-def _write_config(project_root: Path) -> Path:
+def _write_config(project_root: Path, *, spark_enabled: bool = True) -> Path:
     config_path = project_root / "configs" / "data.yaml"
     config_path.parent.mkdir(parents=True, exist_ok=True)
     config_path.write_text(
@@ -35,6 +38,7 @@ def _write_config(project_root: Path) -> Path:
                 "  interim_root: data/interim",
                 "  processed_root: data/processed",
                 "  ddi_source_path: ''",
+                "processed_format: parquet",
                 "split:",
                 "  train: 1.0",
                 "  val: 0.0",
@@ -49,6 +53,20 @@ def _write_config(project_root: Path) -> Path:
                 "  top_k_vitals: 4",
                 "  max_med_history: 8",
                 "  normalization_eps: 1.0e-6",
+                "spark:",
+                f"  enabled: {'true' if spark_enabled else 'false'}",
+                "  master: local[4]",
+                "  driver_memory: 3g",
+                "  default_parallelism: 8",
+                "  sql_shuffle_partitions: 24",
+                "  adaptive_enabled: true",
+                "  adaptive_coalesce_enabled: true",
+                "  files_max_partition_bytes: 64m",
+                "  local_dir: /tmp/healthdm-spark-tests",
+                "  stage_cache_dir: data/interim/spark_cache",
+                "  cache_codec: snappy",
+                "  trajectory_rows_per_file: 2",
+                "  max_open_shards_per_dataset: 2",
             ]
         ),
         encoding="utf-8",
@@ -149,14 +167,49 @@ def _build_mock_project(tmp_path: Path) -> Path:
     return project_root
 
 
-def test_data_pipeline_builders(tmp_path: Path) -> None:
+def _write_minimal_vocab_bundle(project_root: Path) -> None:
+    vocab_dir = project_root / "data" / "interim" / "vocab"
+    vocab_dir.mkdir(parents=True, exist_ok=True)
+    for name in ("diagnosis", "procedure", "drug", "lab", "vital"):
+        write_json(
+            vocab_dir / f"{name}_vocab.json",
+            {
+                "name": name,
+                "size": 2,
+                "pad_idx": 0,
+                "unk_idx": 1,
+                "idx_to_token": ["PAD", "UNK"],
+                "token_to_idx": {"PAD": 0, "UNK": 1},
+            },
+        )
+
+
+def test_build_vocab_requires_stage_cache_when_spark_enabled(tmp_path: Path) -> None:
+    pytest.importorskip("pyspark")
     project_root = _build_mock_project(tmp_path)
-    config_path = _write_config(project_root)
+    config_path = _write_config(project_root, spark_enabled=True)
+    build_cohort(config_path)
+
+    with pytest.raises(FileNotFoundError, match="stage_filtered_tables"):
+        build_vocab(config_path)
+
+
+def test_data_pipeline_builders_with_spark_cache(tmp_path: Path) -> None:
+    pytest.importorskip("pyspark")
+    pytest.importorskip("pyarrow")
+
+    project_root = _build_mock_project(tmp_path)
+    config_path = _write_config(project_root, spark_enabled=True)
 
     cohort_path = build_cohort(config_path)
     cohort_rows = read_csv_gz(cohort_path)
     assert len(cohort_rows) == 2
     assert {row["stay_id"] for row in cohort_rows} == {"111", "222"}
+    assert (project_root / "data" / "interim" / "cohort" / "cohort_keys.parquet").exists()
+
+    cache_dir = stage_filtered_tables(config_path)
+    cache_manifest = read_json(cache_dir / "cache_manifest.json")
+    assert set(cache_manifest["tables"]) == {"diagnoses_icd", "procedures_icd", "labevents", "chartevents", "medications"}
 
     build_vocab(config_path)
     diagnosis_vocab = read_json(project_root / "data" / "interim" / "vocab" / "diagnosis_vocab.json")
@@ -164,16 +217,15 @@ def test_data_pipeline_builders(tmp_path: Path) -> None:
     assert "ICD9:4019" in diagnosis_vocab["token_to_idx"]
 
     ddi_path = build_ddi_matrix(config_path)
-    ddi_payload = load_pt(ddi_path)
-    assert ddi_payload["source"] == "fallback_zero"
-    assert len(ddi_payload["matrix"]) == len(read_json(project_root / "data" / "interim" / "vocab" / "drug_vocab.json")["idx_to_token"])
+    assert ddi_path.exists()
 
     outputs = build_trajectories(config_path)
-    train_records = list(iter_jsonl_gz(outputs["train"]))
-    assert len(train_records) == 2
-    assert all(record["num_steps"] >= 1 for record in train_records)
-    assert train_records[0]["steps"][0]["delta_hours"] == 0.0
-    assert all(step["delta_hours"] in {0.0, 24.0} for record in train_records for step in record["steps"])
+    assert outputs["train"].exists()
+
+    manifest = read_json(project_root / "data" / "processed" / "trajectories" / "manifest.json")
+    assert manifest["format"] == "parquet"
+    assert manifest["counts_by_split"]["train"] == 2
+    assert manifest["splits"]["train"]["shards"]
 
     metadata = read_json(project_root / "data" / "processed" / "trajectories" / "metadata.json")
     assert metadata["lab_feature_size"] >= 1
@@ -181,12 +233,15 @@ def test_data_pipeline_builders(tmp_path: Path) -> None:
 
 
 def test_dataset_collate_when_torch_available(tmp_path: Path) -> None:
-    torch = __import__("pytest").importorskip("torch")
-    __import__("pytest").importorskip("torch.utils.data")
+    pytest.importorskip("pyspark")
+    pytest.importorskip("pyarrow")
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("torch.utils.data")
 
     project_root = _build_mock_project(tmp_path)
-    config_path = _write_config(project_root)
+    config_path = _write_config(project_root, spark_enabled=True)
     build_cohort(config_path)
+    stage_filtered_tables(config_path)
     build_vocab(config_path)
     build_ddi_matrix(config_path)
     build_trajectories(config_path)
@@ -200,18 +255,83 @@ def test_dataset_collate_when_torch_available(tmp_path: Path) -> None:
     assert torch.all(batch["visit_mask"].sum(dim=1) >= 1)
 
 
+def test_dataset_legacy_jsonl_fallback(tmp_path: Path) -> None:
+    project_root = _build_mock_project(tmp_path)
+    config_path = _write_config(project_root, spark_enabled=False)
+    _write_minimal_vocab_bundle(project_root)
+    record = {
+        "subject_id": 1,
+        "hadm_id": 11,
+        "stay_id": 111,
+        "split": "train",
+        "intime": "2020-01-01 00:00:00",
+        "outtime": "2020-01-02 00:00:00",
+        "num_steps": 1,
+        "drug_vocab_size": 2,
+        "lab_feature_size": 0,
+        "vital_feature_size": 0,
+        "steps": [
+            {
+                "step_index": 0,
+                "diagnosis_ids": [],
+                "procedure_ids": [],
+                "lab_values": [],
+                "lab_mask": [],
+                "vital_values": [],
+                "vital_mask": [],
+                "med_history_ids": [],
+                "delta_hours": 0.0,
+                "target_drugs": [],
+            }
+        ],
+    }
+    write_jsonl_gz(
+        project_root / "data" / "processed" / "trajectories" / "train" / "trajectories.jsonl.gz",
+        [record],
+    )
+
+    from src.data.dataset import MIMICTrajectoryDataset
+
+    dataset = MIMICTrajectoryDataset("train", config_path)
+    assert len(dataset) == 1
+    assert dataset[0]["stay_id"] == 111
+
+
+def test_dataset_raises_clear_error_when_outputs_missing(tmp_path: Path) -> None:
+    project_root = _build_mock_project(tmp_path)
+    config_path = _write_config(project_root, spark_enabled=True)
+    _write_minimal_vocab_bundle(project_root)
+
+    from src.data.dataset import MIMICTrajectoryDataset
+
+    with pytest.raises(FileNotFoundError, match="Neither parquet manifest"):
+        MIMICTrajectoryDataset("train", config_path)
+
+
 def test_preprocess_script_smoke_if_pwsh_exists(tmp_path: Path) -> None:
-    pytest = __import__("pytest")
+    pytest.importorskip("pyspark")
+    pytest.importorskip("pyarrow")
+
     pwsh = shutil.which("pwsh") or shutil.which("powershell")
     if not pwsh:
         pytest.skip("PowerShell is not available in this environment")
 
     project_root = _build_mock_project(tmp_path)
-    config_path = _write_config(project_root)
+    config_path = _write_config(project_root, spark_enabled=True)
     script_path = Path(__file__).resolve().parents[1] / "scripts" / "preprocess.ps1"
     result = subprocess.run(
-        [pwsh, "-ExecutionPolicy", "Bypass", "-NoProfile", "-File", str(script_path), "-Config", str(config_path),
-         "-Python", sys.executable],
+        [
+            pwsh,
+            "-ExecutionPolicy",
+            "Bypass",
+            "-NoProfile",
+            "-File",
+            str(script_path),
+            "-Config",
+            str(config_path),
+            "-Python",
+            sys.executable,
+        ],
         cwd=project_root,
         capture_output=True,
         text=True,

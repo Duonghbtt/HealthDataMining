@@ -14,6 +14,7 @@ from src.utils.io import (
     parse_int,
     resolve_path,
     write_csv_gz,
+    write_parquet_pylist,
     write_json,
 )
 
@@ -158,6 +159,20 @@ def build_cohort(config_path: str | Path) -> Path:
         cohort_rows.append(row)
 
     cohort_path = write_csv_gz(cohort_dir / "cohort.csv.gz", cohort_rows, COHORT_FIELDS)
+    write_parquet_pylist(
+        cohort_dir / "cohort_keys.parquet",
+        [
+            {
+                "subject_id": int(row["subject_id"]),
+                "hadm_id": int(row["hadm_id"]),
+                "stay_id": int(row["stay_id"]),
+                "split": str(row["split"]),
+                "intime": str(row["intime"]),
+                "outtime": str(row["outtime"]),
+            }
+            for row in cohort_rows
+        ],
+    )
     split_manifest = {
         split_name: sorted(subject_ids)
         for split_name, subject_ids in split_subjects.items()

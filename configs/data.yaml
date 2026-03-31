@@ -6,6 +6,8 @@ paths:
   processed_root: data/processed
   ddi_source_path: ""
 
+processed_format: parquet
+
 split:
   train: 0.7
   val: 0.15
@@ -22,3 +24,18 @@ features:
   top_k_vitals: 64
   max_med_history: 32
   normalization_eps: 1.0e-6
+
+spark:
+  enabled: true
+  master: local[4]
+  driver_memory: 3g
+  default_parallelism: 8
+  sql_shuffle_partitions: 24
+  adaptive_enabled: true
+  adaptive_coalesce_enabled: true
+  files_max_partition_bytes: 64m
+  local_dir: /tmp/healthdm-spark
+  stage_cache_dir: data/interim/spark_cache
+  cache_codec: snappy
+  trajectory_rows_per_file: 2048
+  max_open_shards_per_dataset: 2
