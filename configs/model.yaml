@@ -14,5 +14,13 @@ sequence:
   rnn_type: gru
   bidirectional: false
 
+retrieval:
+  top_k: 5
+  temporal_decay_alpha: 0.05
+  exclude_same_stay: true
+  backend: bruteforce
+  use_faiss_if_available: true
+  graph_top_k: 5
+
 training:
   device: cuda
