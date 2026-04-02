@@ -15,6 +15,9 @@ __pycache__/
 data/raw/
 data/interim/
 data/processed/
+handover_data/
+handover_data.tar.gz
+cach_dung.md
 
 # outputs
 outputs/

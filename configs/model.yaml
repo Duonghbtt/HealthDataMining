@@ -9,6 +9,7 @@ embedding:
   drug_dim: 128
   lab_dim: 64
   vital_dim: 64
+  time_dim: 32
 
 sequence:
   rnn_type: gru

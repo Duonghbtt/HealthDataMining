@@ -32,7 +32,7 @@ class PatientStateEncoder(nn.Module):
         code_embedding_dim: int = 64,
         medication_embedding_dim: int = 64,
         numeric_projection_dim: int = 32,
-        time_embedding_dim: int = 16,
+        time_embedding_dim: int = 32,
         visit_hidden_dim: int = 128,
         hidden_dim: int = 128,
         dropout: float = 0.1,
