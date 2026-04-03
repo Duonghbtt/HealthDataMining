@@ -9,6 +9,7 @@ venv/
 # cache
 __pycache__/
 .pytest_cache/
+pytest-cache-files-*/
 *.pyc
 
 # data
@@ -21,6 +22,7 @@ cach_dung.md
 
 # outputs
 outputs/
+test_artifacts/
 
 # system
 .DS_Store

@@ -1,6 +1,27 @@
+# System prerequisites outside pip:
+# - JDK 17 for Spark on Windows
+# - HADOOP_HOME + winutils.exe when running Spark parquet write paths on Windows
+
+# Core numeric / IO
 numpy>=1.26
 pyarrow>=16.0
-pyspark>=3.5
-pytest>=8.3
 PyYAML>=6.0
+
+# ML
 torch>=2.4
+
+# Spark data pipeline
+pyspark>=4.1,<4.2
+
+# App / demo
+streamlit>=1.33
+
+# Notebook support
+jupyterlab>=4.2
+ipykernel>=6.29
+
+# Testing
+pytest>=8.3
+
+# Optional acceleration (install manually when environment supports it)
+# faiss-cpu>=1.8

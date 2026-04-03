@@ -25,3 +25,22 @@ retrieval:
 
 training:
   device: cuda
+
+history_selector:
+  dropout: 0.1
+  score_bias_weight: 0.5
+  self_top_k: 3
+  neighbor_top_k: 3
+  use_retrieval_bias: true
+
+fusion:
+  dropout: 0.1
+  strategy: gated
+
+hypergraph:
+  num_layers: 2
+  dropout: 0.1
+  num_group_prototypes: 8
+  use_semantic_edges: true
+  use_weighted_edges: true
+  prototype_top_k: 2
