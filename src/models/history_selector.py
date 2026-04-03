@@ -65,21 +65,32 @@ def _sparsify_weights(
         return sparse_weights, selected_mask
     if top_k <= 0:
         raise ValueError("top_k must be positive when provided")
-    sparse_weights = torch.zeros_like(weights)
-    selected_mask = torch.zeros_like(mask)
+    sparse_rows: list[torch.Tensor] = []
+    selected_rows: list[torch.Tensor] = []
     for row_index in range(weights.shape[0]):
         row_mask = mask[row_index]
         valid_count = int(row_mask.sum().item())
+        row_selected = torch.zeros_like(row_mask, dtype=torch.bool)
+        row_sparse = torch.zeros_like(weights[row_index])
         if valid_count <= 0:
+            selected_rows.append(row_selected)
+            sparse_rows.append(row_sparse)
             continue
         keep = min(int(top_k), valid_count)
         row_values = weights[row_index].masked_fill(~row_mask, float("-inf"))
         top_positions = torch.topk(row_values, k=keep, dim=-1).indices
-        selected_mask[row_index, top_positions] = True
-        sparse_weights[row_index, top_positions] = weights[row_index, top_positions]
-        denom = sparse_weights[row_index].sum()
-        if float(denom.item()) > 0.0:
-            sparse_weights[row_index] = sparse_weights[row_index] / denom
+        row_selected = row_selected.scatter(
+            0,
+            top_positions,
+            torch.ones_like(top_positions, dtype=torch.bool),
+        )
+        row_sparse = torch.where(row_selected, weights[row_index], row_sparse)
+        denom = row_sparse.sum().clamp(min=torch.finfo(row_sparse.dtype).eps)
+        row_sparse = row_sparse / denom
+        selected_rows.append(row_selected)
+        sparse_rows.append(row_sparse)
+    sparse_weights = torch.stack(sparse_rows, dim=0)
+    selected_mask = torch.stack(selected_rows, dim=0)
     return sparse_weights, selected_mask
 
 

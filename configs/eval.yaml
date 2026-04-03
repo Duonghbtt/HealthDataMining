@@ -1,0 +1,43 @@
+config_refs:
+  data: configs/data.yaml
+  model: configs/model.yaml
+  train: configs/train.yaml
+
+paths:
+  ddi_matrix_path: handover_data/processed/ddi/drug_ddi.pt
+  checkpoint_dir: outputs/checkpoints
+  log_dir: outputs/logs
+  report_dir: outputs/reports
+  prediction_dir: outputs/predictions
+
+runtime:
+  mode: core
+  device: cuda
+  batch_size: 32
+
+loss:
+  ddi_lambda: 0.05
+
+prediction:
+  top_k: 10
+  threshold: 0.5
+
+evaluation:
+  split: test
+  save_predictions: true
+  save_reports: true
+
+core:
+  mode: core
+  use_retrieval: false
+  use_group_encoder: false
+
+extended:
+  mode: extended
+  use_retrieval: true
+  use_group_encoder: true
+  retrieval_top_k: 5
+  temporal_decay_alpha: 0.05
+  retrieval_backend: bruteforce
+  use_faiss_if_available: true
+  allow_cross_split: false
