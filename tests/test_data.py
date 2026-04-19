@@ -17,6 +17,20 @@ from src.data.stage_filtered_tables import stage_filtered_tables
 from src.utils.io import read_csv_gz, read_json, write_json, write_jsonl_gz
 
 
+def _stage_filtered_tables_or_skip(config_path: Path) -> Path:
+    try:
+        return stage_filtered_tables(config_path)
+    except Exception as exc:  # pragma: no cover - depends on sandboxed Spark runtime
+        message = str(exc)
+        if (
+            "JAVA_GATEWAY_EXITED" in message
+            or "Failed to bind" in message
+            or "Operation not permitted" in message
+        ):
+            pytest.skip(f"Spark gateway is unavailable in this environment: {message}")
+        raise
+
+
 def _write_csv_gz(path: Path, rows: list[dict[str, object]], fieldnames: list[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with gzip.open(path, "wt", encoding="utf-8", newline="") as handle:
@@ -207,7 +221,7 @@ def test_data_pipeline_builders_with_spark_cache(tmp_path: Path) -> None:
     assert {row["stay_id"] for row in cohort_rows} == {"111", "222"}
     assert (project_root / "data" / "interim" / "cohort" / "cohort_keys.parquet").exists()
 
-    cache_dir = stage_filtered_tables(config_path)
+    cache_dir = _stage_filtered_tables_or_skip(config_path)
     cache_manifest = read_json(cache_dir / "cache_manifest.json")
     assert set(cache_manifest["tables"]) == {"diagnoses_icd", "procedures_icd", "labevents", "chartevents", "medications"}
 
@@ -241,7 +255,7 @@ def test_dataset_collate_when_torch_available(tmp_path: Path) -> None:
     project_root = _build_mock_project(tmp_path)
     config_path = _write_config(project_root, spark_enabled=True)
     build_cohort(config_path)
-    stage_filtered_tables(config_path)
+    _stage_filtered_tables_or_skip(config_path)
     build_vocab(config_path)
     build_ddi_matrix(config_path)
     build_trajectories(config_path)
@@ -253,6 +267,117 @@ def test_dataset_collate_when_torch_available(tmp_path: Path) -> None:
     assert batch["diag_codes"].shape[0] == 2
     assert batch["visit_mask"].shape[0] == 2
     assert torch.all(batch["visit_mask"].sum(dim=1) >= 1)
+
+
+def test_parquet_dataset_caches_arrow_tables_and_preserves_records(tmp_path: Path) -> None:
+    pytest.importorskip("pyspark")
+    pytest.importorskip("pyarrow")
+
+    project_root = _build_mock_project(tmp_path)
+    config_path = _write_config(project_root, spark_enabled=True)
+    build_cohort(config_path)
+    _stage_filtered_tables_or_skip(config_path)
+    build_vocab(config_path)
+    build_ddi_matrix(config_path)
+    build_trajectories(config_path)
+
+    from src.data.dataset import MIMICTrajectoryDataset
+
+    dataset = MIMICTrajectoryDataset("train", config_path)
+    first_record = dataset[0]
+    second_record = dataset[0]
+
+    assert first_record == second_record
+    assert dataset._shard_cache
+    cached_table = next(iter(dataset._shard_cache.values()))
+    assert hasattr(cached_table, "num_rows")
+    assert not isinstance(cached_table, list)
+
+
+def test_collate_batch_can_emit_final_targets_without_full_target_tensor() -> None:
+    torch = pytest.importorskip("torch")
+
+    from src.data.dataset import collate_batch
+    from src.training.losses import extract_last_valid_targets
+
+    records = [
+        {
+            "subject_id": 1,
+            "hadm_id": 10,
+            "stay_id": 100,
+            "num_steps": 3,
+            "drug_vocab_size": 8,
+            "lab_feature_size": 0,
+            "vital_feature_size": 0,
+            "steps": [
+                {"diagnosis_ids": [1], "procedure_ids": [], "lab_values": [], "lab_mask": [], "vital_values": [], "vital_mask": [], "med_history_ids": [1, 2], "delta_hours": 0.0, "target_drugs": [1]},
+                {"diagnosis_ids": [2], "procedure_ids": [], "lab_values": [], "lab_mask": [], "vital_values": [], "vital_mask": [], "med_history_ids": [2, 3], "delta_hours": 4.0, "target_drugs": [2, 4]},
+                {"diagnosis_ids": [3], "procedure_ids": [], "lab_values": [], "lab_mask": [], "vital_values": [], "vital_mask": [], "med_history_ids": [4, 5], "delta_hours": 8.0, "target_drugs": [3, 6]},
+            ],
+        }
+    ]
+
+    full_batch = collate_batch(records, include_full_targets=True, include_final_target=True)
+    fast_batch = collate_batch(records, include_full_targets=False, include_final_target=True)
+
+    expected_final = extract_last_valid_targets(
+        full_batch["target_drugs"],
+        full_batch["visit_mask"],
+    )
+    assert "target_drugs" not in fast_batch
+    assert torch.equal(fast_batch["final_target_drugs"], expected_final)
+
+
+def test_collate_batch_applies_visit_and_history_truncation() -> None:
+    torch = pytest.importorskip("torch")
+
+    from src.data.dataset import collate_batch
+
+    record = {
+        "subject_id": 1,
+        "hadm_id": 10,
+        "stay_id": 100,
+        "num_steps": 4,
+        "drug_vocab_size": 12,
+        "lab_feature_size": 0,
+        "vital_feature_size": 0,
+        "steps": [
+            {"diagnosis_ids": [1], "procedure_ids": [], "lab_values": [], "lab_mask": [], "vital_values": [], "vital_mask": [], "med_history_ids": [1, 2, 3], "delta_hours": 0.0, "target_drugs": [1]},
+            {"diagnosis_ids": [2], "procedure_ids": [], "lab_values": [], "lab_mask": [], "vital_values": [], "vital_mask": [], "med_history_ids": [4, 5, 6], "delta_hours": 2.0, "target_drugs": [2]},
+            {"diagnosis_ids": [3], "procedure_ids": [], "lab_values": [], "lab_mask": [], "vital_values": [], "vital_mask": [], "med_history_ids": [7, 8, 9], "delta_hours": 4.0, "target_drugs": [3]},
+            {"diagnosis_ids": [4], "procedure_ids": [], "lab_values": [], "lab_mask": [], "vital_values": [], "vital_mask": [], "med_history_ids": [10, 11, 12], "delta_hours": 6.0, "target_drugs": [4]},
+        ],
+    }
+
+    batch = collate_batch([record], max_visits=2, max_history=2)
+
+    assert int(batch["visit_lengths"][0].item()) == 2
+    assert tuple(batch["visit_mask"].shape) == (1, 2)
+    assert tuple(batch["med_history"].shape) == (1, 2, 2)
+    assert torch.equal(batch["diag_codes"][0, :, 0], torch.tensor([3, 4], dtype=torch.long))
+    assert torch.equal(batch["med_history"][0, 0], torch.tensor([8, 9], dtype=torch.long))
+    assert torch.equal(batch["med_history"][0, 1], torch.tensor([11, 12], dtype=torch.long))
+
+
+def test_shard_length_batch_sampler_keeps_batches_within_shards_and_covers_all_indices() -> None:
+    from src.data.dataset import ShardLengthBatchSampler
+
+    class DummyDataset:
+        shard_row_indices = [[0, 1, 2], [3, 4]]
+        row_num_steps = [5, 1, 3, 4, 2]
+
+    sampler = ShardLengthBatchSampler(
+        DummyDataset(),
+        batch_size=2,
+        length_bucket_window=2,
+        shuffle=False,
+        seed=0,
+    )
+    batches = list(sampler)
+    flattened = [index for batch in batches for index in batch]
+
+    assert flattened == [1, 0, 2, 4, 3]
+    assert {tuple(batch) for batch in batches} == {(1, 0), (2,), (4, 3)}
 
 
 def test_dataset_legacy_jsonl_fallback(tmp_path: Path) -> None:

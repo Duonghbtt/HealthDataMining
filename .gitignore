@@ -29,3 +29,4 @@ test_artifacts/
 Thumbs.db
 
 .gitattributes
+*.docx

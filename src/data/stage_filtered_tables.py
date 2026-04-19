@@ -110,12 +110,15 @@ def require_stage_cache(config: dict) -> tuple[Path, dict]:
     if not manifest_path.exists():
         raise FileNotFoundError(
             f"Spark cache manifest is missing at {manifest_path}. "
+            "Build the Spark stage cache after running `build_cohort` "
+            "or whenever you set up a new preprocessing workspace. "
             f"Run `python -m src.data.stage_filtered_tables --config {config['_config_path']}` first."
         )
     manifest = read_json(manifest_path)
     if not cache_is_complete(config, manifest):
         raise FileNotFoundError(
             f"Spark cache at {cache_dir} is missing, stale, or incomplete. "
+            "This usually happens after rebuilding the cohort or changing Spark/cohort-related config. "
             f"Run `python -m src.data.stage_filtered_tables --config {config['_config_path']}` first."
         )
     return cache_dir, manifest

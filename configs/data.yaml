@@ -4,7 +4,7 @@ paths:
   raw_root: data/raw
   interim_root: data/interim
   processed_root: data/processed
-  ddi_source_path: ""
+  ddi_source_path: data/raw/ddi/drug_ddi_smoke.csv
 
 processed_format: parquet
 
@@ -23,6 +23,8 @@ features:
   top_k_labs: 64
   top_k_vitals: 64
   max_med_history: 32
+  max_visits: null
+  max_history: null
   normalization_eps: 1.0e-6
 
 spark:
@@ -38,4 +40,24 @@ spark:
   stage_cache_dir: data/interim/spark_cache
   cache_codec: snappy
   trajectory_rows_per_file: 8192
-  max_open_shards_per_dataset: 2
+  max_open_shards_per_dataset: 4
+
+profiles:
+  safe:
+    features:
+      max_visits: null
+      max_history: null
+    spark:
+      max_open_shards_per_dataset: 4
+  balanced:
+    features:
+      max_visits: null
+      max_history: null
+    spark:
+      max_open_shards_per_dataset: 4
+  fast:
+    features:
+      max_visits: 16
+      max_history: 24
+    spark:
+      max_open_shards_per_dataset: 6

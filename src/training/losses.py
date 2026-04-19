@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from typing import Any
 
 import torch
@@ -102,6 +103,7 @@ class MedicationRecommendationLoss(nn.Module):
         *,
         lambda_ddi: float = 0.0,
         ddi_regularizer: DDIRegularizer | None = None,
+        ddi_context: dict[str, Any] | None = None,
         pos_weight: torch.Tensor | None = None,
         reduction: str = "mean",
     ) -> None:
@@ -109,8 +111,11 @@ class MedicationRecommendationLoss(nn.Module):
         if float(lambda_ddi) < 0.0:
             raise ValueError(f"lambda_ddi must be non-negative, got {lambda_ddi!r}")
 
-        self.lambda_ddi = float(lambda_ddi)
+        self.configured_lambda_ddi = float(lambda_ddi)
         self.ddi_regularizer = ddi_regularizer
+        self.ddi_context = copy.deepcopy(ddi_context or {})
+        self.ddi_active = self.ddi_regularizer is not None and bool(self.ddi_context.get("active", True))
+        self.effective_lambda_ddi = self.configured_lambda_ddi if self.ddi_active else 0.0
         self.reduction = _validate_reduction(reduction)
 
         if pos_weight is None:
@@ -213,7 +218,7 @@ class MedicationRecommendationLoss(nn.Module):
             ddi_per_sample = ddi_per_sample.to(device=drug_logits.device, dtype=drug_logits.dtype)
 
         ddi_loss = _reduce_tensor(ddi_per_sample, self.reduction)
-        weighted_ddi_loss = ddi_loss * self.lambda_ddi
+        weighted_ddi_loss = ddi_loss * self.effective_lambda_ddi
         total_loss = prediction_loss + weighted_ddi_loss
 
         return {
@@ -221,7 +226,16 @@ class MedicationRecommendationLoss(nn.Module):
             "prediction_loss": prediction_loss,
             "ddi_loss": ddi_loss,
             "weighted_ddi_loss": weighted_ddi_loss,
-            "lambda_ddi": torch.tensor(self.lambda_ddi, device=drug_logits.device, dtype=drug_logits.dtype),
+            "configured_ddi_lambda": torch.tensor(
+                self.configured_lambda_ddi,
+                device=drug_logits.device,
+                dtype=drug_logits.dtype,
+            ),
+            "effective_ddi_lambda": torch.tensor(
+                self.effective_lambda_ddi,
+                device=drug_logits.device,
+                dtype=drug_logits.dtype,
+            ),
         }
 
 

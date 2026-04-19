@@ -44,3 +44,47 @@ hypergraph:
   use_semantic_edges: true
   use_weighted_edges: true
   prototype_top_k: 2
+
+profiles:
+  safe:
+    model:
+      hidden_dim: 128
+      num_layers: 1
+      dropout: 0.1
+    embedding:
+      diag_dim: 128
+      proc_dim: 128
+      drug_dim: 128
+      lab_dim: 64
+      vital_dim: 64
+      time_dim: 32
+    history_selector:
+      self_top_k: 3
+  balanced:
+    model:
+      hidden_dim: 128
+      num_layers: 1
+      dropout: 0.1
+    embedding:
+      diag_dim: 128
+      proc_dim: 128
+      drug_dim: 128
+      lab_dim: 64
+      vital_dim: 64
+      time_dim: 32
+    history_selector:
+      self_top_k: 3
+  fast:
+    model:
+      hidden_dim: 96
+      num_layers: 1
+      dropout: 0.1
+    embedding:
+      diag_dim: 96
+      proc_dim: 96
+      drug_dim: 96
+      lab_dim: 48
+      vital_dim: 48
+      time_dim: 16
+    history_selector:
+      self_top_k: 2

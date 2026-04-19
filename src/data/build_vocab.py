@@ -74,6 +74,7 @@ def _write_vocab_outputs(
     drug_tokens: list[str],
     lab_tokens: list[str],
     vital_tokens: list[str],
+    built_from_split: str,
 ) -> Path:
     vocab_dir = vocab_dir_from_config(config)
     paths = MIMICDataPaths.from_config(config)
@@ -123,19 +124,33 @@ def _write_vocab_outputs(
             "drug_size": drug_vocab["size"],
             "lab_size": lab_vocab["size"],
             "vital_size": vital_vocab["size"],
+            "built_from_split": built_from_split,
         },
     )
     return vocab_dir
 
 
-def _build_vocab_python(config: dict) -> Path:
-    paths = MIMICDataPaths.from_config(config)
+def _train_cohort_ids(config: dict) -> tuple[set[int], set[int]]:
     cohort_rows = read_csv_gz(cohort_path_from_config(config))
+    train_rows = [row for row in cohort_rows if str(row.get("split", "")).strip().lower() == "train"]
+    if not train_rows:
+        raise ValueError(
+            "Vocab building requires at least one train cohort row. "
+            f"Check split assignments in {cohort_path_from_config(config)}."
+        )
 
-    hadm_ids = {parse_int(row["hadm_id"]) for row in cohort_rows if row.get("hadm_id")}
-    stay_ids = {parse_int(row["stay_id"]) for row in cohort_rows if row.get("stay_id")}
+    hadm_ids = {parse_int(row["hadm_id"]) for row in train_rows if row.get("hadm_id")}
+    stay_ids = {parse_int(row["stay_id"]) for row in train_rows if row.get("stay_id")}
     hadm_ids.discard(None)
     stay_ids.discard(None)
+    if not hadm_ids and not stay_ids:
+        raise ValueError("Train cohort rows did not contain any usable hadm_id or stay_id keys for vocab building.")
+    return hadm_ids, stay_ids
+
+
+def _build_vocab_python(config: dict) -> Path:
+    paths = MIMICDataPaths.from_config(config)
+    hadm_ids, stay_ids = _train_cohort_ids(config)
 
     feature_cfg = config.get("features", {})
     top_k_labs = int(feature_cfg.get("top_k_labs", 64))
@@ -195,6 +210,7 @@ def _build_vocab_python(config: dict) -> Path:
         drug_tokens=_sorted_counter_items(drug_counter),
         lab_tokens=_sorted_counter_items(lab_counter, top_k=top_k_labs),
         vital_tokens=_sorted_counter_items(vital_counter, top_k=top_k_vitals),
+        built_from_split="train",
     )
 
 
@@ -221,11 +237,43 @@ def _build_vocab_spark(config: dict) -> Path:
     try:
         from pyspark.sql import functions as F
 
-        diagnosis_df = spark.read.parquet(str(cache_dir / "diagnoses_icd")).select("diagnosis_token")
-        procedure_df = spark.read.parquet(str(cache_dir / "procedures_icd")).select("procedure_token")
-        drug_df = spark.read.parquet(str(cache_dir / "medications")).select("drug_token")
-        lab_df = spark.read.parquet(str(cache_dir / "labevents")).select(F.trim(F.col("itemid")).alias("itemid"))
-        vital_df = spark.read.parquet(str(cache_dir / "chartevents")).select(F.trim(F.col("itemid")).alias("itemid"))
+        interim_root = resolve_path(config["_project_root"], config["paths"]["interim_root"])
+        train_keys = (
+            spark.read.parquet(str(Path(interim_root) / "cohort" / "cohort_keys.parquet"))
+            .filter(F.lower(F.trim(F.col("split"))) == F.lit("train"))
+            .select("hadm_id", "stay_id")
+        )
+        if int(train_keys.limit(1).count()) <= 0:
+            raise ValueError("Vocab building requires at least one train key in cohort_keys.parquet.")
+
+        train_hadm = F.broadcast(train_keys.select("hadm_id").dropna().dropDuplicates())
+        train_stay = F.broadcast(train_keys.select("stay_id").dropna().dropDuplicates())
+
+        diagnosis_df = (
+            spark.read.parquet(str(cache_dir / "diagnoses_icd"))
+            .join(train_hadm, "hadm_id", "inner")
+            .select("diagnosis_token")
+        )
+        procedure_df = (
+            spark.read.parquet(str(cache_dir / "procedures_icd"))
+            .join(train_hadm, "hadm_id", "inner")
+            .select("procedure_token")
+        )
+        drug_df = (
+            spark.read.parquet(str(cache_dir / "medications"))
+            .join(train_hadm, "hadm_id", "inner")
+            .select("drug_token")
+        )
+        lab_df = (
+            spark.read.parquet(str(cache_dir / "labevents"))
+            .join(train_hadm, "hadm_id", "inner")
+            .select(F.trim(F.col("itemid")).alias("itemid"))
+        )
+        vital_df = (
+            spark.read.parquet(str(cache_dir / "chartevents"))
+            .join(train_stay, "stay_id", "inner")
+            .select(F.trim(F.col("itemid")).alias("itemid"))
+        )
 
         diagnosis_tokens = _collect_tokens(diagnosis_df, "diagnosis_token")
         procedure_tokens = _collect_tokens(procedure_df, "procedure_token")
@@ -239,6 +287,7 @@ def _build_vocab_spark(config: dict) -> Path:
             drug_tokens=drug_tokens,
             lab_tokens=lab_tokens,
             vital_tokens=vital_tokens,
+            built_from_split="train",
         )
     finally:
         spark.stop()

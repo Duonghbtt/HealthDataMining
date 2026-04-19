@@ -4,7 +4,9 @@ config_refs:
   train: configs/train.yaml
 
 paths:
-  ddi_matrix_path: handover_data/processed/ddi/drug_ddi.pt
+  processed_root: data/processed
+  vocab_root: data/interim/vocab
+  ddi_matrix_path: data/processed/ddi/drug_ddi.pt
   checkpoint_dir: outputs/checkpoints
   log_dir: outputs/logs
   report_dir: outputs/reports

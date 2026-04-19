@@ -22,6 +22,7 @@ if __package__ in {None, ""}:
         compute_ddi_flags,
         compute_samplewise_f1,
         compute_samplewise_jaccard,
+        multilabel_prauc,
     )
 else:
     from .metrics import (
@@ -30,16 +31,18 @@ else:
         compute_ddi_flags,
         compute_samplewise_f1,
         compute_samplewise_jaccard,
+        multilabel_prauc,
     )
 
 from src.data.build_vocab import load_vocab_bundle
 from src.data.dataset import collate_batch
-from src.models.ddi_regularization import load_ddi_matrix
+from src.models.ddi_regularization import load_ddi_artifact
 from src.training.train_core import (
     build_core_model,
     build_dataset,
     build_runtime_data_config_file,
     resolve_device,
+    validate_core_runtime_config,
 )
 from src.utils.io import ensure_dir, load_yaml_config, read_json, resolve_path, write_json
 
@@ -85,16 +88,57 @@ def _existing_path_candidates_to_path(candidates: Sequence[str | Path | None]) -
 def _resolve_existing_path(
     *,
     kind: str,
-    candidates: Sequence[str | Path | None],
-) -> Path:
+    candidates: Sequence[tuple[str, str | Path | None]],
+) -> tuple[Path, str]:
     checked: list[str] = []
-    for candidate in _existing_path_candidates_to_path(candidates):
-        checked.append(str(candidate))
-        if candidate.exists():
-            return candidate
+    for label, raw_candidate in candidates:
+        for candidate in _existing_path_candidates_to_path([raw_candidate]):
+            checked.append(f"{label}={candidate}")
+            if candidate.exists():
+                return candidate, label
     raise FileNotFoundError(
         f"Unable to resolve {kind}. Checked candidates: {checked if checked else ['<none>']}"
     )
+
+
+def _core_checkpoint_help(train_config_path: str | Path) -> str:
+    return (
+        "Pass --checkpoint /path/to/train_core_best.pt or run "
+        f"`python -m src.training.train_core --config {train_config_path}` first."
+    )
+
+
+def _stringify_path_source(path: Path, source: str) -> str:
+    return f"{path} [{source}]"
+
+
+def _compatibility_fallback_used(*, sources: Sequence[str]) -> bool:
+    return any(source.startswith("compat:") for source in sources)
+
+
+def _resolve_checkpoint_path(project_root: Path, eval_config: Mapping[str, Any], args: argparse.Namespace) -> Path:
+    train_config_ref = resolve_path(
+        project_root,
+        dict(eval_config.get("config_refs", {})).get("train", "configs/train.yaml"),
+    ).resolve()
+    if args.checkpoint is not None:
+        checkpoint_path = Path(args.checkpoint).resolve()
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(
+                f"Checkpoint path does not exist: {checkpoint_path}. {_core_checkpoint_help(train_config_ref)}"
+            )
+        return checkpoint_path
+
+    checkpoint_dir = resolve_path(
+        project_root,
+        eval_config.get("paths", {}).get("checkpoint_dir", "outputs/checkpoints"),
+    ).resolve()
+    checkpoint_path = checkpoint_dir / "train_core_best.pt"
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(
+            f"Default core checkpoint not found at {checkpoint_path}. {_core_checkpoint_help(train_config_ref)}"
+        )
+    return checkpoint_path
 
 
 def _write_plain_csv(path: str | Path, rows: Sequence[Mapping[str, Any]]) -> Path:
@@ -130,23 +174,6 @@ def _move_batch_to_device(batch: Mapping[str, Any], device: torch.device) -> dic
     }
 
 
-def _resolve_checkpoint_path(project_root: Path, eval_config: Mapping[str, Any], args: argparse.Namespace) -> Path:
-    if args.checkpoint is not None:
-        checkpoint_path = Path(args.checkpoint).resolve()
-        if not checkpoint_path.exists():
-            raise FileNotFoundError(f"Checkpoint path does not exist: {checkpoint_path}")
-        return checkpoint_path
-
-    checkpoint_dir = resolve_path(
-        project_root,
-        eval_config.get("paths", {}).get("checkpoint_dir", "outputs/checkpoints"),
-    ).resolve()
-    checkpoint_path = checkpoint_dir / "train_core_best.pt"
-    if not checkpoint_path.exists():
-        raise FileNotFoundError(f"Best checkpoint not found at {checkpoint_path}")
-    return checkpoint_path
-
-
 def _resolve_eval_paths(
     *,
     project_root: Path,
@@ -155,39 +182,66 @@ def _resolve_eval_paths(
     data_config: Mapping[str, Any],
     checkpoint_payload: Mapping[str, Any],
     args: argparse.Namespace,
-) -> dict[str, Path]:
+) -> dict[str, Any]:
     eval_paths = dict(eval_config.get("paths", {}))
     train_paths = dict(train_config.get("paths", {}))
     data_paths = dict(data_config.get("paths", {}))
     checkpoint_paths = dict(checkpoint_payload.get("resolved_paths", {}))
 
-    processed_root = _resolve_existing_path(
+    processed_root, processed_root_source = _resolve_existing_path(
         kind="processed_root",
         candidates=[
-            args.processed_root,
-            checkpoint_paths.get("processed_root"),
-            None if data_paths.get("processed_root") is None else resolve_path(project_root, data_paths["processed_root"]),
-            project_root / "handover_data" / "processed",
+            ("arg:processed_root", args.processed_root),
+            ("checkpoint.resolved_paths.processed_root", checkpoint_paths.get("processed_root")),
+            (
+                "eval.paths.processed_root",
+                None if eval_paths.get("processed_root") is None else resolve_path(project_root, eval_paths["processed_root"]),
+            ),
+            (
+                "train.paths.processed_root",
+                None if train_paths.get("processed_root") is None else resolve_path(project_root, train_paths["processed_root"]),
+            ),
+            (
+                "data.paths.processed_root",
+                None if data_paths.get("processed_root") is None else resolve_path(project_root, data_paths["processed_root"]),
+            ),
+            ("compat:handover_data/processed", project_root / "handover_data" / "processed"),
         ],
     )
-    vocab_root = _resolve_existing_path(
+    vocab_root, vocab_root_source = _resolve_existing_path(
         kind="vocab_root",
         candidates=[
-            args.vocab_root,
-            checkpoint_paths.get("vocab_root"),
-            None if train_paths.get("vocab_root") is None else resolve_path(project_root, train_paths["vocab_root"]),
-            None if data_paths.get("interim_root") is None else resolve_path(project_root, data_paths["interim_root"]) / "vocab",
-            project_root / "handover_data" / "vocab",
+            ("arg:vocab_root", args.vocab_root),
+            ("checkpoint.resolved_paths.vocab_root", checkpoint_paths.get("vocab_root")),
+            (
+                "eval.paths.vocab_root",
+                None if eval_paths.get("vocab_root") is None else resolve_path(project_root, eval_paths["vocab_root"]),
+            ),
+            (
+                "train.paths.vocab_root",
+                None if train_paths.get("vocab_root") is None else resolve_path(project_root, train_paths["vocab_root"]),
+            ),
+            (
+                "data.paths.interim_root/vocab",
+                None if data_paths.get("interim_root") is None else resolve_path(project_root, data_paths["interim_root"]) / "vocab",
+            ),
+            ("compat:handover_data/vocab", project_root / "handover_data" / "vocab"),
         ],
     )
-    ddi_matrix_path = _resolve_existing_path(
+    ddi_matrix_path, ddi_matrix_source = _resolve_existing_path(
         kind="ddi_matrix_path",
         candidates=[
-            args.ddi_matrix_path,
-            checkpoint_paths.get("ddi_matrix_path"),
-            None if eval_paths.get("ddi_matrix_path") is None else resolve_path(project_root, eval_paths["ddi_matrix_path"]),
-            None if train_paths.get("ddi_matrix_path") is None else resolve_path(project_root, train_paths["ddi_matrix_path"]),
-            project_root / "handover_data" / "processed" / "ddi" / "drug_ddi.pt",
+            ("arg:ddi_matrix_path", args.ddi_matrix_path),
+            ("checkpoint.resolved_paths.ddi_matrix_path", checkpoint_paths.get("ddi_matrix_path")),
+            (
+                "eval.paths.ddi_matrix_path",
+                None if eval_paths.get("ddi_matrix_path") is None else resolve_path(project_root, eval_paths["ddi_matrix_path"]),
+            ),
+            (
+                "train.paths.ddi_matrix_path",
+                None if train_paths.get("ddi_matrix_path") is None else resolve_path(project_root, train_paths["ddi_matrix_path"]),
+            ),
+            ("compat:handover_data/processed/ddi/drug_ddi.pt", project_root / "handover_data" / "processed" / "ddi" / "drug_ddi.pt"),
         ],
     )
 
@@ -202,6 +256,9 @@ def _resolve_eval_paths(
         "ddi_matrix_path": ddi_matrix_path,
         "report_dir": report_dir,
         "prediction_dir": prediction_dir,
+        "processed_root_source": processed_root_source,
+        "vocab_root_source": vocab_root_source,
+        "ddi_matrix_path_source": ddi_matrix_source,
     }
 
 
@@ -242,7 +299,7 @@ def run_core_evaluation(
     dataloader: DataLoader,
     device: torch.device,
     threshold: float,
-    ddi_matrix: torch.Tensor,
+    ddi_artifact: Mapping[str, Any],
     decoder_top_k: int | None,
 ) -> dict[str, Any]:
     collected_probs: list[torch.Tensor] = []
@@ -280,17 +337,65 @@ def run_core_evaluation(
     all_probs = torch.cat(collected_probs, dim=0)
     all_targets = torch.cat(collected_targets, dim=0)
     binary_predictions = binarize_predictions(all_probs, threshold).cpu()
-    ddi_matrix_cpu = ddi_matrix.detach().cpu()
-
-    metrics = compute_core_metrics(
-        all_targets,
-        all_probs,
-        threshold=threshold,
-        ddi_matrix=ddi_matrix_cpu,
-    )
     sample_jaccard = compute_samplewise_jaccard(all_targets, binary_predictions).cpu()
     sample_f1 = compute_samplewise_f1(all_targets, binary_predictions).cpu()
-    ddi_flags = compute_ddi_flags(binary_predictions, ddi_matrix_cpu).cpu()
+    ddi_active = bool(ddi_artifact.get("active", False))
+    ddi_matrix_cpu = ddi_artifact["matrix"].detach().cpu()
+    if ddi_active:
+        metrics = compute_core_metrics(
+            all_targets,
+            all_probs,
+            threshold=threshold,
+            ddi_matrix=ddi_matrix_cpu,
+        )
+        ddi_flags = compute_ddi_flags(binary_predictions, ddi_matrix_cpu).cpu()
+        ddi_summary: dict[str, Any] = {
+            "available": True,
+            "status": "active",
+            "reason": ddi_artifact.get("reason"),
+            "source": ddi_artifact.get("source"),
+            "matched_pairs": ddi_artifact.get("matched_pairs"),
+            "nonzero_pairs": ddi_artifact.get("nonzero_pairs"),
+            "vocab_size": ddi_artifact.get("vocab_size"),
+            "source_metadata": copy.deepcopy(dict(ddi_artifact.get("source_metadata") or {})),
+            **{
+                key: metrics[key]
+                for key in (
+                    "ddi_rate",
+                    "total_predicted_pairs",
+                    "total_interacting_pairs",
+                    "patients_with_ddi",
+                    "num_samples",
+                )
+            },
+        }
+        metric_summary: dict[str, Any] = {
+            key: metrics[key]
+            for key in ("jaccard", "f1", "prauc", "ddi_rate")
+        }
+    else:
+        ddi_flags = torch.zeros(binary_predictions.shape[0], dtype=torch.bool)
+        ddi_summary = {
+            "available": False,
+            "status": "inactive",
+            "reason": ddi_artifact.get("reason"),
+            "source": ddi_artifact.get("source"),
+            "matched_pairs": ddi_artifact.get("matched_pairs"),
+            "nonzero_pairs": ddi_artifact.get("nonzero_pairs"),
+            "vocab_size": ddi_artifact.get("vocab_size"),
+            "source_metadata": copy.deepcopy(dict(ddi_artifact.get("source_metadata") or {})),
+            "ddi_rate": None,
+            "total_predicted_pairs": None,
+            "total_interacting_pairs": None,
+            "patients_with_ddi": None,
+            "num_samples": float(all_targets.shape[0]),
+        }
+        metric_summary = {
+            "jaccard": float(sample_jaccard.mean().item()),
+            "f1": float(sample_f1.mean().item()),
+            "prauc": multilabel_prauc(all_targets, all_probs),
+            "ddi_rate": None,
+        }
 
     prediction_rows: list[dict[str, Any]] = []
     for row_index in range(all_probs.shape[0]):
@@ -304,7 +409,7 @@ def run_core_evaluation(
                 "pred_count": int(binary_predictions[row_index].sum().item()),
                 "sample_jaccard": float(sample_jaccard[row_index].item()),
                 "sample_f1": float(sample_f1[row_index].item()),
-                "has_ddi": bool(ddi_flags[row_index].item()),
+                "has_ddi": None if not ddi_active else bool(ddi_flags[row_index].item()),
                 "predicted_drug_indices": _stringify_indices(predicted_indices),
             }
         )
@@ -312,14 +417,6 @@ def run_core_evaluation(
     prediction_summary = {
         "avg_predicted_drugs": float(binary_predictions.sum(dim=1, dtype=torch.float32).mean().item()),
         "avg_true_drugs": float(all_targets.sum(dim=1, dtype=torch.float32).mean().item()),
-    }
-    ddi_summary = {
-        key: metrics[key]
-        for key in ("ddi_rate", "total_predicted_pairs", "total_interacting_pairs", "patients_with_ddi", "num_samples")
-    }
-    metric_summary = {
-        key: metrics[key]
-        for key in ("jaccard", "f1", "prauc", "ddi_rate")
     }
 
     return {
@@ -335,6 +432,11 @@ def run_core_evaluation(
 def main() -> None:
     args = parse_args()
     eval_config = load_yaml_config(args.config)
+    validate_core_runtime_config(
+        runtime_cfg=dict(eval_config.get("runtime", {})),
+        core_cfg=dict(eval_config.get("core", {})),
+        context_label="evaluate_core.py",
+    )
     project_root = Path(eval_config["_project_root"]).resolve()
     checkpoint_path = _resolve_checkpoint_path(project_root, eval_config, args)
     checkpoint_payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
@@ -365,8 +467,20 @@ def main() -> None:
         args=args,
     )
     print("Resolved evaluation paths:")
-    for key, value in resolved_paths.items():
-        print(f"  {key}: {value}")
+    for key in ("processed_root", "vocab_root", "ddi_matrix_path", "report_dir", "prediction_dir"):
+        source_key = f"{key}_source"
+        if source_key in resolved_paths:
+            print(f"  {key}: {_stringify_path_source(resolved_paths[key], str(resolved_paths[source_key]))}")
+        else:
+            print(f"  {key}: {resolved_paths[key]}")
+    if _compatibility_fallback_used(
+        sources=[
+            str(resolved_paths.get("processed_root_source", "")),
+            str(resolved_paths.get("vocab_root_source", "")),
+            str(resolved_paths.get("ddi_matrix_path_source", "")),
+        ]
+    ):
+        print("Compatibility fallback is active: evaluation is using handover_data artifacts instead of canonical data/... paths.")
 
     runtime_cfg = dict(eval_config.get("runtime", {}))
     evaluation_cfg = dict(eval_config.get("evaluation", {}))
@@ -378,18 +492,30 @@ def main() -> None:
     batch_size = int(runtime_cfg.get("batch_size", 32))
     decoder_top_k = int(prediction_cfg.get("top_k", 10))
 
-    ddi_matrix = load_ddi_matrix(resolved_paths["ddi_matrix_path"], device="cpu")
+    ddi_artifact = load_ddi_artifact(resolved_paths["ddi_matrix_path"], device="cpu")
+    ddi_artifact["status"] = "active" if ddi_artifact["active"] else "inactive"
     drug_vocab_size = int(read_json(resolved_paths["vocab_root"] / "drug_vocab.json")["size"])
-    if ddi_matrix.shape[0] != drug_vocab_size:
+    if ddi_artifact["matrix"].shape[0] != drug_vocab_size:
         raise ValueError(
             "DDI matrix width must match drug vocabulary size: "
-            f"got ddi={int(ddi_matrix.shape[0])}, vocab={drug_vocab_size}"
+            f"got ddi={int(ddi_artifact['matrix'].shape[0])}, vocab={drug_vocab_size}"
         )
 
     print(f"Using device: {device}")
     print(f"Evaluating split: {split}")
     print(f"Using threshold: {threshold}")
     print(f"Loading checkpoint: {checkpoint_path}")
+    print(
+        "Evaluation DDI state: "
+        f"status={ddi_artifact['status']} "
+        f"reason={ddi_artifact['reason']} "
+        f"source={ddi_artifact['source']} "
+        f"matched_pairs={ddi_artifact['matched_pairs']} "
+        f"nonzero_pairs={ddi_artifact['nonzero_pairs']} "
+        f"kind={dict(ddi_artifact.get('source_metadata') or {}).get('kind', '')} "
+        f"research_grade={dict(ddi_artifact.get('source_metadata') or {}).get('research_grade')} "
+        f"purpose={dict(ddi_artifact.get('source_metadata') or {}).get('purpose', '')}"
+    )
 
     train_config = copy.deepcopy(train_config)
     train_config["_resolved_paths"] = {"processed_root": str(resolved_paths["processed_root"])}
@@ -421,17 +547,21 @@ def main() -> None:
 
     model_state_dict = checkpoint_payload.get("model_state_dict")
     if not isinstance(model_state_dict, Mapping):
-        raise KeyError("Checkpoint does not contain `model_state_dict`.")
-    model.load_state_dict(model_state_dict, strict=True)
+        raise KeyError(f"Checkpoint at {checkpoint_path} does not contain `model_state_dict`.")
+    try:
+        model.load_state_dict(model_state_dict, strict=True)
+    except RuntimeError as exc:
+        raise RuntimeError(f"Failed to load checkpoint state from {checkpoint_path}: {exc}") from exc
 
     evaluation_result = run_core_evaluation(
         model=model,
         dataloader=dataloader,
         device=device,
         threshold=threshold,
-        ddi_matrix=ddi_matrix,
+        ddi_artifact=ddi_artifact,
         decoder_top_k=decoder_top_k,
     )
+    training_ddi_context = checkpoint_payload.get("ddi_context")
 
     report: dict[str, Any] = {
         "split": split,
@@ -441,6 +571,10 @@ def main() -> None:
         "device": str(device),
         "metrics": evaluation_result["metrics"],
         "ddi_summary": evaluation_result["ddi_summary"],
+        "ddi_context": {
+            "training": training_ddi_context,
+            "evaluation": {key: value for key, value in ddi_artifact.items() if key != "matrix"},
+        },
         "prediction_summary": evaluation_result["prediction_summary"],
         "artifacts": {},
     }

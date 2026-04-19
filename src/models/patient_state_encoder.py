@@ -35,9 +35,11 @@ class PatientStateEncoder(nn.Module):
         time_embedding_dim: int = 32,
         visit_hidden_dim: int = 128,
         hidden_dim: int = 128,
+        num_layers: int = 1,
         dropout: float = 0.1,
     ) -> None:
         super().__init__()
+        resolved_num_layers = max(int(num_layers), 1)
         self.diagnosis_encoder = DiagnosisEncoder(diagnosis_vocab_size, code_embedding_dim, padding_idx=0)
         self.procedure_encoder = ProcedureEncoder(procedure_vocab_size, code_embedding_dim, padding_idx=0)
         self.medication_embedding = nn.Embedding(drug_vocab_size, medication_embedding_dim, padding_idx=0)
@@ -58,7 +60,13 @@ class PatientStateEncoder(nn.Module):
             nn.ReLU(),
             nn.Dropout(dropout),
         )
-        self.gru = nn.GRU(visit_hidden_dim, hidden_dim, batch_first=True)
+        self.gru = nn.GRU(
+            visit_hidden_dim,
+            hidden_dim,
+            num_layers=resolved_num_layers,
+            dropout=float(dropout) if resolved_num_layers > 1 else 0.0,
+            batch_first=True,
+        )
 
     def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         diag_repr = self.diagnosis_encoder(batch["diag_codes"], batch["diag_mask"])
@@ -77,7 +85,11 @@ class PatientStateEncoder(nn.Module):
             torch.cat([diag_repr, proc_repr, med_repr, lab_repr, vital_repr, time_repr], dim=-1)
         )
         visit_mask = batch["visit_mask"]
-        lengths = visit_mask.sum(dim=-1).clamp(min=1).cpu()
+        visit_lengths = batch.get("visit_lengths")
+        if visit_lengths is None:
+            lengths = visit_mask.sum(dim=-1).clamp(min=1).cpu()
+        else:
+            lengths = visit_lengths.to(dtype=torch.long, device="cpu").clamp(min=1)
         packed = pack_padded_sequence(visit_repr, lengths, batch_first=True, enforce_sorted=False)
         packed_output, hidden = self.gru(packed)
         state_sequence, _ = pad_packed_sequence(

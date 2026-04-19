@@ -286,6 +286,7 @@ clinrec/
 │   └── 07_counterfactual_cases.ipynb
 ├── scripts/
 │   ├── preprocess.ps1
+│   ├── preprocess.sh
 │   ├── train_core.ps1
 │   ├── train_extended.ps1
 │   └── evaluate.ps1
@@ -329,6 +330,7 @@ clinrec/
 ```text
 load_mimic.py
   → build_cohort.py
+  → stage_filtered_tables.py
   → build_vocab.py / build_ddi_matrix.py
   → build_trajectories.py
   → dataset.py
@@ -444,17 +446,28 @@ Chỉnh các file sau cho phù hợp với máy của bạn:
 **PowerShell**
 
 ```powershell
-./scripts/preprocess.ps1
+./scripts/preprocess.ps1 -Config configs/data.yaml
+```
+
+**Bash / Linux / macOS**
+
+```bash
+./scripts/preprocess.sh --config configs/data.yaml
 ```
 
 Hoặc chạy từng bước bằng Python:
 
 ```bash
-python -m src.data.build_cohort
-python -m src.data.build_vocab
-python -m src.data.build_ddi_matrix
-python -m src.data.build_trajectories
+python -m src.data.build_cohort --config configs/data.yaml
+python -m src.data.stage_filtered_tables --config configs/data.yaml
+python -m src.data.build_vocab --config configs/data.yaml
+python -m src.data.build_ddi_matrix --config configs/data.yaml
+python -m src.data.build_trajectories --config configs/data.yaml
 ```
+
+Neu ban vua chay lai `build_cohort` hoac thay doi cohort / Spark-related config,
+hay chay lai `stage_filtered_tables` truoc `build_vocab` va `build_trajectories`
+de refresh `data/interim/spark_cache/`.
 
 Sau bước này, các thư mục quan trọng cần xuất hiện:
 
@@ -465,6 +478,11 @@ Sau bước này, các thư mục quan trọng cần xuất hiện:
 - `data/processed/val/`
 - `data/processed/test/`
 - `data/processed/ddi/`
+
+Luu y:
+Mac dinh local repo nay tro `ddi_source_path` den `data/raw/ddi/drug_ddi_smoke.csv`.
+Day la source `manual_smoke`, chi dung cho local wiring / smoke test cua DDI path, khong duoc dung de claim ket qua nghien cuu.
+Muon co `research-grade real DDI`, ban phai thay bang source DDI that va rebuild de artifact/report cho thay `matched_pairs > 0` tu source do.
 
 ---
 
@@ -481,6 +499,9 @@ hoặc:
 ```bash
 python -m src.training.train_core
 ```
+
+Checkpoint va report core se carry `ddi_context` cua artifact dang dung.
+Neu ban dang chay voi `manual_smoke` source, training van co the `DDI active` de test wiring, nhung khong duoc dien giai nhu DDI research-grade.
 
 ### 10.2. Train bản mở rộng
 

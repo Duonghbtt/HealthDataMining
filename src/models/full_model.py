@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from typing import Any, Mapping, Sequence
 
 import torch
@@ -87,6 +88,7 @@ class RetrievalEvidenceFusionModel(nn.Module):
         group_encoder: GroupEncoder | None = None,
         medication_decoder: MedicationDecoder | None = None,
         ddi_regularizer: DDIRegularizer | None = None,
+        ddi_context: Mapping[str, Any] | None = None,
         mode: str = "core",
         retrieval_top_k: int = 5,
         temporal_decay_alpha: float = 0.05,
@@ -106,12 +108,31 @@ class RetrievalEvidenceFusionModel(nn.Module):
         self.group_encoder = group_encoder
         self.medication_decoder = medication_decoder
         self.ddi_regularizer = ddi_regularizer
+        self.ddi_context = copy.deepcopy(dict(ddi_context or {}))
         self.mode = _resolve_mode(mode, None)
         self.retrieval_top_k = int(retrieval_top_k)
         self.temporal_decay_alpha = float(temporal_decay_alpha)
         self.retrieval_backend = retrieval_backend
         self.use_faiss_if_available = bool(use_faiss_if_available)
         self.allow_cross_split = bool(allow_cross_split)
+
+    def _base_safety_metadata(self, *, mode: str, retrieval_used: bool) -> dict[str, Any]:
+        ddi_active = bool(self.ddi_context.get("active", self.ddi_regularizer is not None))
+        ddi_status = "active" if ddi_active else "inactive"
+        return {
+            "ddi_active": ddi_active,
+            "ddi_available": ddi_active,
+            "ddi_regularizer_present": self.ddi_regularizer is not None,
+            "ddi_status": ddi_status,
+            "ddi_reason": self.ddi_context.get("reason", "available" if ddi_active else "unavailable"),
+            "ddi_source": self.ddi_context.get("source", ""),
+            "matched_pairs": self.ddi_context.get("matched_pairs"),
+            "nonzero_pairs": self.ddi_context.get("nonzero_pairs"),
+            "vocab_size": self.ddi_context.get("vocab_size"),
+            "source_metadata": copy.deepcopy(dict(self.ddi_context.get("source_metadata") or {})),
+            "mode": mode,
+            "retrieval_used": retrieval_used,
+        }
 
     def _build_retrieval_payload_if_possible(
         self,
@@ -195,17 +216,14 @@ class RetrievalEvidenceFusionModel(nn.Module):
         dtype: torch.dtype,
         mode: str,
         retrieval_used: bool,
+        compute_ddi_metrics: bool,
     ) -> dict[str, Any]:
-        if self.ddi_regularizer is None or drug_probs is None:
+        safety_metadata = self._base_safety_metadata(mode=mode, retrieval_used=retrieval_used)
+        if self.ddi_regularizer is None or drug_probs is None or not compute_ddi_metrics:
             return {
                 "ddi_penalty_per_sample": None,
                 "ddi_penalty_mean": None,
-                "safety_metadata": {
-                    "ddi_available": False,
-                    "ddi_regularizer_present": self.ddi_regularizer is not None,
-                    "mode": mode,
-                    "retrieval_used": retrieval_used,
-                },
+                "safety_metadata": safety_metadata,
             }
 
         ddi_penalty_per_sample = self.ddi_regularizer.compute_penalty_per_sample(drug_probs)
@@ -214,12 +232,7 @@ class RetrievalEvidenceFusionModel(nn.Module):
         return {
             "ddi_penalty_per_sample": ddi_penalty_per_sample,
             "ddi_penalty_mean": ddi_penalty_mean,
-            "safety_metadata": {
-                "ddi_available": True,
-                "ddi_regularizer_present": True,
-                "mode": mode,
-                "retrieval_used": retrieval_used,
-            },
+            "safety_metadata": safety_metadata,
         }
 
     def forward(
@@ -234,6 +247,7 @@ class RetrievalEvidenceFusionModel(nn.Module):
         mode: str | None = None,
         attribute_payload: Mapping[str, Any] | None = None,
         decoder_top_k: int | None = None,
+        compute_ddi_metrics: bool = True,
     ) -> dict[str, Any]:
         encoder_outputs = self.encoder(dict(batch))
         current_state = encoder_outputs["pooled_state"]
@@ -320,21 +334,30 @@ class RetrievalEvidenceFusionModel(nn.Module):
             dtype=current_state.dtype,
             mode=resolved_mode,
             retrieval_used=retrieval_used,
+            compute_ddi_metrics=compute_ddi_metrics,
         )
 
+        final_target_drugs_payload = batch.get("final_target_drugs")
         target_drugs = batch.get("target_drugs")
         resolved_target_drugs: torch.Tensor | None = None
         final_target_drugs: torch.Tensor | None = None
+        if final_target_drugs_payload is not None:
+            final_target_drugs = torch.as_tensor(
+                final_target_drugs_payload,
+                device=current_state.device,
+                dtype=current_state.dtype,
+            )
         if target_drugs is not None:
             resolved_target_drugs = torch.as_tensor(
                 target_drugs,
                 device=current_state.device,
                 dtype=current_state.dtype,
             )
-            final_target_drugs = _extract_last_valid_targets(
-                resolved_target_drugs,
-                encoder_outputs["visit_mask"],
-            )
+            if final_target_drugs is None:
+                final_target_drugs = _extract_last_valid_targets(
+                    resolved_target_drugs,
+                    encoder_outputs["visit_mask"],
+                )
 
         return {
             **encoder_outputs,
