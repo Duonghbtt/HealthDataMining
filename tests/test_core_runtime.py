@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from unittest import mock
 
 import pytest
 import yaml
@@ -25,6 +26,7 @@ from src.training.train_core import (
     build_scheduler,
     resolve_profile_name,
 )
+from src.training.trainer import Trainer, resolve_precision_policy
 from src.utils.io import (
     load_yaml_config,
     save_pt,
@@ -120,6 +122,7 @@ def _write_config_bundle(project_root: Path) -> dict[str, Path]:
             "learning_rate": 1.0e-3,
             "optimizer": "adam",
             "scheduler": "none",
+            "max_grad_norm": 1.0,
         },
         "loss": {"ddi_lambda": 0.05},
         "prediction": {"top_k": 2, "threshold": 0.5},
@@ -1068,6 +1071,7 @@ def test_trainer_logs_timing_metrics_and_checkpoint_profile(tmp_path: Path) -> N
         decoder_top_k=int(train_config["runtime"]["train_decoder_top_k"]),
         amp=bool(train_config["runtime"]["amp"]),
         grad_accum_steps=int(train_config["runtime"]["grad_accum_steps"]),
+        max_grad_norm=float(train_config["optimization"]["max_grad_norm"]),
         non_blocking_transfer=bool(train_config["runtime"]["non_blocking_transfer"]),
         log_interval=int(train_config["runtime"]["log_interval"]),
         profile_steps=int(train_config["runtime"]["profile_steps"]),
@@ -1102,9 +1106,176 @@ def test_trainer_logs_timing_metrics_and_checkpoint_profile(tmp_path: Path) -> N
     assert "train_data_time" in log_entry
     assert "train_step_time" in log_entry
     assert "train_samples_per_sec" in log_entry
+    assert log_entry["run_context"]["runtime"]["requested_amp"] is False
+    assert log_entry["run_context"]["runtime"]["resolved_precision"] == "fp32"
+    assert log_entry["run_context"]["runtime"]["grad_scaler_enabled"] is False
+    assert log_entry["run_context"]["runtime"]["max_grad_norm"] == pytest.approx(1.0)
 
     checkpoint = torch.load(trainer.best_checkpoint_path, map_location="cpu", weights_only=False)
     assert checkpoint["selected_profile"] == profile_name
+
+
+def test_resolve_precision_policy_cpu_uses_fp32() -> None:
+    torch = pytest.importorskip("torch")
+
+    policy = resolve_precision_policy(requested_amp=True, device=torch.device("cpu"))
+
+    assert policy.requested_amp is True
+    assert policy.resolved_precision == "fp32"
+    assert policy.use_autocast is False
+    assert policy.autocast_dtype is None
+    assert policy.grad_scaler_enabled is False
+    assert policy.warning_message is None
+
+
+def test_resolve_precision_policy_cuda_prefers_bfloat16() -> None:
+    torch = pytest.importorskip("torch")
+
+    with mock.patch.object(torch.cuda, "is_bf16_supported", return_value=True, create=True):
+        policy = resolve_precision_policy(requested_amp=True, device=torch.device("cuda"))
+
+    assert policy.requested_amp is True
+    assert policy.resolved_precision == "bf16"
+    assert policy.use_autocast is True
+    assert policy.autocast_dtype == torch.bfloat16
+    assert policy.grad_scaler_enabled is False
+    assert policy.warning_message is None
+
+
+def test_resolve_precision_policy_cuda_without_bfloat16_falls_back_to_fp32() -> None:
+    torch = pytest.importorskip("torch")
+
+    with mock.patch.object(torch.cuda, "is_bf16_supported", return_value=False, create=True):
+        policy = resolve_precision_policy(requested_amp=True, device=torch.device("cuda"))
+
+    assert policy.requested_amp is True
+    assert policy.resolved_precision == "fp32"
+    assert policy.use_autocast is False
+    assert policy.autocast_dtype is None
+    assert policy.grad_scaler_enabled is False
+    assert policy.warning_message is not None
+    assert "falling back to float32" in policy.warning_message
+
+
+def test_trainer_raises_contextual_error_for_non_finite_forward_outputs(tmp_path: Path) -> None:
+    torch = pytest.importorskip("torch")
+
+    class NaNForwardModel(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.anchor = torch.nn.Parameter(torch.zeros(1, dtype=torch.float32))
+
+        def forward(self, batch, *, mode, decoder_top_k, compute_ddi_metrics):
+            _ = mode
+            _ = decoder_top_k
+            _ = compute_ddi_metrics
+            batch_size = int(batch["visit_mask"].shape[0])
+            fused = self.anchor.expand(batch_size, 2) * 0.0
+            bad = torch.full_like(fused, float("nan"))
+            return {
+                "pooled_state": fused,
+                "fused_repr": fused,
+                "drug_logits": bad,
+                "drug_probs": bad,
+            }
+
+    dataset = [
+        {
+            "visit_mask": torch.tensor([True], dtype=torch.bool),
+            "lab_values": torch.tensor([[0.1]], dtype=torch.float32),
+            "vital_values": torch.tensor([[0.2]], dtype=torch.float32),
+            "time_delta_hours": torch.tensor([0.0], dtype=torch.float32),
+            "final_target_drugs": torch.tensor([1.0, 0.0], dtype=torch.float32),
+        }
+    ]
+    dataloader = torch.utils.data.DataLoader(dataset, batch_size=1, shuffle=False)
+    model = NaNForwardModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    trainer = Trainer(
+        model=model,
+        loss_fn=torch.nn.Identity(),
+        optimizer=optimizer,
+        device=torch.device("cpu"),
+        checkpoint_dir=tmp_path / "checkpoints",
+        log_dir=tmp_path / "logs",
+    )
+
+    with pytest.raises(RuntimeError, match=r"val step 1 after forward: tensor `drug_logits`"):
+        trainer.validate_one_epoch(dataloader)
+
+
+def test_trainer_raises_when_optimizer_produces_non_finite_parameter(tmp_path: Path) -> None:
+    torch = pytest.importorskip("torch")
+
+    class StableModel(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.logit_bias = torch.nn.Parameter(torch.zeros(2, dtype=torch.float32))
+
+        def forward(self, batch, *, mode, decoder_top_k, compute_ddi_metrics):
+            _ = mode
+            _ = decoder_top_k
+            _ = compute_ddi_metrics
+            batch_size = int(batch["visit_mask"].shape[0])
+            logits = self.logit_bias.unsqueeze(0).expand(batch_size, -1)
+            fused = logits * 0.0
+            return {
+                "pooled_state": fused,
+                "fused_repr": fused,
+                "drug_logits": logits,
+                "drug_probs": torch.sigmoid(logits),
+            }
+
+    class SimpleLoss(torch.nn.Module):
+        def forward(self, *, drug_logits, drug_probs, target_drugs, visit_mask):
+            _ = drug_probs
+            _ = visit_mask
+            prediction_loss = torch.nn.functional.binary_cross_entropy_with_logits(
+                drug_logits,
+                target_drugs,
+            )
+            zero = prediction_loss.new_zeros(())
+            return {
+                "total_loss": prediction_loss,
+                "prediction_loss": prediction_loss,
+                "ddi_loss": zero,
+                "weighted_ddi_loss": zero,
+            }
+
+    class PoisonOptimizer(torch.optim.SGD):
+        def __init__(self, params, *, poison_parameter, lr=0.1) -> None:
+            super().__init__(params, lr=lr)
+            self.poison_parameter = poison_parameter
+
+        def step(self, closure=None):
+            loss = super().step(closure)
+            self.poison_parameter.data.fill_(float("nan"))
+            return loss
+
+    dataset = [
+        {
+            "visit_mask": torch.tensor([True], dtype=torch.bool),
+            "lab_values": torch.tensor([[0.1]], dtype=torch.float32),
+            "vital_values": torch.tensor([[0.2]], dtype=torch.float32),
+            "time_delta_hours": torch.tensor([0.0], dtype=torch.float32),
+            "final_target_drugs": torch.tensor([1.0, 0.0], dtype=torch.float32),
+        }
+    ]
+    dataloader = torch.utils.data.DataLoader(dataset, batch_size=1, shuffle=False)
+    model = StableModel()
+    optimizer = PoisonOptimizer(model.parameters(), poison_parameter=model.logit_bias, lr=0.1)
+    trainer = Trainer(
+        model=model,
+        loss_fn=SimpleLoss(),
+        optimizer=optimizer,
+        device=torch.device("cpu"),
+        checkpoint_dir=tmp_path / "checkpoints",
+        log_dir=tmp_path / "logs",
+        max_grad_norm=1.0,
+    )
+
+    with pytest.raises(RuntimeError, match=r"train step 1 after optimizer step: tensor `parameter:logit_bias`"):
+        trainer.train_one_epoch(dataloader)
 
 
 def test_sparse_ddi_regularizer_matches_dense_penalty() -> None:

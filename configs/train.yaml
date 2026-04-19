@@ -32,6 +32,7 @@ optimization:
   learning_rate: 1.0e-3
   optimizer: adam
   scheduler: none
+  max_grad_norm: 1.0
 
 loss:
   ddi_lambda: 0.05

@@ -5,6 +5,8 @@ import copy
 import itertools
 import json
 import time
+import warnings
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -28,6 +30,59 @@ _TIMING_KEYS = (
     "samples_per_sec",
 )
 _KEEP_CPU_BATCH_KEYS = frozenset({"visit_lengths"})
+_BATCH_FINITE_CHECK_KEYS = ("lab_values", "vital_values", "time_delta_hours")
+_OUTPUT_FINITE_CHECK_KEYS = ("pooled_state", "fused_repr", "drug_logits", "drug_probs")
+
+
+@dataclass(frozen=True)
+class PrecisionPolicy:
+    requested_amp: bool
+    resolved_precision: str
+    use_autocast: bool
+    autocast_dtype: torch.dtype | None
+    grad_scaler_enabled: bool
+    warning_message: str | None = None
+
+
+def _cuda_bfloat16_supported() -> bool:
+    support_check = getattr(torch.cuda, "is_bf16_supported", None)
+    if support_check is None:
+        return False
+    try:
+        return bool(support_check())
+    except Exception:
+        return False
+
+
+def resolve_precision_policy(*, requested_amp: bool, device: torch.device) -> PrecisionPolicy:
+    resolved_requested_amp = bool(requested_amp)
+    if not resolved_requested_amp or device.type != "cuda":
+        return PrecisionPolicy(
+            requested_amp=resolved_requested_amp,
+            resolved_precision="fp32",
+            use_autocast=False,
+            autocast_dtype=None,
+            grad_scaler_enabled=False,
+        )
+    if _cuda_bfloat16_supported():
+        return PrecisionPolicy(
+            requested_amp=True,
+            resolved_precision="bf16",
+            use_autocast=True,
+            autocast_dtype=torch.bfloat16,
+            grad_scaler_enabled=False,
+        )
+    return PrecisionPolicy(
+        requested_amp=True,
+        resolved_precision="fp32",
+        use_autocast=False,
+        autocast_dtype=None,
+        grad_scaler_enabled=False,
+        warning_message=(
+            "AMP was requested on CUDA, but bfloat16 autocast is not supported on this device; "
+            "falling back to float32 for stability."
+        ),
+    )
 
 
 def _to_float(value: Any) -> float:
@@ -87,6 +142,7 @@ class Trainer:
         run_context: Mapping[str, Any] | None = None,
         amp: bool = False,
         grad_accum_steps: int = 1,
+        max_grad_norm: float | None = None,
         non_blocking_transfer: bool = False,
         log_interval: int = 50,
         profile_steps: int | None = None,
@@ -96,6 +152,8 @@ class Trainer:
             raise ValueError(f"monitor_mode must be 'min' or 'max', got {monitor_mode!r}")
         if int(grad_accum_steps) <= 0:
             raise ValueError(f"grad_accum_steps must be positive, got {grad_accum_steps!r}")
+        if max_grad_norm is not None and float(max_grad_norm) <= 0.0:
+            raise ValueError(f"max_grad_norm must be positive when provided, got {max_grad_norm!r}")
         if int(log_interval) <= 0:
             raise ValueError(f"log_interval must be positive, got {log_interval!r}")
         if profile_steps is not None and int(profile_steps) <= 0:
@@ -111,16 +169,37 @@ class Trainer:
         self.decoder_top_k = decoder_top_k
         self.run_context = copy.deepcopy(dict(run_context or {}))
 
-        self.use_amp = bool(amp) and device.type == "cuda"
+        self.precision_policy = resolve_precision_policy(requested_amp=bool(amp), device=device)
+        self.requested_amp = self.precision_policy.requested_amp
+        self.resolved_precision = self.precision_policy.resolved_precision
+        self.use_autocast = self.precision_policy.use_autocast
+        self.use_amp = self.use_autocast
+        self.autocast_dtype = self.precision_policy.autocast_dtype
+        self.grad_scaler_enabled = self.precision_policy.grad_scaler_enabled
         self.grad_accum_steps = int(grad_accum_steps)
+        self.max_grad_norm = None if max_grad_norm is None else float(max_grad_norm)
         self.non_blocking_transfer = bool(non_blocking_transfer)
         self.log_interval = int(log_interval)
         self.profile_steps = None if profile_steps is None else int(profile_steps)
         self.timing_enabled = bool(timing_enabled)
-        if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
-            self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
-        else:  # pragma: no cover - compatibility path for older torch
-            self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
+        if self.precision_policy.warning_message:
+            warnings.warn(self.precision_policy.warning_message, RuntimeWarning, stacklevel=2)
+        if self.grad_scaler_enabled:
+            if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
+                self.scaler = torch.amp.GradScaler("cuda", enabled=True)
+            else:  # pragma: no cover - compatibility path for older torch
+                self.scaler = torch.cuda.amp.GradScaler(enabled=True)
+        else:
+            self.scaler = None
+
+        runtime_context = self.run_context.get("runtime")
+        if not isinstance(runtime_context, dict):
+            runtime_context = {}
+            self.run_context["runtime"] = runtime_context
+        runtime_context["requested_amp"] = self.requested_amp
+        runtime_context["resolved_precision"] = self.resolved_precision
+        runtime_context["grad_scaler_enabled"] = self.grad_scaler_enabled
+        runtime_context["max_grad_norm"] = self.max_grad_norm
 
         self.checkpoint_dir = ensure_dir(checkpoint_dir)
         self.log_dir = ensure_dir(log_dir)
@@ -133,9 +212,68 @@ class Trainer:
             torch.cuda.synchronize(self.device)
 
     def _autocast_context(self):
-        if not self.use_amp:
+        if not self.use_autocast or self.autocast_dtype is None:
             return contextlib.nullcontext()
-        return torch.autocast(device_type=self.device.type, dtype=torch.float16)
+        return torch.autocast(device_type=self.device.type, dtype=self.autocast_dtype)
+
+    def _raise_non_finite_tensor(self, tensor: torch.Tensor, *, name: str, context: str) -> None:
+        invalid = ~torch.isfinite(tensor)
+        if not bool(invalid.any().item()):
+            return
+        first_invalid = torch.nonzero(invalid, as_tuple=False)[0].tolist()
+        raise RuntimeError(
+            f"{context}: tensor `{name}` contains non-finite values at index {first_invalid} "
+            f"(shape={tuple(tensor.shape)}, dtype={tensor.dtype})"
+        )
+
+    def _validate_tensor_finite(self, tensor: Any, *, name: str, context: str) -> None:
+        if not isinstance(tensor, torch.Tensor):
+            return
+        if not tensor.is_floating_point() and not tensor.is_complex():
+            return
+        self._raise_non_finite_tensor(tensor, name=name, context=context)
+
+    def _validate_batch_inputs_finite(
+        self,
+        batch_on_device: Mapping[str, Any],
+        *,
+        context: str,
+    ) -> None:
+        for key in _BATCH_FINITE_CHECK_KEYS:
+            self._validate_tensor_finite(batch_on_device.get(key), name=key, context=context)
+        self._validate_tensor_finite(
+            batch_on_device.get("final_target_drugs"),
+            name="final_target_drugs",
+            context=context,
+        )
+        self._validate_tensor_finite(
+            batch_on_device.get("target_drugs"),
+            name="target_drugs",
+            context=context,
+        )
+
+    def _validate_model_outputs_finite(
+        self,
+        outputs: Mapping[str, Any],
+        *,
+        context: str,
+    ) -> None:
+        for key in _OUTPUT_FINITE_CHECK_KEYS:
+            self._validate_tensor_finite(outputs.get(key), name=key, context=context)
+
+    def _clip_gradients(self) -> None:
+        if self.max_grad_norm is None:
+            return
+        if self.grad_scaler_enabled and self.scaler is not None:
+            self.scaler.unscale_(self.optimizer)
+        parameters = [parameter for parameter in self.model.parameters() if parameter.grad is not None]
+        if not parameters:
+            return
+        torch.nn.utils.clip_grad_norm_(parameters, self.max_grad_norm)
+
+    def _validate_model_parameters_finite(self, *, context: str) -> None:
+        for name, parameter in self.model.named_parameters():
+            self._validate_tensor_finite(parameter, name=f"parameter:{name}", context=context)
 
     def _max_epoch_steps(self, dataloader: DataLoader) -> int | None:
         if self.profile_steps is None:
@@ -207,12 +345,14 @@ class Trainer:
             visit_mask=batch_on_device["visit_mask"],
         )
 
-    def _optimizer_step(self) -> None:
-        if self.use_amp:
+    def _optimizer_step(self, *, context: str) -> None:
+        self._clip_gradients()
+        if self.grad_scaler_enabled and self.scaler is not None:
             self.scaler.step(self.optimizer)
             self.scaler.update()
         else:
             self.optimizer.step()
+        self._validate_model_parameters_finite(context=context)
         self.optimizer.zero_grad(set_to_none=True)
 
     def _timing_metric_payload(
@@ -274,6 +414,7 @@ class Trainer:
 
         try:
             for step_index, batch in enumerate(iterable, start=1):
+                step_context = f"{phase} step {step_index}"
                 data_time = time.perf_counter() - last_step_end
 
                 transfer_start = time.perf_counter()
@@ -289,11 +430,19 @@ class Trainer:
                 if batch_size <= 0:
                     last_step_end = time.perf_counter()
                     continue
+                self._validate_batch_inputs_finite(
+                    batch_on_device,
+                    context=f"{step_context} before forward",
+                )
 
                 with grad_context():
                     forward_start = time.perf_counter()
                     with self._autocast_context():
                         outputs = self._forward_model(batch_on_device)
+                    self._validate_model_outputs_finite(
+                        outputs,
+                        context=f"{step_context} after forward",
+                    )
                     self._sync_timing()
                     forward_time = time.perf_counter() - forward_start
 
@@ -311,7 +460,7 @@ class Trainer:
                     if training:
                         backward_start = time.perf_counter()
                         scaled_loss = loss_outputs["total_loss"] / float(self.grad_accum_steps)
-                        if self.use_amp:
+                        if self.grad_scaler_enabled and self.scaler is not None:
                             self.scaler.scale(scaled_loss).backward()
                         else:
                             scaled_loss.backward()
@@ -321,7 +470,9 @@ class Trainer:
 
                         if batches_since_step >= self.grad_accum_steps:
                             optimizer_start = time.perf_counter()
-                            self._optimizer_step()
+                            self._optimizer_step(
+                                context=f"{step_context} after optimizer step",
+                            )
                             self._sync_timing()
                             optimizer_time = time.perf_counter() - optimizer_start
                             batches_since_step = 0
@@ -354,7 +505,7 @@ class Trainer:
 
         if training and batches_since_step > 0:
             optimizer_start = time.perf_counter()
-            self._optimizer_step()
+            self._optimizer_step(context=f"{phase} epoch-end optimizer flush")
             self._sync_timing()
             optimizer_flush_time = time.perf_counter() - optimizer_start
             timing_totals["optimizer_time"] += optimizer_flush_time
@@ -514,4 +665,12 @@ class Trainer:
         }
 
 
-__all__ = ["Trainer", "_LOSS_KEYS", "_move_batch_to_device", "_resolve_target_tensor", "_to_float"]
+__all__ = [
+    "PrecisionPolicy",
+    "Trainer",
+    "_LOSS_KEYS",
+    "_move_batch_to_device",
+    "_resolve_target_tensor",
+    "_to_float",
+    "resolve_precision_policy",
+]

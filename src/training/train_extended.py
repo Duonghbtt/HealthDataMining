@@ -293,19 +293,33 @@ class ExtendedTrainer(Trainer):
         grad_context = torch.enable_grad if training else torch.no_grad
         phase_memory_bank = self.train_memory_bank if training else self.val_memory_bank
 
-        for batch in dataloader:
-            batch_on_device = _move_batch_to_device(batch, self.device)
+        for step_index, batch in enumerate(dataloader, start=1):
+            step_context = f"{phase} step {step_index}"
+            batch_on_device = _move_batch_to_device(
+                batch,
+                self.device,
+                non_blocking=self.non_blocking_transfer,
+            )
             batch_size = int(batch_on_device["visit_mask"].shape[0])
             if batch_size <= 0:
                 continue
+            self._validate_batch_inputs_finite(
+                batch_on_device,
+                context=f"{step_context} before forward",
+            )
 
             if training:
                 self.optimizer.zero_grad(set_to_none=True)
 
             with grad_context():
-                outputs = self._forward_with_fallback(
-                    batch_on_device,
-                    memory_bank=phase_memory_bank if self.use_retrieval else None,
+                with self._autocast_context():
+                    outputs = self._forward_with_fallback(
+                        batch_on_device,
+                        memory_bank=phase_memory_bank if self.use_retrieval else None,
+                    )
+                self._validate_model_outputs_finite(
+                    outputs,
+                    context=f"{step_context} after forward",
                 )
                 drug_logits = outputs.get("drug_logits")
                 drug_probs = outputs.get("drug_probs")
@@ -315,16 +329,20 @@ class ExtendedTrainer(Trainer):
                         "Ensure a medication decoder is attached in extended training."
                     )
 
-                loss_outputs = self.loss_fn(
-                    drug_logits=drug_logits,
-                    drug_probs=drug_probs,
-                    target_drugs=batch_on_device["target_drugs"],
-                    visit_mask=batch_on_device["visit_mask"],
-                )
+                with self._autocast_context():
+                    loss_outputs = self.loss_fn(
+                        drug_logits=drug_logits,
+                        drug_probs=drug_probs,
+                        target_drugs=batch_on_device["target_drugs"],
+                        visit_mask=batch_on_device["visit_mask"],
+                    )
 
                 if training:
-                    loss_outputs["total_loss"].backward()
-                    self.optimizer.step()
+                    if self.grad_scaler_enabled and self.scaler is not None:
+                        self.scaler.scale(loss_outputs["total_loss"]).backward()
+                    else:
+                        loss_outputs["total_loss"].backward()
+                    self._optimizer_step(context=f"{step_context} after optimizer step")
 
             total_examples += batch_size
             for key in _LOSS_KEYS:
@@ -450,6 +468,8 @@ def main() -> None:
     extended_cfg = dict(train_config.get("extended", {}))
     device = resolve_device(args.device or runtime_cfg.get("device", "cpu"))
     seed = int(args.seed if args.seed is not None else data_config.get("seed", 17))
+    requested_amp = bool(runtime_cfg.get("amp", False))
+    max_grad_norm = float(train_config.get("optimization", {}).get("max_grad_norm", 1.0))
     set_seed(seed)
 
     print(f"Using device: {device}")
@@ -497,7 +517,27 @@ def main() -> None:
         monitor_metric="val_total_loss",
         monitor_mode="min",
         decoder_top_k=int(train_config.get("prediction", {}).get("top_k", 10)),
+        amp=requested_amp,
+        max_grad_norm=max_grad_norm,
+        non_blocking_transfer=bool(runtime_cfg.get("non_blocking_transfer", False)),
+        log_interval=int(runtime_cfg.get("log_interval", 50)),
+        profile_steps=runtime_cfg.get("profile_steps"),
+        run_context={
+            "runtime": {
+                "amp": requested_amp,
+                "requested_amp": requested_amp,
+                "max_grad_norm": max_grad_norm,
+            },
+        },
         use_retrieval=bool(extended_cfg.get("use_retrieval", True)),
+    )
+
+    print(
+        "Trainer precision settings: "
+        f"requested_amp={trainer.requested_amp} "
+        f"resolved_precision={trainer.resolved_precision} "
+        f"grad_scaler_enabled={trainer.grad_scaler_enabled} "
+        f"max_grad_norm={trainer.max_grad_norm}"
     )
 
     fit_result = trainer.fit(

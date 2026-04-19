@@ -652,11 +652,13 @@ def main() -> None:
     seed = int(args.seed if args.seed is not None else data_config.get("seed", 17))
     num_workers = int(runtime_cfg.get("num_workers", 0))
     pin_memory = bool(runtime_cfg.get("pin_memory", device.type == "cuda"))
+    requested_amp = bool(runtime_cfg.get("amp", False))
     persistent_workers = bool(runtime_cfg.get("persistent_workers", num_workers > 0))
     prefetch_factor = runtime_cfg.get("prefetch_factor")
     length_bucket_window = int(runtime_cfg.get("length_bucket_window", 256))
     train_decoder_top_k = int(runtime_cfg.get("train_decoder_top_k", 0))
     matmul_precision = runtime_cfg.get("matmul_precision")
+    max_grad_norm = float(train_config.get("optimization", {}).get("max_grad_norm", 1.0))
     feature_cfg = dict(data_config.get("features", {}))
     spark_cfg = dict(data_config.get("spark", {}))
     max_open_shards = int(spark_cfg.get("max_open_shards_per_dataset", 2))
@@ -680,12 +682,13 @@ def main() -> None:
     )
     print(
         "Core runtime settings: "
-        f"amp={bool(runtime_cfg.get('amp', False))} "
+        f"requested_amp={requested_amp} "
         f"grad_accum_steps={int(runtime_cfg.get('grad_accum_steps', 1))} "
         f"non_blocking_transfer={bool(runtime_cfg.get('non_blocking_transfer', False))} "
         f"train_decoder_top_k={train_decoder_top_k} "
         f"profile_steps={runtime_cfg.get('profile_steps')} "
-        f"matmul_precision={matmul_precision}"
+        f"matmul_precision={matmul_precision} "
+        f"max_grad_norm={max_grad_norm}"
     )
     print(
         "Core data view: "
@@ -763,8 +766,9 @@ def main() -> None:
         monitor_metric="val_total_loss",
         monitor_mode="min",
         decoder_top_k=train_decoder_top_k,
-        amp=bool(runtime_cfg.get("amp", False)),
+        amp=requested_amp,
         grad_accum_steps=int(runtime_cfg.get("grad_accum_steps", 1)),
+        max_grad_norm=max_grad_norm,
         non_blocking_transfer=bool(runtime_cfg.get("non_blocking_transfer", False)),
         log_interval=int(runtime_cfg.get("log_interval", 50)),
         profile_steps=runtime_cfg.get("profile_steps"),
@@ -780,7 +784,8 @@ def main() -> None:
                 "pin_memory": pin_memory,
                 "persistent_workers": persistent_workers if num_workers > 0 else False,
                 "prefetch_factor": None if num_workers <= 0 else prefetch_factor,
-                "amp": bool(runtime_cfg.get("amp", False)),
+                "amp": requested_amp,
+                "requested_amp": requested_amp,
                 "grad_accum_steps": int(runtime_cfg.get("grad_accum_steps", 1)),
                 "non_blocking_transfer": bool(runtime_cfg.get("non_blocking_transfer", False)),
                 "log_interval": int(runtime_cfg.get("log_interval", 50)),
@@ -788,8 +793,17 @@ def main() -> None:
                 "train_decoder_top_k": train_decoder_top_k,
                 "matmul_precision": matmul_precision,
                 "length_bucket_window": length_bucket_window,
+                "max_grad_norm": max_grad_norm,
             },
         },
+    )
+
+    print(
+        "Trainer precision settings: "
+        f"requested_amp={trainer.requested_amp} "
+        f"resolved_precision={trainer.resolved_precision} "
+        f"grad_scaler_enabled={trainer.grad_scaler_enabled} "
+        f"max_grad_norm={trainer.max_grad_norm}"
     )
 
     fit_result = trainer.fit(
@@ -807,6 +821,12 @@ def main() -> None:
             "configured_ddi_lambda": float(loss_fn.configured_lambda_ddi),
             "effective_ddi_lambda": float(loss_fn.effective_lambda_ddi),
             "dataset_layouts": dataset_layouts,
+            "trainer_runtime": {
+                "requested_amp": trainer.requested_amp,
+                "resolved_precision": trainer.resolved_precision,
+                "grad_scaler_enabled": trainer.grad_scaler_enabled,
+                "max_grad_norm": trainer.max_grad_norm,
+            },
         },
     )
 
