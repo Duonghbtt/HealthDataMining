@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import time
 from typing import Any, Mapping, Sequence
 
 import torch
@@ -14,6 +15,12 @@ from src.models.medication_decoder import MedicationDecoder
 from src.models.patient_state_encoder import PatientStateEncoder
 from src.retrieval.memory_bank import MemoryBank, build_last_visit_queries
 from src.retrieval.topk_retriever import retrieve_topk
+from src.utils.runtime_truth import (
+    build_core_runtime_truth,
+    build_extension_runtime_truth,
+    ddi_truth_fields,
+    normalize_ddi_context,
+)
 
 
 _VALID_MODES = {"core", "extended"}
@@ -77,7 +84,7 @@ def _extract_last_valid_targets(
 
 
 class RetrievalEvidenceFusionModel(nn.Module):
-    """End-to-end recommendation model with soft fallbacks for core and extended modes."""
+    """End-to-end recommendation model for verified core mode and experimental extensions."""
 
     def __init__(
         self,
@@ -95,6 +102,8 @@ class RetrievalEvidenceFusionModel(nn.Module):
         retrieval_backend: str = "bruteforce",
         use_faiss_if_available: bool = True,
         allow_cross_split: bool = False,
+        retrieval_scoring_mode: str = "temporal_relevance",
+        cross_split_policy: str | None = None,
     ) -> None:
         super().__init__()
         if int(retrieval_top_k) <= 0:
@@ -108,24 +117,24 @@ class RetrievalEvidenceFusionModel(nn.Module):
         self.group_encoder = group_encoder
         self.medication_decoder = medication_decoder
         self.ddi_regularizer = ddi_regularizer
-        self.ddi_context = copy.deepcopy(dict(ddi_context or {}))
+        self.ddi_context = normalize_ddi_context(ddi_context)
         self.mode = _resolve_mode(mode, None)
         self.retrieval_top_k = int(retrieval_top_k)
         self.temporal_decay_alpha = float(temporal_decay_alpha)
         self.retrieval_backend = retrieval_backend
         self.use_faiss_if_available = bool(use_faiss_if_available)
         self.allow_cross_split = bool(allow_cross_split)
+        self.retrieval_scoring_mode = str(retrieval_scoring_mode)
+        self.cross_split_policy = None if cross_split_policy is None else str(cross_split_policy)
 
     def _base_safety_metadata(self, *, mode: str, retrieval_used: bool) -> dict[str, Any]:
-        ddi_active = bool(self.ddi_context.get("active", self.ddi_regularizer is not None))
-        ddi_status = "active" if ddi_active else "inactive"
+        ddi_truth = ddi_truth_fields(self.ddi_context)
+        ddi_active = bool(ddi_truth["ddi_active"])
         return {
-            "ddi_active": ddi_active,
+            **ddi_truth,
             "ddi_available": ddi_active,
             "ddi_regularizer_present": self.ddi_regularizer is not None,
-            "ddi_status": ddi_status,
             "ddi_reason": self.ddi_context.get("reason", "available" if ddi_active else "unavailable"),
-            "ddi_source": self.ddi_context.get("source", ""),
             "matched_pairs": self.ddi_context.get("matched_pairs"),
             "nonzero_pairs": self.ddi_context.get("nonzero_pairs"),
             "vocab_size": self.ddi_context.get("vocab_size"),
@@ -133,6 +142,37 @@ class RetrievalEvidenceFusionModel(nn.Module):
             "mode": mode,
             "retrieval_used": retrieval_used,
         }
+
+    def _build_runtime_truth(
+        self,
+        *,
+        mode: str,
+        retrieval_used: bool,
+        retrieval_payload_source: str,
+        fusion_strategy: str,
+    ) -> dict[str, Any]:
+        if mode == "core":
+            runtime_truth = build_core_runtime_truth(
+                fusion_strategy=fusion_strategy,
+                ddi_context=self.ddi_context,
+            )
+        else:
+            runtime_truth = build_extension_runtime_truth(
+                fusion_strategy=fusion_strategy,
+                ddi_context=self.ddi_context,
+                retrieval_active=retrieval_used,
+                group_encoder_active=self.group_encoder is not None,
+                retrieval_scoring_mode=self.retrieval_scoring_mode,
+                retrieval_cross_split_policy=self.cross_split_policy
+                or ("allow_all" if self.allow_cross_split else "same_split"),
+            )
+        runtime_truth["retrieval_mode"] = str(self.retrieval_scoring_mode if retrieval_used else retrieval_payload_source)
+        runtime_truth["retrieval_payload_source"] = str(retrieval_payload_source)
+        runtime_truth["retrieval_scoring_mode"] = str(self.retrieval_scoring_mode)
+        runtime_truth["retrieval_cross_split_policy"] = str(
+            self.cross_split_policy or ("allow_all" if self.allow_cross_split else "same_split")
+        )
+        return runtime_truth
 
     def _build_retrieval_payload_if_possible(
         self,
@@ -144,11 +184,13 @@ class RetrievalEvidenceFusionModel(nn.Module):
         records: Sequence[Mapping[str, Any]] | None,
         query_metadata: Mapping[str, Any] | None,
         query_states: torch.Tensor | None,
-    ) -> tuple[Mapping[str, Any] | None, str]:
+    ) -> tuple[Mapping[str, Any] | None, str, dict[str, float]]:
         if retrieval_payload is not None:
-            return retrieval_payload, "provided"
-        if mode != "extended" or memory_bank is None:
-            return None, "disabled"
+            return retrieval_payload, "provided", {"retrieval_time": 0.0}
+        if mode != "extended":
+            return None, "disabled_in_core", {"retrieval_time": 0.0}
+        if memory_bank is None:
+            return None, "disabled_no_memory_bank", {"retrieval_time": 0.0}
 
         resolved_query_states: torch.Tensor | None = None
         resolved_query_metadata: Mapping[str, Any] | None = None
@@ -157,7 +199,6 @@ class RetrievalEvidenceFusionModel(nn.Module):
             resolved_query_states, resolved_query_metadata = build_last_visit_queries(
                 records,
                 encoder_outputs,
-                split=memory_bank.split,
             )
         elif query_metadata is not None:
             resolved_query_metadata = query_metadata
@@ -170,8 +211,9 @@ class RetrievalEvidenceFusionModel(nn.Module):
                 resolved_query_states = torch.as_tensor(query_states, dtype=torch.float32).cpu()
 
         if resolved_query_states is None or resolved_query_metadata is None:
-            return None, "disabled"
+            return None, "disabled_no_queries", {"retrieval_time": 0.0}
 
+        retrieval_start = time.perf_counter()
         payload = retrieve_topk(
             resolved_query_states,
             resolved_query_metadata,
@@ -181,8 +223,10 @@ class RetrievalEvidenceFusionModel(nn.Module):
             backend=self.retrieval_backend,
             use_faiss_if_available=self.use_faiss_if_available,
             allow_cross_split=self.allow_cross_split,
+            cross_split_policy=self.cross_split_policy,
+            scoring_mode=self.retrieval_scoring_mode,
         )
-        return payload, "built"
+        return payload, "built", {"retrieval_time": time.perf_counter() - retrieval_start}
 
     def _build_group_outputs(
         self,
@@ -253,7 +297,7 @@ class RetrievalEvidenceFusionModel(nn.Module):
         current_state = encoder_outputs["pooled_state"]
         resolved_mode = _resolve_mode(self.mode, mode)
 
-        resolved_retrieval_payload, retrieval_mode = self._build_retrieval_payload_if_possible(
+        resolved_retrieval_payload, retrieval_mode, runtime_timing = self._build_retrieval_payload_if_possible(
             encoder_outputs,
             mode=resolved_mode,
             retrieval_payload=retrieval_payload,
@@ -336,6 +380,12 @@ class RetrievalEvidenceFusionModel(nn.Module):
             retrieval_used=retrieval_used,
             compute_ddi_metrics=compute_ddi_metrics,
         )
+        runtime_truth = self._build_runtime_truth(
+            mode=resolved_mode,
+            retrieval_used=retrieval_used,
+            retrieval_payload_source=retrieval_mode,
+            fusion_strategy=str(fusion_outputs["fusion_strategy"]),
+        )
 
         final_target_drugs_payload = batch.get("final_target_drugs")
         target_drugs = batch.get("target_drugs")
@@ -369,12 +419,15 @@ class RetrievalEvidenceFusionModel(nn.Module):
             "retrieval_used": retrieval_used,
             "retrieval_available": retrieval_available,
             "retrieval_mode": retrieval_mode,
+            "retrieval_scoring_mode": self.retrieval_scoring_mode,
+            "runtime_timing": runtime_timing,
             "drug_logits": drug_logits,
             "drug_probs": drug_probs,
             "recommendation_metadata": recommendation_metadata,
             "ddi_penalty_per_sample": ddi_outputs["ddi_penalty_per_sample"],
             "ddi_penalty_mean": ddi_outputs["ddi_penalty_mean"],
             "safety_metadata": ddi_outputs["safety_metadata"],
+            "runtime_truth": runtime_truth,
             "target_drugs": resolved_target_drugs,
             "final_target_drugs": final_target_drugs,
         }

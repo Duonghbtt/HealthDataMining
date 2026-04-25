@@ -8,21 +8,28 @@ paths:
   vocab_root: data/interim/vocab
   ddi_matrix_path: data/processed/ddi/drug_ddi.pt
   checkpoint_dir: outputs/checkpoints
-  log_dir: outputs/logs
   report_dir: outputs/reports
   prediction_dir: outputs/predictions
 
 runtime:
+  # The shipped evaluators are core-only and intentionally disable retrieval.
   mode: core
   device: cuda
   batch_size: 32
 
-loss:
-  ddi_lambda: 0.05
-
 prediction:
+  mode: threshold
   top_k: 10
+  top_k_strategy: fixed
+  decoder_top_k: 10
+  # Fallback only. Evaluators prefer CLI --threshold, then checkpoint threshold metadata.
   threshold: 0.5
+  calibration:
+    enabled: false
+    split: val
+    metric: f1
+    tie_breaker: jaccard
+    candidates: [0.5]
 
 evaluation:
   split: test
@@ -30,16 +37,5 @@ evaluation:
   save_reports: true
 
 core:
-  mode: core
   use_retrieval: false
   use_group_encoder: false
-
-extended:
-  mode: extended
-  use_retrieval: true
-  use_group_encoder: true
-  retrieval_top_k: 5
-  temporal_decay_alpha: 0.05
-  retrieval_backend: bruteforce
-  use_faiss_if_available: true
-  allow_cross_split: false

@@ -10,6 +10,7 @@ paths:
   log_dir: outputs/logs
 
 runtime:
+  # train_core.py requires runtime.mode=core.
   mode: core
   profile: balanced
   device: cuda
@@ -21,31 +22,62 @@ runtime:
   non_blocking_transfer: true
   persistent_workers: true
   prefetch_factor: 2
+  detailed_timing: false
   log_interval: 100
   profile_steps: null
   train_decoder_top_k: 0
   matmul_precision: high
   length_bucket_window: 256
+  train_budget_label: null
+
+initialization:
+  warm_start_checkpoint: null
+  warm_start_mode: disabled
+  strict: true
 
 optimization:
   epochs: 10
   learning_rate: 1.0e-3
   optimizer: adam
   scheduler: none
+  scheduler_factor: 0.5
+  scheduler_patience: 1
+  scheduler_min_lr: 1.0e-6
+  early_stopping_patience: null
   max_grad_norm: 1.0
 
 loss:
   ddi_lambda: 0.05
+  objective: bce
+  focal_gamma: 1.5
+  pos_weight_mode: log_balanced
+  pos_weight_clip: 12.0
+  fusion_entropy_lambda: 0.0
+  fusion_balance_lambda: 0.0
+  ranking_lambda: 0.0
+  ranking_objective: bpr
+  ranking_margin: 1.0
+  ranking_num_negatives: 32
+  ranking_hard_negative_fraction: 0.5
+  ddi_lambda_candidates: [0.0, 0.05, 0.01]
+
+threshold_tuning:
+  enabled: true
+  metric: f1
+  tie_breaker: jaccard
+  split: val
+  candidates: [0.18, 0.20, 0.22, 0.24, 0.25, 0.26, 0.28, 0.30, 0.32, 0.35, 0.40, 0.45, 0.50]
 
 prediction:
   top_k: 10
   threshold: 0.5
 
 core:
-  mode: core
   use_retrieval: false
   use_group_encoder: false
 
+# Experimental only. Use with `python -m src.training.train_extended`.
+# These fields do not change the verified core train/eval path.
 extended:
   mode: extended
   use_retrieval: true
@@ -55,6 +87,11 @@ extended:
   retrieval_backend: bruteforce
   use_faiss_if_available: true
   allow_cross_split: false
+  retrieval_scoring_mode: temporal_relevance
+  cross_split_policy: train_bank_only
+  validation_memory_bank_policy: train_only
+  monitor_metric: val_prauc_tuned
+  monitor_mode: max
 
 profiles:
   safe:
@@ -67,6 +104,7 @@ profiles:
       non_blocking_transfer: true
       persistent_workers: true
       prefetch_factor: 2
+      detailed_timing: false
       log_interval: 50
       profile_steps: null
       train_decoder_top_k: 0
@@ -82,6 +120,7 @@ profiles:
       non_blocking_transfer: true
       persistent_workers: true
       prefetch_factor: 2
+      detailed_timing: false
       log_interval: 100
       profile_steps: null
       train_decoder_top_k: 0
@@ -97,6 +136,7 @@ profiles:
       non_blocking_transfer: true
       persistent_workers: true
       prefetch_factor: 2
+      detailed_timing: false
       log_interval: 100
       profile_steps: 100
       train_decoder_top_k: 0

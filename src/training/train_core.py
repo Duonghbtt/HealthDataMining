@@ -4,6 +4,7 @@ import argparse
 import copy
 import random
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -42,15 +43,17 @@ from src.data.dataset import (
     collate_batch,
     detect_trajectory_layout,
 )
+from src.evaluation.thresholding import normalize_threshold_tuning_config, sweep_multilabel_thresholds
 from src.models.ddi_regularization import DDIRegularizer, load_ddi_artifact
 from src.models.full_model import RetrievalEvidenceFusionModel
 from src.models.fusion import FusionModule
 from src.models.history_selector import HistorySelector
 from src.models.medication_decoder import MedicationDecoder
 from src.models.patient_state_encoder import PatientStateEncoder
-from src.training.losses import MedicationRecommendationLoss
+from src.training.losses import MedicationRecommendationLoss, extract_last_valid_targets
 from src.training.trainer import Trainer
 from src.utils.io import ensure_dir, load_yaml_config, read_json, resolve_path
+from src.utils.runtime_truth import build_core_runtime_truth, normalize_ddi_context
 
 
 class TqdmCoreTrainer(Trainer):
@@ -112,6 +115,164 @@ class TqdmCoreTrainer(Trainer):
             postfix["ddi"] = "inactive"
         progress.set_postfix(**postfix)
 
+    def _threshold_tuning_config(self) -> dict[str, Any]:
+        raw_config = self.run_context.get("threshold_tuning")
+        if isinstance(raw_config, Mapping):
+            return normalize_threshold_tuning_config(raw_config)
+        return normalize_threshold_tuning_config({})
+
+    def _prediction_payload_collector(self, *, training: bool) -> Any | None:
+        if training:
+            return None
+        tuning_cfg = self._threshold_tuning_config()
+        if not bool(tuning_cfg.get("enabled", False)):
+            return None
+        return {"drug_probs": [], "targets": []}
+
+    def _resolve_prediction_targets(
+        self,
+        outputs: Mapping[str, Any],
+        batch_on_device: Mapping[str, Any],
+    ) -> torch.Tensor:
+        final_target_drugs = outputs.get("final_target_drugs")
+        if isinstance(final_target_drugs, torch.Tensor):
+            return final_target_drugs
+        final_target_drugs = batch_on_device.get("final_target_drugs")
+        if isinstance(final_target_drugs, torch.Tensor):
+            return final_target_drugs
+        resolved_targets = outputs.get("target_drugs")
+        if not isinstance(resolved_targets, torch.Tensor):
+            resolved_targets = batch_on_device.get("target_drugs")
+        if not isinstance(resolved_targets, torch.Tensor):
+            raise RuntimeError("Validation batch is missing final_target_drugs and target_drugs.")
+        if resolved_targets.ndim == 3:
+            return extract_last_valid_targets(resolved_targets, batch_on_device["visit_mask"])
+        return resolved_targets
+
+    def _collect_prediction_payload_batch(
+        self,
+        *,
+        collector: Any,
+        outputs: Mapping[str, Any],
+        batch_on_device: Mapping[str, Any],
+    ) -> None:
+        if collector is None:
+            return
+        drug_probs = outputs.get("drug_probs")
+        if not isinstance(drug_probs, torch.Tensor):
+            raise RuntimeError("Model did not return `drug_probs` during threshold tuning.")
+        targets = self._resolve_prediction_targets(outputs, batch_on_device)
+        collector["drug_probs"].append(drug_probs.detach().cpu())
+        collector["targets"].append(targets.detach().cpu())
+
+    def _finalize_prediction_payload_collector(
+        self,
+        *,
+        collector: Any,
+        dataloader: DataLoader,
+        training: bool,
+    ) -> None:
+        super()._finalize_prediction_payload_collector(
+            collector=collector,
+            dataloader=dataloader,
+            training=training,
+        )
+        if training or collector is None:
+            return
+        max_steps = self._max_epoch_steps(dataloader)
+        try:
+            total_steps = int(len(dataloader))
+        except TypeError:
+            total_steps = None
+        if max_steps is not None and total_steps is not None and int(max_steps) < total_steps:
+            return
+        if not collector["drug_probs"] or not collector["targets"]:
+            return
+        self._cached_validation_prediction_payload = (
+            torch.cat(collector["drug_probs"], dim=0),
+            torch.cat(collector["targets"], dim=0),
+        )
+        self._cached_validation_payload_dataloader_id = id(dataloader)
+
+    def _collect_prediction_payload(self, dataloader: DataLoader) -> tuple[torch.Tensor, torch.Tensor]:
+        cached_payload = self._cached_validation_prediction_payload_for(dataloader)
+        if cached_payload is not None:
+            return cached_payload
+
+        collected_probs: list[torch.Tensor] = []
+        collected_targets: list[torch.Tensor] = []
+
+        self.model.eval()
+        with torch.no_grad():
+            for batch in dataloader:
+                batch_on_device = {
+                    key: value.to(self.device) if isinstance(value, torch.Tensor) else value
+                    for key, value in batch.items()
+                }
+                outputs = self._forward_model(batch_on_device)
+                drug_probs = outputs.get("drug_probs")
+                if drug_probs is None:
+                    raise RuntimeError("Model did not return `drug_probs` during threshold tuning.")
+                targets = self._resolve_prediction_targets(outputs, batch_on_device)
+                collected_probs.append(drug_probs.detach().cpu())
+                collected_targets.append(targets.detach().cpu())
+
+        if not collected_probs or not collected_targets:
+            raise ValueError("Threshold tuning requires at least one validation batch")
+        return torch.cat(collected_probs, dim=0), torch.cat(collected_targets, dim=0)
+
+    def _run_threshold_tuning(self, val_dataloader: DataLoader) -> dict[str, float]:
+        tuning_start = time.perf_counter()
+        tuning_cfg = self._threshold_tuning_config()
+        if not bool(tuning_cfg.get("enabled", False)):
+            return {}
+        if str(tuning_cfg.get("split", "val")).strip().lower() != "val":
+            raise ValueError(
+                "Threshold tuning must run on the validation split only. "
+                f"Received split={tuning_cfg.get('split')!r}."
+            )
+
+        probabilities, targets = self._collect_prediction_payload(val_dataloader)
+        ddi_matrix = None
+        ddi_regularizer = getattr(self.loss_fn, "ddi_regularizer", None)
+        if ddi_regularizer is not None and hasattr(ddi_regularizer, "ddi_matrix"):
+            ddi_matrix = ddi_regularizer.ddi_matrix.detach().cpu()
+
+        sweep_result = sweep_multilabel_thresholds(
+            y_true=targets,
+            y_score=probabilities,
+            candidates=tuning_cfg["candidates"],
+            metric=str(tuning_cfg["metric"]),
+            tie_breaker=str(tuning_cfg["tie_breaker"]),
+            ddi_matrix=ddi_matrix,
+        )
+        best_metrics = dict(sweep_result["best_metrics"])
+        threshold_selection = {
+            "source": "validation_sweep",
+            "split": "val",
+            "metric": str(tuning_cfg["metric"]),
+            "tie_breaker": str(tuning_cfg["tie_breaker"]),
+            "candidates": [float(value) for value in tuning_cfg["candidates"]],
+            "best_threshold": float(sweep_result["best_threshold"]),
+        }
+        self.run_context["effective_threshold"] = float(sweep_result["best_threshold"])
+        self.run_context["threshold_selection"] = threshold_selection
+
+        threshold_metrics = {
+            "val_f1_tuned": float(best_metrics["f1"]),
+            "val_jaccard_tuned": float(best_metrics["jaccard"]),
+            "val_prauc_tuned": float(sweep_result["prauc"]),
+            "val_threshold_best": float(sweep_result["best_threshold"]),
+            "val_avg_predicted_drugs_tuned": float(best_metrics["avg_predicted_drugs"]),
+            "val_avg_true_drugs": float(best_metrics["avg_true_drugs"]),
+        }
+        ddi_rate = best_metrics.get("ddi_rate")
+        if ddi_rate is not None:
+            threshold_metrics["val_ddi_rate_tuned"] = float(ddi_rate)
+        if self.detailed_timing_enabled:
+            threshold_metrics["val_threshold_tuning_time"] = time.perf_counter() - tuning_start
+        return threshold_metrics
+
     def fit(
         self,
         *,
@@ -132,11 +293,10 @@ class TqdmCoreTrainer(Trainer):
             self._set_dataloader_epoch(train_dataloader, epoch=epoch)
             train_metrics = self.train_one_epoch(train_dataloader)
             val_metrics = self.validate_one_epoch(val_dataloader)
+            tuned_threshold_metrics = self._run_threshold_tuning(val_dataloader)
+            epoch_metrics = {**train_metrics, **val_metrics, **tuned_threshold_metrics}
 
-            epoch_metrics = {**train_metrics, **val_metrics}
-
-            if self.scheduler is not None:
-                self.scheduler.step()
+            self._step_scheduler(epoch_metrics)
 
             maybe_best = self.save_best_checkpoint(
                 epoch=epoch,
@@ -146,14 +306,31 @@ class TqdmCoreTrainer(Trainer):
             if maybe_best is not None:
                 best_checkpoint_path = maybe_best
 
-            self.log_metrics(epoch=epoch, metrics=epoch_metrics)
-            history.append({"epoch": float(epoch), **epoch_metrics})
+            epoch_metrics = {**epoch_metrics, **self._epoch_aux_timing_metrics()}
+            metrics_log_write_time = self.log_metrics(epoch=epoch, metrics=epoch_metrics)
+            history.append(
+                {
+                    "epoch": float(epoch),
+                    **epoch_metrics,
+                    **(
+                        {"metrics_log_write_time": float(metrics_log_write_time)}
+                        if self.detailed_timing_enabled
+                        else {}
+                    ),
+                }
+            )
+            if self._maybe_trigger_early_stopping():
+                print(f"Early stopping triggered at epoch {epoch}: {self.stop_reason}")
+                break
 
         return {
             "history": history,
             "best_metric": self.best_metric,
             "best_checkpoint_path": None if best_checkpoint_path is None else str(best_checkpoint_path),
             "monitor_metric": self.monitor_metric,
+            "epochs_completed": len(history),
+            "stopped_early": self.stopped_early,
+            "stop_reason": self.stop_reason,
         }
 
 
@@ -499,6 +676,7 @@ def build_core_model(
     runtime_data_config_path: Path,
     vocab_root: Path,
     ddi_matrix_path: Path,
+    pos_weight: torch.Tensor | None = None,
 ) -> tuple[RetrievalEvidenceFusionModel, MedicationRecommendationLoss]:
     validate_core_runtime_config(
         runtime_cfg=dict(train_config.get("runtime", {"mode": "core"})),
@@ -527,8 +705,11 @@ def build_core_model(
 
     model_cfg = dict(model_config.get("model", {}))
     embedding_cfg = dict(model_config.get("embedding", {}))
+    retrieval_cfg = dict(model_config.get("retrieval", {}))
     history_cfg = dict(model_config.get("history_selector", {}))
     fusion_cfg = dict(model_config.get("fusion", {}))
+    decoder_cfg = dict(model_config.get("decoder", {}))
+    label_correlation_cfg = dict(decoder_cfg.get("label_correlation", {}))
 
     hidden_dim = int(model_cfg.get("hidden_dim", 128))
     num_layers = int(model_cfg.get("num_layers", 1))
@@ -574,16 +755,23 @@ def build_core_model(
         hidden_dim=hidden_dim,
         dropout=float(fusion_cfg.get("dropout", model_dropout)),
         strategy=str(fusion_cfg.get("strategy", "gated")),
+        current_branch_dropout=float(fusion_cfg.get("current_branch_dropout", 0.0)),
     )
     decoder = MedicationDecoder(
         hidden_dim=hidden_dim,
         drug_vocab_size=vocab_sizes["drug"],
         dropout=model_dropout,
         top_k_metadata=int(train_config.get("prediction", {}).get("top_k", 10)),
+        label_correlation_enabled=bool(label_correlation_cfg.get("enabled", False)),
+        correlation_dim=label_correlation_cfg.get("correlation_dim"),
+        patient_residual_weight=float(label_correlation_cfg.get("patient_residual_weight", 0.0)),
+        coprescription_residual_weight=float(
+            label_correlation_cfg.get("coprescription_residual_weight", 0.0)
+        ),
+        correlation_dropout=float(label_correlation_cfg.get("dropout", model_dropout)),
     )
     ddi_artifact = load_ddi_artifact(ddi_matrix_path, device="cpu")
-    ddi_context = {key: value for key, value in ddi_artifact.items() if key != "matrix"}
-    ddi_context["status"] = "active" if ddi_context["active"] else "inactive"
+    ddi_context = normalize_ddi_context({key: value for key, value in ddi_artifact.items() if key != "matrix"})
     loss_ddi_regularizer = None
     if bool(ddi_context["active"]):
         loss_ddi_regularizer = DDIRegularizer(ddi_artifact, reduction="mean")
@@ -596,14 +784,221 @@ def build_core_model(
         ddi_regularizer=None,
         ddi_context=ddi_context,
         mode="core",
+        retrieval_top_k=int(retrieval_cfg.get("top_k", 5)),
+        temporal_decay_alpha=float(retrieval_cfg.get("temporal_decay_alpha", 0.05)),
+        retrieval_backend=str(retrieval_cfg.get("backend", "bruteforce")),
+        use_faiss_if_available=bool(retrieval_cfg.get("use_faiss_if_available", True)),
+        allow_cross_split=bool(retrieval_cfg.get("allow_cross_split", False)),
+        retrieval_scoring_mode=str(retrieval_cfg.get("scoring_mode", "temporal_relevance")),
+        cross_split_policy=retrieval_cfg.get("cross_split_policy"),
     )
+    model.runtime_truth = build_core_runtime_truth(
+        fusion_strategy=fusion_module.strategy,
+        ddi_context=ddi_context,
+    )
+    loss_cfg = dict(train_config.get("loss", {}))
     loss_fn = MedicationRecommendationLoss(
-        lambda_ddi=float(train_config.get("loss", {}).get("ddi_lambda", 0.0)),
+        lambda_ddi=float(loss_cfg.get("ddi_lambda", 0.0)),
         ddi_regularizer=loss_ddi_regularizer,
         ddi_context=ddi_context,
+        pos_weight=pos_weight,
         reduction="mean",
+        objective=str(loss_cfg.get("objective", "bce")),
+        focal_gamma=float(loss_cfg.get("focal_gamma", 1.5)),
+        asymmetric_gamma_pos=float(loss_cfg.get("asymmetric_gamma_pos", 0.0)),
+        asymmetric_gamma_neg=float(loss_cfg.get("asymmetric_gamma_neg", 4.0)),
+        asymmetric_clip=float(loss_cfg.get("asymmetric_clip", 0.05)),
+        fusion_entropy_lambda=float(loss_cfg.get("fusion_entropy_lambda", 0.0)),
+        fusion_balance_lambda=float(loss_cfg.get("fusion_balance_lambda", 0.0)),
+        ranking_lambda=float(loss_cfg.get("ranking_lambda", 0.0)),
+        ranking_objective=str(loss_cfg.get("ranking_objective", "bpr")),
+        ranking_margin=float(loss_cfg.get("ranking_margin", 1.0)),
+        ranking_num_negatives=int(loss_cfg.get("ranking_num_negatives", 32)),
+        ranking_hard_negative_fraction=float(loss_cfg.get("ranking_hard_negative_fraction", 0.5)),
     )
     return model, loss_fn
+
+
+def _record_final_target_ids(record: Mapping[str, Any], *, drug_vocab_size: int) -> list[int]:
+    steps = list(record.get("steps", []))
+    if not steps:
+        return []
+    final_step = dict(steps[-1])
+    resolved_ids: list[int] = []
+    seen: set[int] = set()
+    for raw_drug_id in final_step.get("target_drugs", []):
+        drug_id = int(raw_drug_id)
+        if drug_id < 0 or drug_id >= int(drug_vocab_size):
+            continue
+        if drug_id in seen:
+            continue
+        seen.add(drug_id)
+        resolved_ids.append(drug_id)
+    return resolved_ids
+
+
+def build_positive_class_weight(
+    *,
+    dataset: Dataset,
+    drug_vocab_size: int,
+    mode: str,
+    clip: float,
+) -> tuple[torch.Tensor | None, dict[str, Any]]:
+    resolved_mode = str(mode).strip().lower()
+    if resolved_mode in {"", "none", "disabled"}:
+        return None, {
+            "mode": "disabled",
+            "clip": float(clip),
+            "num_samples": int(len(dataset)),
+            "num_labels_with_positive": 0,
+        }
+    if resolved_mode != "log_balanced":
+        raise ValueError(f"Unsupported loss.pos_weight_mode `{mode}`")
+    if float(clip) < 1.0:
+        raise ValueError(f"loss.pos_weight_clip must be at least 1.0, got {clip!r}")
+
+    positive_counts = torch.zeros(int(drug_vocab_size), dtype=torch.float32)
+    num_samples = int(len(dataset))
+    for record_index in range(num_samples):
+        record = dataset[record_index]
+        for drug_id in _record_final_target_ids(record, drug_vocab_size=drug_vocab_size):
+            positive_counts[drug_id] += 1.0
+
+    pos_weight = torch.ones(int(drug_vocab_size), dtype=torch.float32)
+    positive_mask = positive_counts > 0
+    if bool(positive_mask.any().item()):
+        positive_values = positive_counts[positive_mask]
+        negative_values = float(num_samples) - positive_values
+        ratio = negative_values / positive_values.clamp(min=1.0)
+        computed = torch.log1p(ratio).clamp(min=1.0, max=float(clip))
+        pos_weight[positive_mask] = computed
+
+    return pos_weight, {
+        "mode": "log_balanced",
+        "clip": float(clip),
+        "num_samples": num_samples,
+        "num_labels_with_positive": int(positive_mask.sum().item()),
+        "mean_weight": float(pos_weight.mean().item()),
+        "max_weight": float(pos_weight.max().item()),
+        "min_weight": float(pos_weight.min().item()),
+    }
+
+
+def resolve_initialization_config(
+    *,
+    train_config: Mapping[str, Any],
+    project_root: Path,
+) -> dict[str, Any]:
+    initialization_cfg = dict(train_config.get("initialization", {}))
+    warm_start_mode = str(initialization_cfg.get("warm_start_mode", "disabled")).strip().lower()
+    if warm_start_mode in {"", "none", "off"}:
+        warm_start_mode = "disabled"
+    if warm_start_mode not in {"disabled", "model_only"}:
+        raise ValueError(
+            f"Unsupported initialization.warm_start_mode `{warm_start_mode}`. "
+            "Expected one of ['disabled', 'model_only']."
+        )
+
+    warm_start_checkpoint: Path | None = None
+    raw_checkpoint = str(initialization_cfg.get("warm_start_checkpoint") or "").strip()
+    if raw_checkpoint:
+        warm_start_checkpoint = resolve_path(project_root, raw_checkpoint).resolve()
+    if warm_start_mode == "disabled" and warm_start_checkpoint is not None:
+        raise ValueError(
+            "initialization.warm_start_checkpoint was provided while warm_start_mode is disabled. "
+            "Set warm_start_mode=model_only to activate warm start."
+        )
+    if warm_start_mode != "disabled" and warm_start_checkpoint is None:
+        raise ValueError(
+            "initialization.warm_start_mode is enabled but initialization.warm_start_checkpoint is missing."
+        )
+    if warm_start_checkpoint is not None and not warm_start_checkpoint.exists():
+        raise FileNotFoundError(f"Warm-start checkpoint does not exist: {warm_start_checkpoint}")
+
+    initialization_mode = "scratch" if warm_start_mode == "disabled" else "warm_start_model_only"
+    return {
+        "warm_start_mode": warm_start_mode,
+        "warm_start_checkpoint": warm_start_checkpoint,
+        "strict": bool(initialization_cfg.get("strict", True)),
+        "initialization_mode": initialization_mode,
+    }
+
+
+def apply_model_initialization(
+    *,
+    model: torch.nn.Module,
+    train_config: Mapping[str, Any],
+) -> dict[str, Any]:
+    project_root = Path(train_config["_project_root"]).resolve()
+    initialization_state = resolve_initialization_config(
+        train_config=train_config,
+        project_root=project_root,
+    )
+    warm_start_checkpoint = initialization_state["warm_start_checkpoint"]
+    if warm_start_checkpoint is None:
+        return {
+            "initialization_mode": str(initialization_state["initialization_mode"]),
+            "warm_start_mode": str(initialization_state["warm_start_mode"]),
+            "warm_start_checkpoint": "",
+        }
+
+    checkpoint_payload = torch.load(warm_start_checkpoint, map_location="cpu", weights_only=False)
+    model_state_dict = checkpoint_payload.get("model_state_dict")
+    if not isinstance(model_state_dict, Mapping):
+        raise KeyError(
+            f"Warm-start checkpoint at {warm_start_checkpoint} does not contain `model_state_dict`."
+        )
+    model.load_state_dict(model_state_dict, strict=bool(initialization_state["strict"]))
+    print(
+        "Warm-start initialization: "
+        f"mode={initialization_state['warm_start_mode']} "
+        f"checkpoint={warm_start_checkpoint} "
+        f"strict={bool(initialization_state['strict'])} "
+        f"source_monitor={checkpoint_payload.get('monitor_metric')} "
+        f"source_ddi_type={checkpoint_payload.get('ddi_type')} "
+        f"source_ddi_research_grade={checkpoint_payload.get('ddi_research_grade')}"
+    )
+    return {
+        "initialization_mode": str(initialization_state["initialization_mode"]),
+        "warm_start_mode": str(initialization_state["warm_start_mode"]),
+        "warm_start_checkpoint": str(warm_start_checkpoint),
+    }
+
+
+def resolve_train_budget_label(train_config: Mapping[str, Any]) -> str:
+    runtime_cfg = dict(train_config.get("runtime", {}))
+    explicit_label = str(runtime_cfg.get("train_budget_label") or "").strip()
+    if explicit_label:
+        return explicit_label
+
+    optimization_cfg = dict(train_config.get("optimization", {}))
+    epochs = int(optimization_cfg.get("epochs", 0))
+    profile_steps = runtime_cfg.get("profile_steps")
+    if profile_steps is None:
+        return f"full_data_epochs_{epochs}"
+    return f"profile_steps_{int(profile_steps)}_epochs_{epochs}"
+
+
+def resolve_core_monitor_config(
+    train_config: Mapping[str, Any],
+    threshold_tuning_cfg: Mapping[str, Any],
+) -> tuple[str, str]:
+    optimization_cfg = dict(train_config.get("optimization", {}))
+    default_monitor_metric = "val_f1_tuned" if bool(threshold_tuning_cfg["enabled"]) else "val_total_loss"
+    monitor_metric = str(optimization_cfg.get("monitor_metric") or default_monitor_metric)
+    default_monitor_mode = "min" if "total_loss" in monitor_metric else "max"
+    monitor_mode = str(optimization_cfg.get("monitor_mode") or default_monitor_mode)
+    return monitor_metric, monitor_mode
+
+
+def build_loss_objective_metadata(loss_fn: MedicationRecommendationLoss) -> dict[str, Any]:
+    return {
+        "objective": str(getattr(loss_fn, "objective", "bce")),
+        "focal_gamma": float(getattr(loss_fn, "focal_gamma", 1.5)),
+        "asymmetric_gamma_pos": float(getattr(loss_fn, "asymmetric_gamma_pos", 0.0)),
+        "asymmetric_gamma_neg": float(getattr(loss_fn, "asymmetric_gamma_neg", 4.0)),
+        "asymmetric_clip": float(getattr(loss_fn, "asymmetric_clip", 0.05)),
+    }
 
 
 def build_optimizer(*, model: torch.nn.Module, train_config: Mapping[str, Any]) -> torch.optim.Optimizer:
@@ -615,12 +1010,38 @@ def build_optimizer(*, model: torch.nn.Module, train_config: Mapping[str, Any]) 
     return torch.optim.Adam(model.parameters(), lr=learning_rate)
 
 
-def build_scheduler(*, optimizer: torch.optim.Optimizer, train_config: Mapping[str, Any]) -> Any | None:
+def build_scheduler(
+    *,
+    optimizer: torch.optim.Optimizer,
+    train_config: Mapping[str, Any],
+    monitor_mode: str = "min",
+) -> Any | None:
     scheduler_name = str(train_config.get("optimization", {}).get("scheduler", "none")).strip().lower()
-    if scheduler_name != "none":
-        raise ValueError(f"Unsupported scheduler `{scheduler_name}`. Only `none` is supported in train_core.py.")
-    _ = optimizer
-    return None
+    if scheduler_name == "none":
+        return None
+    if scheduler_name != "reduce_on_plateau":
+        raise ValueError(
+            f"Unsupported scheduler `{scheduler_name}`. "
+            "Expected one of ['none', 'reduce_on_plateau']."
+        )
+
+    optimization_cfg = dict(train_config.get("optimization", {}))
+    factor = float(optimization_cfg.get("scheduler_factor", 0.5))
+    patience = int(optimization_cfg.get("scheduler_patience", 1))
+    min_lr = float(optimization_cfg.get("scheduler_min_lr", 1.0e-6))
+    if not 0.0 < factor < 1.0:
+        raise ValueError(f"optimization.scheduler_factor must be within (0, 1), got {factor!r}")
+    if patience < 0:
+        raise ValueError(f"optimization.scheduler_patience must be non-negative, got {patience!r}")
+    if min_lr < 0.0:
+        raise ValueError(f"optimization.scheduler_min_lr must be non-negative, got {min_lr!r}")
+    return torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode=str(monitor_mode),
+        factor=factor,
+        patience=patience,
+        min_lr=min_lr,
+    )
 
 
 def main() -> None:
@@ -632,6 +1053,9 @@ def main() -> None:
     train_config = apply_profile_overrides(raw_train_config, profile_name=profile_name)
     data_config = apply_profile_overrides(raw_data_config, profile_name=profile_name)
     model_config = apply_profile_overrides(raw_model_config, profile_name=profile_name)
+    model_overrides = train_config.get("model_overrides")
+    if isinstance(model_overrides, Mapping):
+        model_config = _deep_merge(model_config, dict(model_overrides))
 
     runtime_cfg = dict(train_config.get("runtime", {}))
     validate_core_runtime_config(
@@ -724,6 +1148,13 @@ def main() -> None:
             max_visits=max_visits,
             max_history=max_history,
         )
+        loss_cfg = dict(train_config.get("loss", {}))
+        pos_weight, pos_weight_stats = build_positive_class_weight(
+            dataset=train_loader.dataset,
+            drug_vocab_size=drug_vocab_size,
+            mode=str(loss_cfg.get("pos_weight_mode", "disabled")),
+            clip=float(loss_cfg.get("pos_weight_clip", 1.0)),
+        )
 
         model, loss_fn = build_core_model(
             train_config=train_config,
@@ -731,6 +1162,11 @@ def main() -> None:
             runtime_data_config_path=runtime_data_config_path,
             vocab_root=resolved_paths["vocab_root"],
             ddi_matrix_path=resolved_paths["ddi_matrix_path"],
+            pos_weight=pos_weight,
+        )
+        initialization_context = apply_model_initialization(
+            model=model,
+            train_config=train_config,
         )
         dataset_layouts = {
             "train": getattr(train_loader.dataset, "layout_kind", "unknown"),
@@ -753,8 +1189,63 @@ def main() -> None:
     if not loss_fn.ddi_active:
         print("DDI regularization is explicitly disabled for this run because the DDI artifact is inactive.")
 
+    runtime_truth = copy.deepcopy(getattr(model, "runtime_truth", {}))
+    threshold_tuning_cfg = normalize_threshold_tuning_config(train_config.get("threshold_tuning"))
+    default_threshold = float(train_config.get("prediction", {}).get("threshold", 0.5))
+    effective_threshold = default_threshold
+    train_budget_label = resolve_train_budget_label(train_config)
+    monitor_metric, monitor_mode = resolve_core_monitor_config(train_config, threshold_tuning_cfg)
+    loss_objective_metadata = build_loss_objective_metadata(loss_fn)
+    print(
+        "Core runtime truth: "
+        f"pipeline_level={runtime_truth.get('pipeline_level', 'unknown')} "
+        f"history_active={runtime_truth.get('history_active')} "
+        f"retrieval_active={runtime_truth.get('retrieval_active')} "
+        f"fusion_strategy={runtime_truth.get('fusion_strategy', 'unknown')} "
+        f"ddi_type={runtime_truth.get('ddi_type', 'unknown')} "
+        f"ddi_research_grade={runtime_truth.get('ddi_research_grade')}"
+    )
+    print(
+        "Loss imbalance settings: "
+        f"objective={loss_objective_metadata['objective']} "
+        f"pos_weight_mode={pos_weight_stats['mode']} "
+        f"pos_weight_clip={pos_weight_stats['clip']:.2f} "
+        f"labels_with_positive={pos_weight_stats['num_labels_with_positive']} "
+        f"mean_weight={pos_weight_stats.get('mean_weight', 1.0):.4f} "
+        f"max_weight={pos_weight_stats.get('max_weight', 1.0):.4f} "
+        f"asymmetric_gamma_pos={loss_objective_metadata['asymmetric_gamma_pos']:.2f} "
+        f"asymmetric_gamma_neg={loss_objective_metadata['asymmetric_gamma_neg']:.2f} "
+        f"asymmetric_clip={loss_objective_metadata['asymmetric_clip']:.3f}"
+    )
+    print(
+        "Threshold tuning settings: "
+        f"enabled={threshold_tuning_cfg['enabled']} "
+        f"split={threshold_tuning_cfg['split']} "
+        f"metric={threshold_tuning_cfg['metric']} "
+        f"tie_breaker={threshold_tuning_cfg['tie_breaker']} "
+        f"candidates={threshold_tuning_cfg['candidates']}"
+    )
+    print(
+        "Initialization settings: "
+        f"initialization_mode={initialization_context['initialization_mode']} "
+        f"warm_start_mode={initialization_context['warm_start_mode']} "
+        f"warm_start_checkpoint={initialization_context['warm_start_checkpoint'] or '<none>'} "
+        f"train_budget_label={train_budget_label}"
+    )
+    print(
+        "Optimization monitor: "
+        f"monitor_metric={monitor_metric} "
+        f"monitor_mode={monitor_mode} "
+        f"scheduler={str(train_config.get('optimization', {}).get('scheduler', 'none'))} "
+        f"early_stopping_patience={train_config.get('optimization', {}).get('early_stopping_patience')}"
+    )
+
     optimizer = build_optimizer(model=model, train_config=train_config)
-    scheduler = build_scheduler(optimizer=optimizer, train_config=train_config)
+    scheduler = build_scheduler(
+        optimizer=optimizer,
+        train_config=train_config,
+        monitor_mode=monitor_mode,
+    )
     trainer = TqdmCoreTrainer(
         model=model,
         loss_fn=loss_fn,
@@ -763,8 +1254,8 @@ def main() -> None:
         device=device,
         checkpoint_dir=resolved_paths["checkpoint_dir"],
         log_dir=resolved_paths["log_dir"],
-        monitor_metric="val_total_loss",
-        monitor_mode="min",
+        monitor_metric=monitor_metric,
+        monitor_mode=monitor_mode,
         decoder_top_k=train_decoder_top_k,
         amp=requested_amp,
         grad_accum_steps=int(runtime_cfg.get("grad_accum_steps", 1)),
@@ -772,11 +1263,38 @@ def main() -> None:
         non_blocking_transfer=bool(runtime_cfg.get("non_blocking_transfer", False)),
         log_interval=int(runtime_cfg.get("log_interval", 50)),
         profile_steps=runtime_cfg.get("profile_steps"),
+        early_stopping_patience=train_config.get("optimization", {}).get("early_stopping_patience"),
+        detailed_timing=bool(runtime_cfg.get("detailed_timing", False)),
         run_context={
+            **runtime_truth,
+            **initialization_context,
             "selected_profile": profile_name,
+            "train_budget_label": train_budget_label,
             "ddi_context": copy.deepcopy(loss_fn.ddi_context),
             "configured_ddi_lambda": float(loss_fn.configured_lambda_ddi),
             "effective_ddi_lambda": float(loss_fn.effective_lambda_ddi),
+            "effective_threshold": effective_threshold,
+            "threshold_selection": {
+                "source": "config.prediction.threshold",
+                "split": "config",
+                "metric": str(threshold_tuning_cfg["metric"]),
+                "tie_breaker": str(threshold_tuning_cfg["tie_breaker"]),
+                "candidates": [float(value) for value in threshold_tuning_cfg["candidates"]],
+                "best_threshold": effective_threshold,
+            },
+            "threshold_tuning": copy.deepcopy(threshold_tuning_cfg),
+            "loss_objective": str(loss_objective_metadata["objective"]),
+            "objective_settings": copy.deepcopy(loss_objective_metadata),
+            "pos_weight_stats": copy.deepcopy(pos_weight_stats),
+            "ranking_loss": {
+                "lambda": float(getattr(loss_fn, "ranking_lambda", 0.0)),
+                "objective": str(getattr(loss_fn, "ranking_objective", "bpr")),
+                "num_negatives": int(getattr(loss_fn, "ranking_num_negatives", 0)),
+                "margin": float(getattr(loss_fn, "ranking_margin", 0.0)),
+                "hard_negative_fraction": float(
+                    getattr(loss_fn, "ranking_hard_negative_fraction", 0.0)
+                ),
+            },
             "dataset_layouts": dataset_layouts,
             "runtime": {
                 "batch_size": int(runtime_cfg.get("batch_size", 16)),
@@ -811,27 +1329,54 @@ def main() -> None:
         val_dataloader=val_loader,
         epochs=int(train_config.get("optimization", {}).get("epochs", 10)),
         extra_checkpoint_state={
+            **runtime_truth,
+            **initialization_context,
             "train_config": {key: value for key, value in train_config.items() if not str(key).startswith("_")},
             "data_config": {key: value for key, value in data_config.items() if not str(key).startswith("_")},
             "model_config": {key: value for key, value in model_config.items() if not str(key).startswith("_")},
             "resolved_paths": {key: str(value) for key, value in resolved_paths.items()},
             "selected_profile": profile_name,
             "seed": seed,
+            "train_mode": "core",
+            "train_budget_label": train_budget_label,
             "ddi_context": copy.deepcopy(loss_fn.ddi_context),
             "configured_ddi_lambda": float(loss_fn.configured_lambda_ddi),
             "effective_ddi_lambda": float(loss_fn.effective_lambda_ddi),
+            "threshold_tuning": copy.deepcopy(threshold_tuning_cfg),
+            "loss_objective": str(loss_objective_metadata["objective"]),
+            "objective_settings": copy.deepcopy(loss_objective_metadata),
+            "pos_weight_stats": copy.deepcopy(pos_weight_stats),
+            "ranking_loss": {
+                "lambda": float(getattr(loss_fn, "ranking_lambda", 0.0)),
+                "objective": str(getattr(loss_fn, "ranking_objective", "bpr")),
+                "num_negatives": int(getattr(loss_fn, "ranking_num_negatives", 0)),
+                "margin": float(getattr(loss_fn, "ranking_margin", 0.0)),
+                "hard_negative_fraction": float(
+                    getattr(loss_fn, "ranking_hard_negative_fraction", 0.0)
+                ),
+            },
             "dataset_layouts": dataset_layouts,
             "trainer_runtime": {
                 "requested_amp": trainer.requested_amp,
                 "resolved_precision": trainer.resolved_precision,
                 "grad_scaler_enabled": trainer.grad_scaler_enabled,
                 "max_grad_norm": trainer.max_grad_norm,
+                "monitor_metric": monitor_metric,
+                "monitor_mode": monitor_mode,
+                "scheduler": str(train_config.get("optimization", {}).get("scheduler", "none")),
+                "early_stopping_patience": train_config.get("optimization", {}).get("early_stopping_patience"),
             },
         },
     )
 
     print(f"Best checkpoint: {fit_result['best_checkpoint_path']}")
     print(f"Monitor metric: {fit_result['monitor_metric']} (best={fit_result['best_metric']:.6f})")
+    print(
+        "Fit status: "
+        f"epochs_completed={fit_result['epochs_completed']} "
+        f"stopped_early={fit_result['stopped_early']} "
+        f"stop_reason={fit_result['stop_reason'] or '<none>'}"
+    )
 
 
 if __name__ == "__main__":

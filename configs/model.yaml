@@ -15,28 +15,40 @@ sequence:
   rnn_type: gru
   bidirectional: false
 
+# Experimental extension only.
+# train_core.py and the default evaluators do not read this block.
 retrieval:
   top_k: 5
   temporal_decay_alpha: 0.05
-  exclude_same_stay: true
   backend: bruteforce
   use_faiss_if_available: true
-  graph_top_k: 5
-
-training:
-  device: cuda
+  scoring_mode: temporal_relevance
+  cross_split_policy: same_split
 
 history_selector:
   dropout: 0.1
   score_bias_weight: 0.5
   self_top_k: 3
+  # Neighbor history only becomes active inside the experimental retrieval path.
   neighbor_top_k: 3
   use_retrieval_bias: true
 
 fusion:
   dropout: 0.1
   strategy: gated
+  current_branch_dropout: 0.0
 
+decoder:
+  # Optional research path for PRAUC-oriented structured label modeling.
+  # Disabled by default so existing benchmark configs remain comparable.
+  label_correlation:
+    enabled: false
+    correlation_dim: 64
+    patient_residual_weight: 0.10
+    coprescription_residual_weight: 0.05
+    dropout: 0.1
+
+# Experimental extension only. Not part of the verified core path.
 hypergraph:
   num_layers: 2
   dropout: 0.1

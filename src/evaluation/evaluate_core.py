@@ -19,19 +19,37 @@ if __package__ in {None, ""}:
     from metrics import (  # type: ignore[import-not-found]
         binarize_predictions,
         compute_core_metrics,
+        compute_core_metrics_from_binary_predictions,
         compute_ddi_flags,
         compute_samplewise_f1,
         compute_samplewise_jaccard,
         multilabel_prauc,
     )
+    from prediction_control import (  # type: ignore[import-not-found]
+        collect_model_predictions,
+        compute_average_target_cardinality_from_dataloader,
+        normalize_prediction_config,
+        prediction_mode_requires_calibration,
+        prediction_mode_requires_train_cardinality,
+        resolve_prediction_control,
+    )
 else:
     from .metrics import (
         binarize_predictions,
         compute_core_metrics,
+        compute_core_metrics_from_binary_predictions,
         compute_ddi_flags,
         compute_samplewise_f1,
         compute_samplewise_jaccard,
         multilabel_prauc,
+    )
+    from .prediction_control import (
+        collect_model_predictions,
+        compute_average_target_cardinality_from_dataloader,
+        normalize_prediction_config,
+        prediction_mode_requires_calibration,
+        prediction_mode_requires_train_cardinality,
+        resolve_prediction_control,
     )
 
 from src.data.build_vocab import load_vocab_bundle
@@ -45,6 +63,11 @@ from src.training.train_core import (
     validate_core_runtime_config,
 )
 from src.utils.io import ensure_dir, load_yaml_config, read_json, resolve_path, write_json
+from src.utils.runtime_truth import (
+    build_core_runtime_truth,
+    normalize_ddi_context,
+    normalize_initialization_context,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -56,10 +79,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", default=None, help="Optional override for best checkpoint path")
     parser.add_argument("--split", default=None, help="Optional override for evaluation split")
     parser.add_argument("--threshold", type=float, default=None, help="Optional override for prediction threshold")
+    parser.add_argument(
+        "--prediction-mode",
+        default=None,
+        choices=("threshold", "calibrated_threshold", "top_k"),
+        help="Optional override for evaluation prediction control mode",
+    )
+    parser.add_argument("--prediction-top-k", type=int, default=None, help="Optional override for top-k prediction mode")
     parser.add_argument("--device", default=None, help="Optional override for runtime device")
     parser.add_argument("--processed-root", default=None, help="Optional override for processed data root")
     parser.add_argument("--vocab-root", default=None, help="Optional override for vocab directory")
     parser.add_argument("--ddi-matrix-path", default=None, help="Optional override for DDI matrix artifact")
+    parser.add_argument("--report-dir", default=None, help="Optional override for report output directory")
+    parser.add_argument("--prediction-dir", default=None, help="Optional override for prediction output directory")
     return parser.parse_args()
 
 
@@ -174,6 +206,39 @@ def _move_batch_to_device(batch: Mapping[str, Any], device: torch.device) -> dic
     }
 
 
+def _build_ddi_summary(ddi_artifact: Mapping[str, Any], metrics: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    normalized = normalize_ddi_context(ddi_artifact)
+    summary = {
+        "available": bool(normalized["active"]),
+        "status": str(normalized["status"]),
+        "reason": normalized.get("reason"),
+        "source": normalized.get("source"),
+        "requested_source": normalized.get("requested_source"),
+        "requested_source_format": normalized.get("requested_source_format"),
+        "effective_source": normalized.get("effective_source"),
+        "effective_source_format": normalized.get("effective_source_format"),
+        "source_format": normalized.get("source_format"),
+        "matched_pairs": normalized.get("matched_pairs"),
+        "nonzero_pairs": normalized.get("nonzero_pairs"),
+        "vocab_size": normalized.get("vocab_size"),
+        "fallback_reason": normalized.get("fallback_reason"),
+        "source_metadata": copy.deepcopy(dict(normalized.get("source_metadata") or {})),
+        "ddi_active": bool(normalized["active"]),
+        "ddi_type": str(normalized.get("ddi_type") or "unknown"),
+        "ddi_research_grade": bool(normalized.get("ddi_research_grade", False)),
+        "ddi_source": str(normalized.get("ddi_source") or normalized.get("effective_source") or ""),
+        "ddi_rate": None,
+        "total_predicted_pairs": None,
+        "total_interacting_pairs": None,
+        "patients_with_ddi": None,
+        "num_samples": None,
+    }
+    if metrics is not None:
+        for key in ("ddi_rate", "total_predicted_pairs", "total_interacting_pairs", "patients_with_ddi", "num_samples"):
+            summary[key] = metrics.get(key)
+    return summary
+
+
 def _resolve_eval_paths(
     *,
     project_root: Path,
@@ -245,9 +310,19 @@ def _resolve_eval_paths(
         ],
     )
 
-    report_dir = ensure_dir(resolve_path(project_root, eval_paths.get("report_dir", "outputs/reports")).resolve())
+    report_dir = ensure_dir(
+        (
+            Path(args.report_dir).resolve()
+            if args.report_dir is not None
+            else resolve_path(project_root, eval_paths.get("report_dir", "outputs/reports")).resolve()
+        )
+    )
     prediction_dir = ensure_dir(
-        resolve_path(project_root, eval_paths.get("prediction_dir", "outputs/predictions")).resolve()
+        (
+            Path(args.prediction_dir).resolve()
+            if args.prediction_dir is not None
+            else resolve_path(project_root, eval_paths.get("prediction_dir", "outputs/predictions")).resolve()
+        )
     )
 
     return {
@@ -293,103 +368,48 @@ def build_eval_dataloader(
     )
 
 
-def run_core_evaluation(
+def _resolve_decoder_top_k(prediction_cfg: Mapping[str, Any]) -> int:
+    decoder_top_k = prediction_cfg.get("decoder_top_k", prediction_cfg.get("top_k", 10))
+    return int(decoder_top_k)
+
+
+def _summarize_core_evaluation_payload(
     *,
-    model: torch.nn.Module,
-    dataloader: DataLoader,
-    device: torch.device,
-    threshold: float,
+    payload: Mapping[str, Any],
+    binary_predictions: torch.Tensor,
     ddi_artifact: Mapping[str, Any],
-    decoder_top_k: int | None,
 ) -> dict[str, Any]:
-    collected_probs: list[torch.Tensor] = []
-    collected_targets: list[torch.Tensor] = []
-    subject_ids: list[int] = []
-    hadm_ids: list[int] = []
-    stay_ids: list[int] = []
+    ddi_artifact = normalize_ddi_context(ddi_artifact)
+    all_probs = torch.as_tensor(payload["probs"], dtype=torch.float32)
+    all_targets = torch.as_tensor(payload["targets"], dtype=torch.float32)
+    subject_ids = list(payload.get("subject_ids", []))
+    hadm_ids = list(payload.get("hadm_ids", []))
+    stay_ids = list(payload.get("stay_ids", []))
+    resolved_predictions = torch.as_tensor(binary_predictions, dtype=torch.bool).cpu()
 
-    model = model.to(device)
-    model.eval()
-    with torch.no_grad():
-        for batch in dataloader:
-            batch_on_device = _move_batch_to_device(batch, device)
-            outputs = model(
-                batch_on_device,
-                mode="core",
-                decoder_top_k=decoder_top_k,
-            )
-            drug_probs = outputs.get("drug_probs")
-            final_target_drugs = outputs.get("final_target_drugs")
-            if drug_probs is None:
-                raise RuntimeError("Model did not return `drug_probs` during evaluation.")
-            if final_target_drugs is None:
-                raise RuntimeError("Model did not return `final_target_drugs` during evaluation.")
-
-            collected_probs.append(drug_probs.detach().cpu())
-            collected_targets.append(final_target_drugs.detach().cpu())
-            subject_ids.extend(int(value) for value in batch.get("subject_ids", []))
-            hadm_ids.extend(int(value) for value in batch.get("hadm_ids", []))
-            stay_ids.extend(int(value) for value in batch.get("stay_ids", []))
-
-    if not collected_probs or not collected_targets:
-        raise ValueError("Evaluation dataloader produced no batches")
-
-    all_probs = torch.cat(collected_probs, dim=0)
-    all_targets = torch.cat(collected_targets, dim=0)
-    binary_predictions = binarize_predictions(all_probs, threshold).cpu()
-    sample_jaccard = compute_samplewise_jaccard(all_targets, binary_predictions).cpu()
-    sample_f1 = compute_samplewise_f1(all_targets, binary_predictions).cpu()
+    sample_jaccard = compute_samplewise_jaccard(all_targets, resolved_predictions).cpu()
+    sample_f1 = compute_samplewise_f1(all_targets, resolved_predictions).cpu()
     ddi_active = bool(ddi_artifact.get("active", False))
     ddi_matrix_cpu = ddi_artifact["matrix"].detach().cpu()
     if ddi_active:
-        metrics = compute_core_metrics(
+        metrics = compute_core_metrics_from_binary_predictions(
             all_targets,
             all_probs,
-            threshold=threshold,
+            resolved_predictions,
             ddi_matrix=ddi_matrix_cpu,
         )
-        ddi_flags = compute_ddi_flags(binary_predictions, ddi_matrix_cpu).cpu()
-        ddi_summary: dict[str, Any] = {
-            "available": True,
-            "status": "active",
-            "reason": ddi_artifact.get("reason"),
-            "source": ddi_artifact.get("source"),
-            "matched_pairs": ddi_artifact.get("matched_pairs"),
-            "nonzero_pairs": ddi_artifact.get("nonzero_pairs"),
-            "vocab_size": ddi_artifact.get("vocab_size"),
-            "source_metadata": copy.deepcopy(dict(ddi_artifact.get("source_metadata") or {})),
-            **{
-                key: metrics[key]
-                for key in (
-                    "ddi_rate",
-                    "total_predicted_pairs",
-                    "total_interacting_pairs",
-                    "patients_with_ddi",
-                    "num_samples",
-                )
-            },
-        }
+        ddi_flags = compute_ddi_flags(resolved_predictions, ddi_matrix_cpu).cpu()
+        ddi_summary = _build_ddi_summary(ddi_artifact, metrics=metrics)
         metric_summary: dict[str, Any] = {
             key: metrics[key]
             for key in ("jaccard", "f1", "prauc", "ddi_rate")
         }
     else:
-        ddi_flags = torch.zeros(binary_predictions.shape[0], dtype=torch.bool)
-        ddi_summary = {
-            "available": False,
-            "status": "inactive",
-            "reason": ddi_artifact.get("reason"),
-            "source": ddi_artifact.get("source"),
-            "matched_pairs": ddi_artifact.get("matched_pairs"),
-            "nonzero_pairs": ddi_artifact.get("nonzero_pairs"),
-            "vocab_size": ddi_artifact.get("vocab_size"),
-            "source_metadata": copy.deepcopy(dict(ddi_artifact.get("source_metadata") or {})),
-            "ddi_rate": None,
-            "total_predicted_pairs": None,
-            "total_interacting_pairs": None,
-            "patients_with_ddi": None,
-            "num_samples": float(all_targets.shape[0]),
-        }
+        ddi_flags = torch.zeros(resolved_predictions.shape[0], dtype=torch.bool)
+        ddi_summary = _build_ddi_summary(
+            ddi_artifact,
+            metrics={"num_samples": float(all_targets.shape[0])},
+        )
         metric_summary = {
             "jaccard": float(sample_jaccard.mean().item()),
             "f1": float(sample_f1.mean().item()),
@@ -399,14 +419,14 @@ def run_core_evaluation(
 
     prediction_rows: list[dict[str, Any]] = []
     for row_index in range(all_probs.shape[0]):
-        predicted_indices = torch.nonzero(binary_predictions[row_index], as_tuple=False).flatten()
+        predicted_indices = torch.nonzero(resolved_predictions[row_index], as_tuple=False).flatten()
         prediction_rows.append(
             {
                 "subject_id": subject_ids[row_index] if row_index < len(subject_ids) else -1,
                 "hadm_id": hadm_ids[row_index] if row_index < len(hadm_ids) else -1,
                 "stay_id": stay_ids[row_index] if row_index < len(stay_ids) else -1,
                 "true_count": int(all_targets[row_index].sum().item()),
-                "pred_count": int(binary_predictions[row_index].sum().item()),
+                "pred_count": int(resolved_predictions[row_index].sum().item()),
                 "sample_jaccard": float(sample_jaccard[row_index].item()),
                 "sample_f1": float(sample_f1[row_index].item()),
                 "has_ddi": None if not ddi_active else bool(ddi_flags[row_index].item()),
@@ -415,18 +435,81 @@ def run_core_evaluation(
         )
 
     prediction_summary = {
-        "avg_predicted_drugs": float(binary_predictions.sum(dim=1, dtype=torch.float32).mean().item()),
+        "avg_predicted_drugs": float(resolved_predictions.sum(dim=1, dtype=torch.float32).mean().item()),
         "avg_true_drugs": float(all_targets.sum(dim=1, dtype=torch.float32).mean().item()),
     }
 
     return {
         "drug_probs": all_probs,
         "targets": all_targets,
+        "binary_predictions": resolved_predictions,
         "prediction_rows": prediction_rows,
         "prediction_summary": prediction_summary,
         "ddi_summary": ddi_summary,
         "metrics": metric_summary,
     }
+
+
+def run_core_evaluation(
+    *,
+    model: torch.nn.Module,
+    dataloader: DataLoader,
+    device: torch.device,
+    ddi_artifact: Mapping[str, Any],
+    decoder_top_k: int | None,
+    prediction_config: Mapping[str, Any],
+    checkpoint_payload: Mapping[str, Any] | None = None,
+    cli_threshold: float | None = None,
+    cli_prediction_mode: str | None = None,
+    cli_prediction_top_k: int | None = None,
+    calibration_dataloader: DataLoader | None = None,
+    train_cardinality_dataloader: DataLoader | None = None,
+) -> dict[str, Any]:
+    ddi_artifact = normalize_ddi_context(ddi_artifact)
+    evaluation_payload = collect_model_predictions(
+        model=model,
+        dataloader=dataloader,
+        device=device,
+        decoder_top_k=decoder_top_k,
+    )
+
+    calibration_payload = None
+    if calibration_dataloader is not None:
+        calibration_payload = collect_model_predictions(
+            model=model,
+            dataloader=calibration_dataloader,
+            device=device,
+            decoder_top_k=decoder_top_k,
+        )
+
+    avg_train_drugs = None
+    if train_cardinality_dataloader is not None:
+        avg_train_drugs = compute_average_target_cardinality_from_dataloader(train_cardinality_dataloader)
+
+    prediction_resolution = resolve_prediction_control(
+        prediction_config=prediction_config,
+        checkpoint_payload=checkpoint_payload,
+        cli_threshold=cli_threshold,
+        cli_prediction_mode=cli_prediction_mode,
+        cli_prediction_top_k=cli_prediction_top_k,
+        eval_probs=evaluation_payload["probs"],
+        eval_targets=evaluation_payload["targets"],
+        ddi_matrix=ddi_artifact["matrix"].detach().cpu() if ddi_artifact.get("active", False) else None,
+        calibration_probs=None if calibration_payload is None else calibration_payload["probs"],
+        calibration_targets=None if calibration_payload is None else calibration_payload["targets"],
+        avg_train_drugs=avg_train_drugs,
+    )
+    summarized = _summarize_core_evaluation_payload(
+        payload=evaluation_payload,
+        binary_predictions=prediction_resolution["binary_predictions"],
+        ddi_artifact=ddi_artifact,
+    )
+    summarized["prediction_mode"] = prediction_resolution["prediction_mode"]
+    summarized["prediction_control"] = prediction_resolution["prediction_control"]
+    summarized["threshold"] = prediction_resolution["threshold"]
+    summarized["threshold_source"] = prediction_resolution["threshold_source"]
+    summarized["threshold_selection"] = prediction_resolution["threshold_selection"]
+    return summarized
 
 
 def main() -> None:
@@ -484,16 +567,15 @@ def main() -> None:
 
     runtime_cfg = dict(eval_config.get("runtime", {}))
     evaluation_cfg = dict(eval_config.get("evaluation", {}))
-    prediction_cfg = dict(eval_config.get("prediction", {}))
+    prediction_cfg = normalize_prediction_config(eval_config.get("prediction", {}))
 
     split = str(args.split or evaluation_cfg.get("split", "test"))
-    threshold = float(args.threshold if args.threshold is not None else prediction_cfg.get("threshold", 0.5))
     device = resolve_device(args.device or runtime_cfg.get("device", "cpu"))
     batch_size = int(runtime_cfg.get("batch_size", 32))
-    decoder_top_k = int(prediction_cfg.get("top_k", 10))
+    decoder_top_k = _resolve_decoder_top_k(prediction_cfg)
 
     ddi_artifact = load_ddi_artifact(resolved_paths["ddi_matrix_path"], device="cpu")
-    ddi_artifact["status"] = "active" if ddi_artifact["active"] else "inactive"
+    ddi_artifact = normalize_ddi_context(ddi_artifact)
     drug_vocab_size = int(read_json(resolved_paths["vocab_root"] / "drug_vocab.json")["size"])
     if ddi_artifact["matrix"].shape[0] != drug_vocab_size:
         raise ValueError(
@@ -503,7 +585,6 @@ def main() -> None:
 
     print(f"Using device: {device}")
     print(f"Evaluating split: {split}")
-    print(f"Using threshold: {threshold}")
     print(f"Loading checkpoint: {checkpoint_path}")
     print(
         "Evaluation DDI state: "
@@ -537,6 +618,37 @@ def main() -> None:
             drug_vocab_size=drug_vocab_size,
             batch_size=batch_size,
         )
+        calibration_dataloader = None
+        if prediction_mode_requires_calibration(
+            cli_prediction_mode=args.prediction_mode,
+            cli_prediction_top_k=args.prediction_top_k,
+            cli_threshold=args.threshold,
+            prediction_config=prediction_cfg,
+        ):
+            calibration_split = str(prediction_cfg["calibration"]["split"])
+            calibration_dataloader = dataloader
+            if calibration_split != split:
+                calibration_dataloader = build_eval_dataloader(
+                    split=calibration_split,
+                    runtime_data_config_path=runtime_data_config_path,
+                    processed_root=resolved_paths["processed_root"],
+                    drug_vocab_size=drug_vocab_size,
+                    batch_size=batch_size,
+                )
+        train_cardinality_dataloader = None
+        if prediction_mode_requires_train_cardinality(
+            cli_prediction_mode=args.prediction_mode,
+            cli_prediction_top_k=args.prediction_top_k,
+            cli_threshold=args.threshold,
+            prediction_config=prediction_cfg,
+        ):
+            train_cardinality_dataloader = build_eval_dataloader(
+                split="train",
+                runtime_data_config_path=runtime_data_config_path,
+                processed_root=resolved_paths["processed_root"],
+                drug_vocab_size=drug_vocab_size,
+                batch_size=batch_size,
+            )
         model, _ = build_core_model(
             train_config=train_config,
             model_config=model_config,
@@ -557,16 +669,56 @@ def main() -> None:
         model=model,
         dataloader=dataloader,
         device=device,
-        threshold=threshold,
         ddi_artifact=ddi_artifact,
         decoder_top_k=decoder_top_k,
+        prediction_config=prediction_cfg,
+        checkpoint_payload=checkpoint_payload,
+        cli_threshold=args.threshold,
+        cli_prediction_mode=args.prediction_mode,
+        cli_prediction_top_k=args.prediction_top_k,
+        calibration_dataloader=calibration_dataloader,
+        train_cardinality_dataloader=train_cardinality_dataloader,
+    )
+    print(f"Prediction mode: {evaluation_result['prediction_mode']}")
+    if evaluation_result["threshold"] is not None:
+        print(
+            f"Using threshold: {evaluation_result['threshold']} "
+            f"[{evaluation_result['threshold_source']}]"
+        )
+    else:
+        prediction_control = dict(evaluation_result["prediction_control"])
+        print(
+            f"Using top-k: {prediction_control['top_k']} "
+            f"[{prediction_control['top_k_source']}]"
+        )
+    runtime_truth = build_core_runtime_truth(
+        fusion_strategy=str(model.fusion_module.strategy),
+        ddi_context=ddi_artifact,
+    )
+    print(
+        "Evaluation runtime truth: "
+        f"pipeline_level={runtime_truth['pipeline_level']} "
+        f"history_active={runtime_truth['history_active']} "
+        f"retrieval_active={runtime_truth['retrieval_active']} "
+        f"fusion_strategy={runtime_truth['fusion_strategy']} "
+        f"ddi_type={runtime_truth['ddi_type']} "
+        f"ddi_research_grade={runtime_truth['ddi_research_grade']}"
     )
     training_ddi_context = checkpoint_payload.get("ddi_context")
+    if isinstance(training_ddi_context, Mapping):
+        training_ddi_context = normalize_ddi_context(training_ddi_context)
+    initialization_context = normalize_initialization_context(checkpoint_payload)
 
     report: dict[str, Any] = {
+        **runtime_truth,
+        **initialization_context,
         "split": split,
         "num_samples": int(evaluation_result["targets"].shape[0]),
-        "threshold": threshold,
+        "prediction_mode": evaluation_result["prediction_mode"],
+        "prediction_control": evaluation_result["prediction_control"],
+        "threshold": evaluation_result["threshold"],
+        "threshold_source": evaluation_result["threshold_source"],
+        "threshold_selection": evaluation_result["threshold_selection"],
         "checkpoint_path": str(checkpoint_path),
         "device": str(device),
         "metrics": evaluation_result["metrics"],

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import inspect
 import itertools
 import json
 import time
@@ -32,6 +33,15 @@ _TIMING_KEYS = (
 _KEEP_CPU_BATCH_KEYS = frozenset({"visit_lengths"})
 _BATCH_FINITE_CHECK_KEYS = ("lab_values", "vital_values", "time_delta_hours")
 _OUTPUT_FINITE_CHECK_KEYS = ("pooled_state", "fused_repr", "drug_logits", "drug_probs")
+_FUSION_SCALAR_DIAGNOSTICS = (
+    "normalized_branch_entropy",
+    "dominant_branch_weight",
+    "branch_balance_score",
+    "branch_collapse_flag",
+    "current_self_current_weight",
+    "current_self_history_weight",
+    "residual_update_norm",
+)
 
 
 @dataclass(frozen=True)
@@ -123,6 +133,34 @@ def _resolve_target_tensor(batch: Mapping[str, Any]) -> torch.Tensor:
     raise KeyError("Batch must contain either `final_target_drugs` or `target_drugs`.")
 
 
+def _accumulate_fusion_diagnostics(
+    totals: dict[str, float],
+    outputs: Mapping[str, Any],
+    *,
+    batch_size: int,
+) -> None:
+    fusion_weights = outputs.get("fusion_weights")
+    branch_order = outputs.get("branch_order")
+    if isinstance(fusion_weights, torch.Tensor) and isinstance(branch_order, list):
+        detached_weights = fusion_weights.detach().to(dtype=torch.float32)
+        if detached_weights.ndim == 2 and detached_weights.shape[1] == len(branch_order):
+            branch_means = detached_weights.mean(dim=0)
+            for branch_index, branch_name in enumerate(branch_order):
+                totals[f"fusion_weight_{branch_name}"] = totals.get(
+                    f"fusion_weight_{branch_name}",
+                    0.0,
+                ) + float(branch_means[branch_index].cpu().item()) * batch_size
+
+    for key in _FUSION_SCALAR_DIAGNOSTICS:
+        value = outputs.get(key)
+        if not isinstance(value, torch.Tensor) or value.numel() <= 0:
+            continue
+        detached_value = value.detach().to(dtype=torch.float32)
+        totals[f"fusion_{key}"] = totals.get(f"fusion_{key}", 0.0) + (
+            float(detached_value.mean().cpu().item()) * batch_size
+        )
+
+
 class Trainer:
     """Minimal trainer for stable core-model optimization."""
 
@@ -146,7 +184,9 @@ class Trainer:
         non_blocking_transfer: bool = False,
         log_interval: int = 50,
         profile_steps: int | None = None,
+        early_stopping_patience: int | None = None,
         timing_enabled: bool = True,
+        detailed_timing: bool = False,
     ) -> None:
         if monitor_mode not in {"min", "max"}:
             raise ValueError(f"monitor_mode must be 'min' or 'max', got {monitor_mode!r}")
@@ -158,6 +198,11 @@ class Trainer:
             raise ValueError(f"log_interval must be positive, got {log_interval!r}")
         if profile_steps is not None and int(profile_steps) <= 0:
             raise ValueError(f"profile_steps must be positive when provided, got {profile_steps!r}")
+        if early_stopping_patience is not None and int(early_stopping_patience) <= 0:
+            raise ValueError(
+                "early_stopping_patience must be positive when provided, "
+                f"got {early_stopping_patience!r}"
+            )
 
         self.model = model.to(device)
         self.loss_fn = loss_fn.to(device) if isinstance(loss_fn, nn.Module) else loss_fn
@@ -167,7 +212,29 @@ class Trainer:
         self.monitor_metric = str(monitor_metric)
         self.monitor_mode = monitor_mode
         self.decoder_top_k = decoder_top_k
+        self._loss_fn_keyword_names: set[str] | None = None
+        self._loss_fn_accepts_var_kwargs = False
+        loss_callable = getattr(self.loss_fn, "forward", self.loss_fn)
+        if callable(loss_callable):
+            try:
+                loss_signature = inspect.signature(loss_callable)
+            except (TypeError, ValueError):
+                loss_signature = None
+            if loss_signature is not None:
+                self._loss_fn_accepts_var_kwargs = any(
+                    parameter.kind == inspect.Parameter.VAR_KEYWORD
+                    for parameter in loss_signature.parameters.values()
+                )
+                self._loss_fn_keyword_names = {
+                    str(name)
+                    for name, parameter in loss_signature.parameters.items()
+                    if parameter.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+                }
         self.run_context = copy.deepcopy(dict(run_context or {}))
+        model_runtime_truth = getattr(model, "runtime_truth", None)
+        if isinstance(model_runtime_truth, Mapping):
+            for key, value in dict(model_runtime_truth).items():
+                self.run_context.setdefault(str(key), copy.deepcopy(value))
 
         self.precision_policy = resolve_precision_policy(requested_amp=bool(amp), device=device)
         self.requested_amp = self.precision_policy.requested_amp
@@ -181,7 +248,9 @@ class Trainer:
         self.non_blocking_transfer = bool(non_blocking_transfer)
         self.log_interval = int(log_interval)
         self.profile_steps = None if profile_steps is None else int(profile_steps)
+        self.early_stopping_patience = None if early_stopping_patience is None else int(early_stopping_patience)
         self.timing_enabled = bool(timing_enabled)
+        self.detailed_timing_enabled = bool(detailed_timing)
         if self.precision_policy.warning_message:
             warnings.warn(self.precision_policy.warning_message, RuntimeWarning, stacklevel=2)
         if self.grad_scaler_enabled:
@@ -200,12 +269,20 @@ class Trainer:
         runtime_context["resolved_precision"] = self.resolved_precision
         runtime_context["grad_scaler_enabled"] = self.grad_scaler_enabled
         runtime_context["max_grad_norm"] = self.max_grad_norm
+        runtime_context["detailed_timing"] = self.detailed_timing_enabled
 
         self.checkpoint_dir = ensure_dir(checkpoint_dir)
         self.log_dir = ensure_dir(log_dir)
         self.best_checkpoint_path = self.checkpoint_dir / "train_core_best.pt"
         self.metrics_log_path = self.log_dir / "train_core_metrics.jsonl"
         self.best_metric = float("inf") if monitor_mode == "min" else float("-inf")
+        self.epochs_without_improvement = 0
+        self.stopped_early = False
+        self.stop_reason: str | None = None
+        self._cached_validation_prediction_payload: tuple[torch.Tensor, torch.Tensor] | None = None
+        self._cached_validation_payload_dataloader_id: int | None = None
+        self._last_checkpoint_write_time = 0.0
+        self._last_metrics_log_write_time = 0.0
 
     def _sync_timing(self) -> None:
         if self.device.type == "cuda" and self.timing_enabled:
@@ -338,11 +415,22 @@ class Trainer:
                 "Model did not return `drug_logits` and `drug_probs`. "
                 "Ensure a medication decoder is attached in core training."
             )
+        loss_kwargs = {
+            "drug_logits": drug_logits,
+            "drug_probs": drug_probs,
+            "target_drugs": _resolve_target_tensor(batch_on_device),
+            "visit_mask": batch_on_device["visit_mask"],
+            "fusion_entropy_loss": outputs.get("fusion_entropy_loss"),
+            "fusion_balance_loss": outputs.get("fusion_balance_loss"),
+        }
+        if not self._loss_fn_accepts_var_kwargs and self._loss_fn_keyword_names is not None:
+            loss_kwargs = {
+                key: value
+                for key, value in loss_kwargs.items()
+                if key in self._loss_fn_keyword_names
+            }
         return self.loss_fn(
-            drug_logits=drug_logits,
-            drug_probs=drug_probs,
-            target_drugs=_resolve_target_tensor(batch_on_device),
-            visit_mask=batch_on_device["visit_mask"],
+            **loss_kwargs,
         )
 
     def _optimizer_step(self, *, context: str) -> None:
@@ -373,6 +461,79 @@ class Trainer:
             if key != "samples_per_sec"
         } | {f"{phase}_samples_per_sec": samples_per_sec}
 
+    def _prediction_payload_collector(self, *, training: bool) -> Any | None:
+        _ = training
+        return None
+
+    def _collect_prediction_payload_batch(
+        self,
+        *,
+        collector: Any,
+        outputs: Mapping[str, Any],
+        batch_on_device: Mapping[str, Any],
+    ) -> None:
+        _ = collector
+        _ = outputs
+        _ = batch_on_device
+
+    def _finalize_prediction_payload_collector(
+        self,
+        *,
+        collector: Any,
+        dataloader: DataLoader,
+        training: bool,
+    ) -> None:
+        _ = collector
+        _ = dataloader
+        _ = training
+        self._cached_validation_prediction_payload = None
+        self._cached_validation_payload_dataloader_id = None
+
+    def _cached_validation_prediction_payload_for(
+        self,
+        dataloader: DataLoader,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        if self._cached_validation_payload_dataloader_id != id(dataloader):
+            return None
+        return self._cached_validation_prediction_payload
+
+    def _collect_runtime_timing(
+        self,
+        timing_totals: dict[str, float],
+        outputs: Mapping[str, Any],
+    ) -> None:
+        if not self.detailed_timing_enabled:
+            return
+        runtime_timing = outputs.get("runtime_timing")
+        if not isinstance(runtime_timing, Mapping):
+            return
+        for key, value in runtime_timing.items():
+            try:
+                timing_totals[str(key)] = timing_totals.get(str(key), 0.0) + float(value)
+            except (TypeError, ValueError):
+                continue
+
+    def _detailed_timing_metric_payload(
+        self,
+        *,
+        phase: str,
+        timing_totals: Mapping[str, float],
+        step_count: int,
+    ) -> dict[str, float]:
+        if not self.detailed_timing_enabled or step_count <= 0:
+            return {}
+        return {
+            f"{phase}_{key}": float(value) / float(step_count)
+            for key, value in timing_totals.items()
+        }
+
+    def _epoch_aux_timing_metrics(self) -> dict[str, float]:
+        if not self.detailed_timing_enabled:
+            return {}
+        return {
+            "checkpoint_write_time": float(self._last_checkpoint_write_time),
+        }
+
     def _run_one_epoch(
         self,
         dataloader: DataLoader,
@@ -390,9 +551,12 @@ class Trainer:
             "optimizer_time": 0.0,
             "step_time": 0.0,
         }
+        detailed_timing_totals: dict[str, float] = {}
+        fusion_diagnostic_totals: dict[str, float] = {}
         total_examples = 0
         step_count = 0
         max_steps = self._max_epoch_steps(dataloader)
+        prediction_payload_collector = self._prediction_payload_collector(training=training)
 
         self.model.train(mode=training)
         grad_context = torch.enable_grad if training else torch.no_grad
@@ -443,6 +607,18 @@ class Trainer:
                         outputs,
                         context=f"{step_context} after forward",
                     )
+                    self._collect_runtime_timing(detailed_timing_totals, outputs)
+                    _accumulate_fusion_diagnostics(
+                        fusion_diagnostic_totals,
+                        outputs,
+                        batch_size=batch_size,
+                    )
+                    if prediction_payload_collector is not None:
+                        self._collect_prediction_payload_batch(
+                            collector=prediction_payload_collector,
+                            outputs=outputs,
+                            batch_on_device=batch_on_device,
+                        )
                     self._sync_timing()
                     forward_time = time.perf_counter() - forward_start
 
@@ -502,6 +678,11 @@ class Trainer:
                 last_step_end = time.perf_counter()
         finally:
             self._close_progress(progress)
+            self._finalize_prediction_payload_collector(
+                collector=prediction_payload_collector,
+                dataloader=dataloader,
+                training=training,
+            )
 
         if training and batches_since_step > 0:
             optimizer_start = time.perf_counter()
@@ -519,10 +700,23 @@ class Trainer:
             for key in _LOSS_KEYS
         }
         epoch_metrics.update(
+            {
+                f"{phase}_{key}": value / float(total_examples)
+                for key, value in fusion_diagnostic_totals.items()
+            }
+        )
+        epoch_metrics.update(
             self._timing_metric_payload(
                 phase=phase,
                 timing_totals=timing_totals,
                 total_examples=total_examples,
+                step_count=step_count,
+            )
+        )
+        epoch_metrics.update(
+            self._detailed_timing_metric_payload(
+                phase=phase,
+                timing_totals=detailed_timing_totals,
                 step_count=step_count,
             )
         )
@@ -534,6 +728,32 @@ class Trainer:
     def validate_one_epoch(self, dataloader: DataLoader) -> dict[str, float]:
         return self._run_one_epoch(dataloader, training=False)
 
+    def _current_monitor_value(self, epoch_metrics: Mapping[str, float]) -> float:
+        if self.monitor_metric not in epoch_metrics:
+            raise KeyError(f"Missing monitor metric `{self.monitor_metric}` in epoch metrics")
+        return float(epoch_metrics[self.monitor_metric])
+
+    def _step_scheduler(self, epoch_metrics: Mapping[str, float]) -> None:
+        if self.scheduler is None:
+            return
+        current_metric = self._current_monitor_value(epoch_metrics)
+        if isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+            self.scheduler.step(current_metric)
+            return
+        self.scheduler.step()
+
+    def _maybe_trigger_early_stopping(self) -> bool:
+        if self.early_stopping_patience is None:
+            return False
+        if self.epochs_without_improvement < self.early_stopping_patience:
+            return False
+        self.stopped_early = True
+        self.stop_reason = (
+            f"early_stopping_patience={self.early_stopping_patience} "
+            f"without improvement on {self.monitor_metric}"
+        )
+        return True
+
     def save_best_checkpoint(
         self,
         *,
@@ -541,19 +761,20 @@ class Trainer:
         epoch_metrics: Mapping[str, float],
         extra_state: Mapping[str, Any] | None = None,
     ) -> Path | None:
-        if self.monitor_metric not in epoch_metrics:
-            raise KeyError(f"Missing monitor metric `{self.monitor_metric}` in epoch metrics")
-
-        current_metric = float(epoch_metrics[self.monitor_metric])
+        checkpoint_start = time.perf_counter()
+        current_metric = self._current_monitor_value(epoch_metrics)
         is_better = (
             current_metric < self.best_metric
             if self.monitor_mode == "min"
             else current_metric > self.best_metric
         )
         if not is_better:
+            self.epochs_without_improvement += 1
+            self._last_checkpoint_write_time = time.perf_counter() - checkpoint_start
             return None
 
         self.best_metric = current_metric
+        self.epochs_without_improvement = 0
         checkpoint_payload: dict[str, Any] = {
             "epoch": int(epoch),
             "best_metric": current_metric,
@@ -565,11 +786,16 @@ class Trainer:
             checkpoint_payload["scheduler_state_dict"] = self.scheduler.state_dict()
         if extra_state:
             checkpoint_payload.update(dict(extra_state))
+        if self.run_context:
+            for key, value in self.run_context.items():
+                checkpoint_payload.setdefault(str(key), copy.deepcopy(value))
 
         torch.save(checkpoint_payload, self.best_checkpoint_path)
+        self._last_checkpoint_write_time = time.perf_counter() - checkpoint_start
         return self.best_checkpoint_path
 
-    def log_metrics(self, *, epoch: int, metrics: Mapping[str, Any]) -> None:
+    def log_metrics(self, *, epoch: int, metrics: Mapping[str, Any]) -> float:
+        log_write_start = time.perf_counter()
         ddi_context = dict(self.run_context.get("ddi_context", {}))
         ddi_status = ddi_context.get("status", "active" if ddi_context.get("active") else "inactive")
         ddi_reason = ddi_context.get("reason", "")
@@ -578,6 +804,10 @@ class Trainer:
         ddi_research_grade = source_metadata.get("research_grade")
         ddi_purpose = source_metadata.get("purpose", "")
         effective_ddi_lambda = self.run_context.get("effective_ddi_lambda", 0.0)
+        pipeline_level = self.run_context.get("pipeline_level")
+        history_active = self.run_context.get("history_active")
+        retrieval_active = self.run_context.get("retrieval_active")
+        fusion_strategy = self.run_context.get("fusion_strategy")
         summary = (
             f"Epoch {epoch}: "
             f"train_total_loss={float(metrics['train_total_loss']):.6f} "
@@ -609,6 +839,14 @@ class Trainer:
             summary = f"{summary} ddi_research_grade={bool(ddi_research_grade)}"
         if ddi_purpose:
             summary = f"{summary} ddi_purpose={str(ddi_purpose)}"
+        if pipeline_level:
+            summary = f"{summary} pipeline_level={str(pipeline_level)}"
+        if history_active is not None:
+            summary = f"{summary} history_active={bool(history_active)}"
+        if retrieval_active is not None:
+            summary = f"{summary} retrieval_active={bool(retrieval_active)}"
+        if fusion_strategy:
+            summary = f"{summary} fusion_strategy={str(fusion_strategy)}"
         print(summary)
 
         log_payload = {"epoch": int(epoch), **{key: _to_float(value) for key, value in metrics.items()}}
@@ -617,6 +855,14 @@ class Trainer:
         with self.metrics_log_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(log_payload, ensure_ascii=True, sort_keys=True))
             handle.write("\n")
+        self._last_metrics_log_write_time = time.perf_counter() - log_write_start
+        if self.detailed_timing_enabled:
+            print(
+                "Detailed timing: "
+                f"checkpoint_write_time={self._last_checkpoint_write_time:.4f} "
+                f"metrics_log_write_time={self._last_metrics_log_write_time:.4f}"
+            )
+        return self._last_metrics_log_write_time
 
     def _set_dataloader_epoch(self, dataloader: DataLoader, *, epoch: int) -> None:
         batch_sampler = getattr(dataloader, "batch_sampler", None)
@@ -643,8 +889,7 @@ class Trainer:
             val_metrics = self.validate_one_epoch(val_dataloader)
             epoch_metrics = {**train_metrics, **val_metrics}
 
-            if self.scheduler is not None:
-                self.scheduler.step()
+            self._step_scheduler(epoch_metrics)
 
             maybe_best = self.save_best_checkpoint(
                 epoch=epoch,
@@ -654,14 +899,31 @@ class Trainer:
             if maybe_best is not None:
                 best_checkpoint_path = maybe_best
 
-            self.log_metrics(epoch=epoch, metrics=epoch_metrics)
-            history.append({"epoch": float(epoch), **epoch_metrics})
+            epoch_metrics = {**epoch_metrics, **self._epoch_aux_timing_metrics()}
+            metrics_log_write_time = self.log_metrics(epoch=epoch, metrics=epoch_metrics)
+            history.append(
+                {
+                    "epoch": float(epoch),
+                    **epoch_metrics,
+                    **(
+                        {"metrics_log_write_time": float(metrics_log_write_time)}
+                        if self.detailed_timing_enabled
+                        else {}
+                    ),
+                }
+            )
+            if self._maybe_trigger_early_stopping():
+                print(f"Early stopping triggered at epoch {epoch}: {self.stop_reason}")
+                break
 
         return {
             "history": history,
             "best_metric": self.best_metric,
             "best_checkpoint_path": None if best_checkpoint_path is None else str(best_checkpoint_path),
             "monitor_metric": self.monitor_metric,
+            "epochs_completed": len(history),
+            "stopped_early": self.stopped_early,
+            "stop_reason": self.stop_reason,
         }
 
 
