@@ -53,11 +53,12 @@ else:
     )
 
 from src.data.build_vocab import load_vocab_bundle
-from src.data.dataset import collate_batch
+from src.data.dataset import build_collate_fn, collate_batch
 from src.models.ddi_regularization import load_ddi_artifact
 from src.training.train_core import (
     build_core_model,
     build_dataset,
+    build_core_memory_bank,
     build_runtime_data_config_file,
     resolve_device,
     validate_core_runtime_config,
@@ -350,6 +351,7 @@ def build_eval_dataloader(
     processed_root: Path,
     drug_vocab_size: int,
     batch_size: int,
+    include_records: bool = False,
 ) -> DataLoader:
     dataset = build_dataset(
         split=split,
@@ -364,7 +366,13 @@ def build_eval_dataloader(
         batch_size=int(batch_size),
         shuffle=False,
         num_workers=0,
-        collate_fn=collate_batch,
+        collate_fn=build_collate_fn(
+            include_full_targets=True,
+            include_final_target=True,
+            include_records=include_records,
+        )
+        if include_records
+        else collate_batch,
     )
 
 
@@ -464,6 +472,7 @@ def run_core_evaluation(
     cli_prediction_top_k: int | None = None,
     calibration_dataloader: DataLoader | None = None,
     train_cardinality_dataloader: DataLoader | None = None,
+    memory_bank: Any | None = None,
 ) -> dict[str, Any]:
     ddi_artifact = normalize_ddi_context(ddi_artifact)
     evaluation_payload = collect_model_predictions(
@@ -471,6 +480,7 @@ def run_core_evaluation(
         dataloader=dataloader,
         device=device,
         decoder_top_k=decoder_top_k,
+        memory_bank=memory_bank,
     )
 
     calibration_payload = None
@@ -480,6 +490,7 @@ def run_core_evaluation(
             dataloader=calibration_dataloader,
             device=device,
             decoder_top_k=decoder_top_k,
+            memory_bank=memory_bank,
         )
 
     avg_train_drugs = None
@@ -568,6 +579,8 @@ def main() -> None:
     runtime_cfg = dict(eval_config.get("runtime", {}))
     evaluation_cfg = dict(eval_config.get("evaluation", {}))
     prediction_cfg = normalize_prediction_config(eval_config.get("prediction", {}))
+    core_cfg = dict(eval_config.get("core", train_config.get("core", {})))
+    retrieval_enabled = bool(core_cfg.get("use_retrieval", False))
 
     split = str(args.split or evaluation_cfg.get("split", "test"))
     device = resolve_device(args.device or runtime_cfg.get("device", "cpu"))
@@ -599,6 +612,7 @@ def main() -> None:
     )
 
     train_config = copy.deepcopy(train_config)
+    train_config["core"] = copy.deepcopy(core_cfg)
     train_config["_resolved_paths"] = {"processed_root": str(resolved_paths["processed_root"])}
 
     with tempfile.TemporaryDirectory(prefix="clinrec_eval_runtime_") as temp_dir_name:
@@ -617,6 +631,7 @@ def main() -> None:
             processed_root=resolved_paths["processed_root"],
             drug_vocab_size=drug_vocab_size,
             batch_size=batch_size,
+            include_records=retrieval_enabled,
         )
         calibration_dataloader = None
         if prediction_mode_requires_calibration(
@@ -634,6 +649,7 @@ def main() -> None:
                     processed_root=resolved_paths["processed_root"],
                     drug_vocab_size=drug_vocab_size,
                     batch_size=batch_size,
+                    include_records=retrieval_enabled,
                 )
         train_cardinality_dataloader = None
         if prediction_mode_requires_train_cardinality(
@@ -648,6 +664,16 @@ def main() -> None:
                 processed_root=resolved_paths["processed_root"],
                 drug_vocab_size=drug_vocab_size,
                 batch_size=batch_size,
+            )
+        retrieval_bank_dataloader = None
+        if retrieval_enabled:
+            retrieval_bank_dataloader = build_eval_dataloader(
+                split="train",
+                runtime_data_config_path=runtime_data_config_path,
+                processed_root=resolved_paths["processed_root"],
+                drug_vocab_size=drug_vocab_size,
+                batch_size=batch_size,
+                include_records=True,
             )
         model, _ = build_core_model(
             train_config=train_config,
@@ -665,6 +691,25 @@ def main() -> None:
     except RuntimeError as exc:
         raise RuntimeError(f"Failed to load checkpoint state from {checkpoint_path}: {exc}") from exc
 
+    memory_bank = None
+    if retrieval_enabled:
+        if retrieval_bank_dataloader is None:
+            raise RuntimeError("Retrieval evaluation requires a train memory-bank dataloader.")
+        memory_bank = build_core_memory_bank(
+            model=model,
+            dataloader=retrieval_bank_dataloader,
+            device=device,
+            split="train",
+        )
+        print(
+            "Evaluation retrieval memory bank: "
+            f"split={memory_bank.split} "
+            f"states={len(memory_bank)} "
+            f"top_k={model.retrieval_top_k} "
+            f"cross_split_policy={model.cross_split_policy or ('allow_all' if model.allow_cross_split else 'same_split')} "
+            f"leakage_safe={model.retrieval_leakage_safe}"
+        )
+
     evaluation_result = run_core_evaluation(
         model=model,
         dataloader=dataloader,
@@ -678,6 +723,7 @@ def main() -> None:
         cli_prediction_top_k=args.prediction_top_k,
         calibration_dataloader=calibration_dataloader,
         train_cardinality_dataloader=train_cardinality_dataloader,
+        memory_bank=memory_bank,
     )
     print(f"Prediction mode: {evaluation_result['prediction_mode']}")
     if evaluation_result["threshold"] is not None:
@@ -694,6 +740,16 @@ def main() -> None:
     runtime_truth = build_core_runtime_truth(
         fusion_strategy=str(model.fusion_module.strategy),
         ddi_context=ddi_artifact,
+        retrieval_active=retrieval_enabled,
+        retrieval_status="active" if retrieval_enabled else "disabled",
+        retrieval_top_k=model.retrieval_top_k if retrieval_enabled else None,
+        retrieval_scoring_mode=model.retrieval_scoring_mode if retrieval_enabled else None,
+        retrieval_cross_split_policy=(
+            model.cross_split_policy or ("allow_all" if model.allow_cross_split else "same_split")
+        )
+        if retrieval_enabled
+        else None,
+        retrieval_leakage_safe=model.retrieval_leakage_safe if retrieval_enabled else None,
     )
     print(
         "Evaluation runtime truth: "

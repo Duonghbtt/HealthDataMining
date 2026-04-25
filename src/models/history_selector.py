@@ -46,7 +46,8 @@ def _gather_bank_states(
         raise ValueError(f"Expected neighbor indices with shape (B, K), got {tuple(indices.shape)}")
     flat = indices.clamp(min=0).flatten().cpu()
     gathered = memory_bank.visit_states.index_select(0, flat).to(device=device, dtype=torch.float32)
-    return gathered.view(indices.shape[0], indices.shape[1], -1)
+    hidden_dim = int(memory_bank.visit_states.shape[1])
+    return gathered.view(indices.shape[0], indices.shape[1], hidden_dim)
 
 
 def _masked_weighted_sum(values: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
@@ -572,6 +573,39 @@ class HistorySelector(nn.Module):
             }
 
         neighbor_indices = torch.as_tensor(retrieval_payload["neighbor_indices"], dtype=torch.long, device=device)
+        if neighbor_indices.shape[1] == 0:
+            empty = torch.zeros(batch_size, 0, dtype=torch.float32, device=device)
+            empty_long = torch.zeros(batch_size, 0, dtype=torch.long, device=device)
+            empty_bool = torch.zeros(batch_size, 0, dtype=torch.bool, device=device)
+            empty_attr = torch.zeros(batch_size, 0, len(ATTRIBUTE_ORDER), dtype=torch.float32, device=device)
+            return {
+                "context": torch.zeros_like(current_state),
+                "available_mask": torch.zeros(batch_size, dtype=torch.bool, device=device),
+                "weights": empty,
+                "dense_weights": empty,
+                "content_scores": empty,
+                "scores": empty,
+                "indices": empty_long,
+                "mask": empty_bool,
+                "selected_mask": empty_bool,
+                "selected_count": torch.zeros(batch_size, dtype=torch.long, device=device),
+                "top_index": torch.full((batch_size,), -1, dtype=torch.long, device=device),
+                "matched_visit_indices": empty_long,
+                "retrieval_scores": empty,
+                "retrieval_bias": empty,
+                "neighbor_stay_ids": empty_long,
+                "attribute_scores": empty_attr,
+                "attribute_weights": empty_attr,
+                "attribute_mask": torch.zeros_like(empty_attr, dtype=torch.bool),
+                "attribute_available_mask": empty_bool,
+                "attribute_fallback_mask": empty_bool,
+                "attribute_sources": ["fallback"] * len(ATTRIBUTE_ORDER),
+                "group_reweight_scores": empty,
+                "group_influence": empty,
+                "group_cosine_scores": empty,
+                "group_used_mask": empty_bool,
+                "group_used": False,
+            }
         neighbor_mask = neighbor_indices >= 0
         neighbor_states = _gather_bank_states(memory_bank, neighbor_indices, device=device)
         retrieval_scores = torch.as_tensor(

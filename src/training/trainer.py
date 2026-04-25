@@ -161,6 +161,49 @@ def _accumulate_fusion_diagnostics(
         )
 
 
+def _accumulate_retrieval_diagnostics(
+    totals: dict[str, float],
+    outputs: Mapping[str, Any],
+    *,
+    batch_size: int,
+) -> None:
+    retrieval_used = bool(outputs.get("retrieval_used", False))
+    totals["retrieval_active"] = totals.get("retrieval_active", 0.0) + float(retrieval_used) * batch_size
+    payload = outputs.get("retrieval_payload")
+    if isinstance(payload, Mapping):
+        neighbor_indices = payload.get("neighbor_indices")
+        neighbor_scores = payload.get("neighbor_scores")
+        if isinstance(neighbor_indices, torch.Tensor):
+            mask = neighbor_indices >= 0
+            row_valid = mask.any(dim=1) if mask.ndim == 2 else torch.zeros(batch_size, dtype=torch.bool)
+            totals["retrieval_valid_neighbor_rate"] = totals.get("retrieval_valid_neighbor_rate", 0.0) + (
+                float(row_valid.to(dtype=torch.float32).mean().cpu().item()) * batch_size
+            )
+            totals["retrieval_empty_neighbor_rate"] = totals.get("retrieval_empty_neighbor_rate", 0.0) + (
+                float((~row_valid).to(dtype=torch.float32).mean().cpu().item()) * batch_size
+            )
+            if mask.ndim == 2:
+                totals["retrieval_top_k"] = totals.get("retrieval_top_k", 0.0) + float(mask.shape[1]) * batch_size
+        if isinstance(neighbor_scores, torch.Tensor):
+            finite_scores = neighbor_scores.detach().to(dtype=torch.float32)
+            finite_scores = finite_scores[torch.isfinite(finite_scores)]
+            if finite_scores.numel() > 0:
+                totals["retrieval_mean_similarity"] = totals.get("retrieval_mean_similarity", 0.0) + (
+                    float(finite_scores.mean().cpu().item()) * batch_size
+                )
+                totals["retrieval_max_similarity"] = totals.get("retrieval_max_similarity", 0.0) + (
+                    float(finite_scores.max().cpu().item()) * batch_size
+                )
+                totals["retrieval_min_similarity"] = totals.get("retrieval_min_similarity", 0.0) + (
+                    float(finite_scores.min().cpu().item()) * batch_size
+                )
+    neighbor_context = outputs.get("neighbor_history_context")
+    if isinstance(neighbor_context, torch.Tensor) and neighbor_context.numel() > 0:
+        totals["neighbor_evidence_norm"] = totals.get("neighbor_evidence_norm", 0.0) + (
+            float(neighbor_context.detach().to(dtype=torch.float32).norm(dim=-1).mean().cpu().item()) * batch_size
+        )
+
+
 class Trainer:
     """Minimal trainer for stable core-model optimization."""
 
@@ -609,6 +652,11 @@ class Trainer:
                     )
                     self._collect_runtime_timing(detailed_timing_totals, outputs)
                     _accumulate_fusion_diagnostics(
+                        fusion_diagnostic_totals,
+                        outputs,
+                        batch_size=batch_size,
+                    )
+                    _accumulate_retrieval_diagnostics(
                         fusion_diagnostic_totals,
                         outputs,
                         batch_size=batch_size,

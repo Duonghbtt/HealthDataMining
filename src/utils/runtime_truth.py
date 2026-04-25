@@ -67,17 +67,36 @@ def build_core_runtime_truth(
     *,
     fusion_strategy: str,
     ddi_context: Mapping[str, Any] | None,
+    retrieval_active: bool = False,
+    retrieval_status: str | None = None,
+    retrieval_top_k: int | None = None,
+    retrieval_scoring_mode: str | None = None,
+    retrieval_cross_split_policy: str | None = None,
+    retrieval_leakage_safe: bool | None = None,
 ) -> dict[str, Any]:
-    return {
-        "pipeline_level": "core+history",
+    truth = {
+        "pipeline_level": "core+history+retrieval" if bool(retrieval_active) else "core+history",
         "history_active": True,
-        "retrieval_active": False,
-        "retrieval_status": "extension_only",
+        "retrieval_active": bool(retrieval_active),
+        "retrieval_status": str(
+            retrieval_status
+            or ("active" if bool(retrieval_active) else "disabled")
+        ),
         "fusion_strategy": str(fusion_strategy),
         "train_mode": "core",
         "runtime_mode": "core",
         **ddi_truth_fields(ddi_context),
     }
+    if retrieval_top_k is not None:
+        truth["retrieval_top_k"] = int(retrieval_top_k)
+    if retrieval_scoring_mode is not None:
+        truth["retrieval_scoring_mode"] = str(retrieval_scoring_mode)
+        truth["retrieval_mode"] = str(retrieval_scoring_mode)
+    if retrieval_cross_split_policy is not None:
+        truth["retrieval_cross_split_policy"] = str(retrieval_cross_split_policy)
+    if retrieval_leakage_safe is not None:
+        truth["retrieval_leakage_safe"] = bool(retrieval_leakage_safe)
+    return truth
 
 
 def build_extension_runtime_truth(

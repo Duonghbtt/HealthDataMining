@@ -123,6 +123,46 @@ def test_cross_patient_retrieval_excludes_same_stay() -> None:
     assert 301 not in payload["neighbor_stay_ids"][0].tolist()
 
 
+def test_empty_memory_bank_returns_empty_neighbors_without_crashing() -> None:
+    bank = MemoryBank(
+        visit_states=torch.empty((0, 2), dtype=torch.float32),
+        visit_repr=torch.empty((0, 2), dtype=torch.float32),
+        subject_ids=[],
+        hadm_ids=[],
+        stay_ids=[],
+        visit_index=[],
+        visit_time_days=[],
+        visit_time_text=[],
+        target_drugs=[],
+        num_steps=[],
+        diag_code_sets=[],
+        proc_code_sets=[],
+        lab_feature_sets=[],
+        vital_feature_sets=[],
+        split="train",
+    )
+    payload = retrieve_patient_neighbors(
+        torch.tensor([[0.96, 0.04]], dtype=torch.float32),
+        {
+            "stay_ids": [399],
+            "subject_ids": [199],
+            "hadm_ids": [299],
+            "visit_indices": [0],
+            "visit_time_days": [4.0],
+            "diag_code_sets": [(10, 20, 30)],
+            "proc_code_sets": [(1, 2)],
+            "lab_feature_sets": [(0, 1, 2)],
+            "vital_feature_sets": [(0, 1)],
+            "split": ["train"],
+        },
+        bank,
+        top_k=2,
+        temporal_decay_alpha=0.2,
+    )
+    validate_retrieval_payload(payload)
+    assert payload["neighbor_indices"].shape == (1, 0)
+
+
 def test_batch_query_supports_more_than_one_patient() -> None:
     bank = _build_memory_bank()
     payload = retrieve_patient_neighbors(

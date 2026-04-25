@@ -50,6 +50,7 @@ from src.models.fusion import FusionModule
 from src.models.history_selector import HistorySelector
 from src.models.medication_decoder import MedicationDecoder
 from src.models.patient_state_encoder import PatientStateEncoder
+from src.retrieval.memory_bank import MemoryBank
 from src.training.losses import MedicationRecommendationLoss, extract_last_valid_targets
 from src.training.trainer import Trainer
 from src.utils.io import ensure_dir, load_yaml_config, read_json, resolve_path
@@ -58,6 +59,29 @@ from src.utils.runtime_truth import build_core_runtime_truth, normalize_ddi_cont
 
 class TqdmCoreTrainer(Trainer):
     """Core trainer that adds tqdm progress bars for train and validation."""
+
+    def __init__(
+        self,
+        *args: Any,
+        retrieval_memory_bank: MemoryBank | None = None,
+        retrieval_enabled: bool = False,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self.retrieval_memory_bank = retrieval_memory_bank
+        self.retrieval_enabled = bool(retrieval_enabled)
+
+    def _forward_model(self, batch_on_device: Mapping[str, Any]) -> dict[str, Any]:
+        if not self.retrieval_enabled:
+            return super()._forward_model(batch_on_device)
+        return self.model(
+            batch_on_device,
+            mode="core",
+            decoder_top_k=self.decoder_top_k,
+            compute_ddi_metrics=False,
+            memory_bank=self.retrieval_memory_bank if self.retrieval_enabled else None,
+            records=batch_on_device.get("records") if self.retrieval_enabled else None,
+        )
 
     def _create_progress(
         self,
@@ -424,8 +448,6 @@ def validate_core_runtime_config(
     runtime_mode = str(runtime_cfg.get("mode", "core")).strip().lower()
     if runtime_mode != "core":
         raise ValueError(f"{context_label} only supports runtime.mode=core, got {runtime_mode!r}.")
-    if bool(core_cfg.get("use_retrieval", False)):
-        raise ValueError(f"{context_label} does not support core.use_retrieval=true.")
     if bool(core_cfg.get("use_group_encoder", False)):
         raise ValueError(f"{context_label} does not support core.use_group_encoder=true.")
 
@@ -587,6 +609,7 @@ def build_dataloaders(
     max_open_shards: int | None = None,
     max_visits: int | None = None,
     max_history: int | None = None,
+    include_records: bool = False,
 ) -> tuple[DataLoader, DataLoader]:
     if int(batch_size) <= 0:
         raise ValueError(f"batch_size must be positive, got {batch_size!r}")
@@ -617,6 +640,7 @@ def build_dataloaders(
         include_final_target=True,
         max_visits=max_visits,
         max_history=max_history,
+        include_records=include_records,
     )
     loader_kwargs: dict[str, Any] = {
         "num_workers": int(num_workers),
@@ -706,6 +730,8 @@ def build_core_model(
     model_cfg = dict(model_config.get("model", {}))
     embedding_cfg = dict(model_config.get("embedding", {}))
     retrieval_cfg = dict(model_config.get("retrieval", {}))
+    core_cfg = dict(train_config.get("core", {}))
+    core_retrieval_enabled = bool(core_cfg.get("use_retrieval", False))
     history_cfg = dict(model_config.get("history_selector", {}))
     fusion_cfg = dict(model_config.get("fusion", {}))
     decoder_cfg = dict(model_config.get("decoder", {}))
@@ -792,10 +818,18 @@ def build_core_model(
         allow_cross_split=bool(retrieval_cfg.get("allow_cross_split", False)),
         retrieval_scoring_mode=str(retrieval_cfg.get("scoring_mode", "temporal_relevance")),
         cross_split_policy=retrieval_cfg.get("cross_split_policy"),
+        core_retrieval_enabled=core_retrieval_enabled,
+        retrieval_leakage_safe=bool(retrieval_cfg.get("leakage_safe", True)),
     )
     model.runtime_truth = build_core_runtime_truth(
         fusion_strategy=fusion_module.strategy,
         ddi_context=ddi_context,
+        retrieval_active=core_retrieval_enabled,
+        retrieval_status="available" if core_retrieval_enabled else "disabled",
+        retrieval_top_k=int(retrieval_cfg.get("top_k", 5)) if core_retrieval_enabled else None,
+        retrieval_scoring_mode=str(retrieval_cfg.get("scoring_mode", "temporal_relevance")) if core_retrieval_enabled else None,
+        retrieval_cross_split_policy=str(retrieval_cfg.get("cross_split_policy") or ("allow_all" if bool(retrieval_cfg.get("allow_cross_split", False)) else "same_split")) if core_retrieval_enabled else None,
+        retrieval_leakage_safe=bool(retrieval_cfg.get("leakage_safe", True)) if core_retrieval_enabled else None,
     )
     loss_cfg = dict(train_config.get("loss", {}))
     loss_fn = MedicationRecommendationLoss(
@@ -1045,6 +1079,64 @@ def build_scheduler(
     )
 
 
+def build_core_memory_bank(
+    *,
+    model: RetrievalEvidenceFusionModel,
+    dataloader: DataLoader,
+    device: torch.device,
+    split: str,
+) -> MemoryBank:
+    banks: list[MemoryBank] = []
+    was_training = model.training
+    model = model.to(device)
+    model.eval()
+    with torch.no_grad():
+        for batch in dataloader:
+            records = batch.get("records")
+            if not isinstance(records, Sequence):
+                raise RuntimeError("Retrieval memory bank construction requires dataloader batches with records.")
+            batch_on_device = {
+                key: value.to(device) if isinstance(value, torch.Tensor) else value
+                for key, value in batch.items()
+            }
+            encoder_outputs = model.encoder(dict(batch_on_device))
+            banks.append(MemoryBank.build_from_batch(records, encoder_outputs, split=split))
+    model.train(was_training)
+    if not banks:
+        raise ValueError("Cannot build retrieval memory bank from an empty dataloader")
+
+    payloads = [bank.to_payload() for bank in banks]
+    tensor_fields = (
+        "visit_states",
+        "visit_repr",
+        "subject_ids",
+        "hadm_ids",
+        "stay_ids",
+        "visit_index",
+        "visit_time_days",
+        "num_steps",
+    )
+    list_fields = (
+        "visit_time_text",
+        "target_drugs",
+        "diag_code_sets",
+        "proc_code_sets",
+        "lab_feature_sets",
+        "vital_feature_sets",
+    )
+    merged: dict[str, Any] = {
+        field: torch.cat([payload[field] for payload in payloads], dim=0)
+        for field in tensor_fields
+    }
+    for field in list_fields:
+        values: list[Any] = []
+        for payload in payloads:
+            values.extend(list(payload[field]))
+        merged[field] = values
+    merged["split"] = split
+    return MemoryBank.from_payload(merged)
+
+
 def main() -> None:
     args = parse_args()
     raw_train_config = load_yaml_config(args.config)
@@ -1089,6 +1181,8 @@ def main() -> None:
     max_open_shards = int(spark_cfg.get("max_open_shards_per_dataset", 2))
     max_visits = feature_cfg.get("max_visits")
     max_history = feature_cfg.get("max_history")
+    core_cfg = dict(train_config.get("core", {}))
+    retrieval_enabled = bool(core_cfg.get("use_retrieval", False))
     if matmul_precision and hasattr(torch, "set_float32_matmul_precision"):
         torch.set_float32_matmul_precision(str(matmul_precision))
     set_seed(seed)
@@ -1148,6 +1242,7 @@ def main() -> None:
             max_open_shards=max_open_shards,
             max_visits=max_visits,
             max_history=max_history,
+            include_records=retrieval_enabled,
         )
         loss_cfg = dict(train_config.get("loss", {}))
         pos_weight, pos_weight_stats = build_positive_class_weight(
@@ -1169,6 +1264,22 @@ def main() -> None:
             model=model,
             train_config=train_config,
         )
+        retrieval_memory_bank = None
+        if retrieval_enabled:
+            retrieval_memory_bank = build_core_memory_bank(
+                model=model,
+                dataloader=train_loader,
+                device=device,
+                split="train",
+            )
+            print(
+                "Core retrieval memory bank: "
+                f"split={retrieval_memory_bank.split} "
+                f"states={len(retrieval_memory_bank)} "
+                f"top_k={model.retrieval_top_k} "
+                f"cross_split_policy={model.cross_split_policy or ('allow_all' if model.allow_cross_split else 'same_split')} "
+                f"leakage_safe={model.retrieval_leakage_safe}"
+            )
         dataset_layouts = {
             "train": getattr(train_loader.dataset, "layout_kind", "unknown"),
             "val": getattr(val_loader.dataset, "layout_kind", "unknown"),
@@ -1266,6 +1377,8 @@ def main() -> None:
         profile_steps=runtime_cfg.get("profile_steps"),
         early_stopping_patience=train_config.get("optimization", {}).get("early_stopping_patience"),
         detailed_timing=bool(runtime_cfg.get("detailed_timing", False)),
+        retrieval_memory_bank=retrieval_memory_bank,
+        retrieval_enabled=retrieval_enabled,
         run_context={
             **runtime_truth,
             **initialization_context,

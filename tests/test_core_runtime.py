@@ -29,6 +29,7 @@ from src.training.train_core import (
     apply_profile_overrides,
     build_positive_class_weight,
     build_core_model,
+    build_core_memory_bank,
     build_dataloaders,
     build_dataset,
     build_optimizer,
@@ -658,6 +659,80 @@ def test_build_core_model_disables_inactive_ddi(tmp_path: Path) -> None:
     assert model.encoder.gru.num_layers == 2
     assert model.medication_decoder.decoder_mode == "independent"
     assert model.medication_decoder.label_correlation_enabled is False
+
+
+def test_build_core_model_opt_in_retrieval_runtime_forward(tmp_path: Path) -> None:
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("pyarrow")
+
+    project_root, configs = _prepare_runtime_project(tmp_path)
+    train_config = load_yaml_config(configs["train"])
+    data_config = load_yaml_config(configs["data"])
+    model_config = load_yaml_config(configs["model"])
+    train_config["core"]["use_retrieval"] = True
+    model_config["retrieval"]["cross_split_policy"] = "train_bank_only"
+    model_config["retrieval"]["use_faiss_if_available"] = False
+    train_config["_resolved_paths"] = {"processed_root": str((project_root / "data" / "processed").resolve())}
+
+    with tempfile.TemporaryDirectory(prefix="core_retrieval_runtime_") as temp_dir_name:
+        runtime_data_config_path = build_runtime_data_config_file(
+            data_config=data_config,
+            processed_root=(project_root / "data" / "processed").resolve(),
+            vocab_root=(project_root / "data" / "interim" / "vocab").resolve(),
+            temp_dir=Path(temp_dir_name),
+        )
+        train_loader, _ = build_dataloaders(
+            runtime_data_config_path=runtime_data_config_path,
+            processed_root=(project_root / "data" / "processed").resolve(),
+            drug_vocab_size=4,
+            batch_size=1,
+            num_workers=0,
+            pin_memory=False,
+            include_records=True,
+        )
+        model, loss_fn = build_core_model(
+            train_config=train_config,
+            model_config=model_config,
+            runtime_data_config_path=runtime_data_config_path,
+            vocab_root=(project_root / "data" / "interim" / "vocab").resolve(),
+            ddi_matrix_path=(project_root / "data" / "processed" / "ddi" / "drug_ddi.pt").resolve(),
+        )
+        bank = build_core_memory_bank(
+            model=model,
+            dataloader=train_loader,
+            device=torch.device("cpu"),
+            split="train",
+        )
+        batch = next(iter(train_loader))
+        outputs = model(
+            batch,
+            mode="core",
+            decoder_top_k=0,
+            compute_ddi_metrics=False,
+            memory_bank=bank,
+            records=batch["records"],
+        )
+        trainer = TqdmCoreTrainer(
+            model=model,
+            loss_fn=loss_fn,
+            optimizer=torch.optim.Adam(model.parameters(), lr=1.0e-3),
+            device=torch.device("cpu"),
+            checkpoint_dir=project_root / "outputs" / "retrieval_test" / "checkpoints",
+            log_dir=project_root / "outputs" / "retrieval_test" / "logs",
+            retrieval_memory_bank=bank,
+            retrieval_enabled=True,
+            decoder_top_k=0,
+        )
+        metrics = trainer.validate_one_epoch(train_loader)
+
+    assert model.runtime_truth["retrieval_active"] is True
+    assert outputs["retrieval_active"] is True
+    assert outputs["runtime_truth"]["pipeline_level"] == "core+history+retrieval"
+    assert outputs["runtime_truth"]["retrieval_leakage_safe"] is True
+    assert outputs["evidence_metadata"]["neighbor_available_mask"].shape == (1,)
+    assert metrics["val_retrieval_active"] == pytest.approx(1.0)
+    assert "val_retrieval_valid_neighbor_rate" in metrics
+    assert "val_neighbor_evidence_norm" in metrics
 
 
 def test_build_core_model_reads_label_correlation_decoder_mode(tmp_path: Path) -> None:

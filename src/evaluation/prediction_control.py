@@ -132,6 +132,7 @@ def collect_model_predictions(
     device: torch.device,
     decoder_top_k: int | None,
     include_num_steps: bool = False,
+    memory_bank: Any | None = None,
 ) -> dict[str, Any]:
     collected_probs: list[torch.Tensor] = []
     collected_targets: list[torch.Tensor] = []
@@ -149,6 +150,8 @@ def collect_model_predictions(
                 batch_on_device,
                 mode="core",
                 decoder_top_k=decoder_top_k,
+                memory_bank=memory_bank,
+                records=batch_on_device.get("records") if memory_bank is not None else None,
             )
             drug_probs = outputs.get("drug_probs")
             final_target_drugs = outputs.get("final_target_drugs")

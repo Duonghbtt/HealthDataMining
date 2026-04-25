@@ -104,6 +104,8 @@ class RetrievalEvidenceFusionModel(nn.Module):
         allow_cross_split: bool = False,
         retrieval_scoring_mode: str = "temporal_relevance",
         cross_split_policy: str | None = None,
+        core_retrieval_enabled: bool = False,
+        retrieval_leakage_safe: bool = True,
     ) -> None:
         super().__init__()
         if int(retrieval_top_k) <= 0:
@@ -126,6 +128,8 @@ class RetrievalEvidenceFusionModel(nn.Module):
         self.allow_cross_split = bool(allow_cross_split)
         self.retrieval_scoring_mode = str(retrieval_scoring_mode)
         self.cross_split_policy = None if cross_split_policy is None else str(cross_split_policy)
+        self.core_retrieval_enabled = bool(core_retrieval_enabled)
+        self.retrieval_leakage_safe = bool(retrieval_leakage_safe)
 
     def _base_safety_metadata(self, *, mode: str, retrieval_used: bool) -> dict[str, Any]:
         ddi_truth = ddi_truth_fields(self.ddi_context)
@@ -155,6 +159,16 @@ class RetrievalEvidenceFusionModel(nn.Module):
             runtime_truth = build_core_runtime_truth(
                 fusion_strategy=fusion_strategy,
                 ddi_context=self.ddi_context,
+                retrieval_active=retrieval_used,
+                retrieval_status="active" if retrieval_used else "disabled",
+                retrieval_top_k=self.retrieval_top_k if self.core_retrieval_enabled else None,
+                retrieval_scoring_mode=self.retrieval_scoring_mode if self.core_retrieval_enabled else None,
+                retrieval_cross_split_policy=(
+                    self.cross_split_policy or ("allow_all" if self.allow_cross_split else "same_split")
+                )
+                if self.core_retrieval_enabled
+                else None,
+                retrieval_leakage_safe=self.retrieval_leakage_safe if self.core_retrieval_enabled else None,
             )
         else:
             runtime_truth = build_extension_runtime_truth(
@@ -187,8 +201,10 @@ class RetrievalEvidenceFusionModel(nn.Module):
     ) -> tuple[Mapping[str, Any] | None, str, dict[str, float]]:
         if retrieval_payload is not None:
             return retrieval_payload, "provided", {"retrieval_time": 0.0}
-        if mode != "extended":
+        if mode == "core" and not self.core_retrieval_enabled:
             return None, "disabled_in_core", {"retrieval_time": 0.0}
+        if mode not in {"core", "extended"}:
+            return None, "disabled_unknown_mode", {"retrieval_time": 0.0}
         if memory_bank is None:
             return None, "disabled_no_memory_bank", {"retrieval_time": 0.0}
 
@@ -417,7 +433,10 @@ class RetrievalEvidenceFusionModel(nn.Module):
             "group_metadata": group_outputs.get("group_metadata", []),
             "retrieval_payload": resolved_retrieval_payload,
             "retrieval_used": retrieval_used,
+            "retrieval_active": retrieval_used,
             "retrieval_available": retrieval_available,
+            "retrieval_status": "active" if retrieval_used else retrieval_mode,
+            "retrieval_leakage_safe": self.retrieval_leakage_safe if self.core_retrieval_enabled else False,
             "retrieval_mode": retrieval_mode,
             "retrieval_scoring_mode": self.retrieval_scoring_mode,
             "runtime_timing": runtime_timing,
