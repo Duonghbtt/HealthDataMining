@@ -41,6 +41,7 @@ fusion:
 decoder:
   # Optional research path for PRAUC-oriented structured label modeling.
   # Disabled by default so existing benchmark configs remain comparable.
+  mode: independent
   label_correlation:
     enabled: false
     correlation_dim: 64

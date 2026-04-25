@@ -656,6 +656,50 @@ def test_build_core_model_disables_inactive_ddi(tmp_path: Path) -> None:
     assert loss_fn.configured_lambda_ddi == pytest.approx(0.05)
     assert loss_fn.effective_lambda_ddi == pytest.approx(0.0)
     assert model.encoder.gru.num_layers == 2
+    assert model.medication_decoder.decoder_mode == "independent"
+    assert model.medication_decoder.label_correlation_enabled is False
+
+
+def test_build_core_model_reads_label_correlation_decoder_mode(tmp_path: Path) -> None:
+    pytest.importorskip("torch")
+    pytest.importorskip("pyarrow")
+
+    project_root, configs = _prepare_runtime_project(tmp_path)
+    train_config = load_yaml_config(configs["train"])
+    data_config = load_yaml_config(configs["data"])
+    model_config = load_yaml_config(configs["model"])
+    model_config["decoder"] = {
+        "mode": "label_correlation_residual",
+        "label_correlation": {
+            "enabled": True,
+            "correlation_dim": 4,
+            "patient_residual_weight": 0.2,
+            "coprescription_residual_weight": 0.1,
+            "dropout": 0.0,
+        },
+    }
+    train_config["_resolved_paths"] = {"processed_root": str((project_root / "data" / "processed").resolve())}
+
+    with tempfile.TemporaryDirectory(prefix="core_runtime_labelcorr_") as temp_dir_name:
+        runtime_data_config_path = build_runtime_data_config_file(
+            data_config=data_config,
+            processed_root=(project_root / "data" / "processed").resolve(),
+            vocab_root=(project_root / "data" / "interim" / "vocab").resolve(),
+            temp_dir=Path(temp_dir_name),
+        )
+        model, _ = build_core_model(
+            train_config=train_config,
+            model_config=model_config,
+            runtime_data_config_path=runtime_data_config_path,
+            vocab_root=(project_root / "data" / "interim" / "vocab").resolve(),
+            ddi_matrix_path=(project_root / "data" / "processed" / "ddi" / "drug_ddi.pt").resolve(),
+        )
+
+    assert model.medication_decoder.decoder_mode == "label_correlation_residual"
+    assert model.medication_decoder.label_correlation_enabled is True
+    assert model.medication_decoder.correlation_dim == 4
+    assert model.medication_decoder.patient_residual_weight == pytest.approx(0.2)
+    assert model.medication_decoder.coprescription_residual_weight == pytest.approx(0.1)
 
 
 def test_build_ddi_matrix_writes_inactive_artifact_for_empty_source(tmp_path: Path) -> None:

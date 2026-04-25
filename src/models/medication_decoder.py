@@ -28,6 +28,26 @@ def _validate_non_negative_float(name: str, value: float) -> float:
     return resolved
 
 
+def _resolve_decoder_mode(
+    decoder_mode: str | None,
+    *,
+    label_correlation_enabled: bool,
+) -> str:
+    if decoder_mode is None:
+        return "label_correlation_residual" if label_correlation_enabled else "independent"
+    resolved = str(decoder_mode).strip().lower()
+    if resolved in {"", "none"}:
+        resolved = "independent"
+    if resolved not in {"independent", "label_correlation_residual"}:
+        raise ValueError(
+            "decoder_mode must be one of ['independent', 'label_correlation_residual'], "
+            f"got {decoder_mode!r}"
+        )
+    if label_correlation_enabled and resolved == "independent":
+        return "label_correlation_residual"
+    return resolved
+
+
 class MedicationDecoder(nn.Module):
     """Decode fused patient representations into medication recommendation scores.
 
@@ -69,6 +89,7 @@ class MedicationDecoder(nn.Module):
         *,
         dropout: float = 0.1,
         top_k_metadata: int | None = 10,
+        decoder_mode: str | None = None,
         label_correlation_enabled: bool = False,
         correlation_dim: int | None = None,
         patient_residual_weight: float = 0.0,
@@ -83,7 +104,11 @@ class MedicationDecoder(nn.Module):
         if not 0.0 <= float(dropout) <= 1.0:
             raise ValueError(f"dropout must be in [0, 1], got {dropout!r}")
         self.dropout = float(dropout)
-        self.label_correlation_enabled = bool(label_correlation_enabled)
+        self.decoder_mode = _resolve_decoder_mode(
+            decoder_mode,
+            label_correlation_enabled=bool(label_correlation_enabled),
+        )
+        self.label_correlation_enabled = self.decoder_mode == "label_correlation_residual"
         self.patient_residual_weight = _validate_non_negative_float(
             "patient_residual_weight",
             patient_residual_weight,
@@ -147,6 +172,9 @@ class MedicationDecoder(nn.Module):
                 "patient_correlation_logits": zero_logits,
                 "coprescription_correlation_logits": zero_logits,
                 "label_correlation_logits": zero_logits,
+                "correlation_residual_norm": zero_logits.new_zeros(()),
+                "logit_shift_mean_abs": zero_logits.new_zeros(()),
+                "logit_shift_max_abs": zero_logits.new_zeros(()),
             }
 
         drug_embeddings = F.normalize(
@@ -174,6 +202,9 @@ class MedicationDecoder(nn.Module):
             "patient_correlation_logits": patient_logits,
             "coprescription_correlation_logits": coprescription_logits,
             "label_correlation_logits": label_correlation_logits,
+            "correlation_residual_norm": label_correlation_logits.norm(p=2, dim=-1).mean(),
+            "logit_shift_mean_abs": label_correlation_logits.abs().mean(),
+            "logit_shift_max_abs": label_correlation_logits.abs().max(),
         }
 
     def forward(
@@ -225,10 +256,14 @@ class MedicationDecoder(nn.Module):
             "batch_size": int(fused_repr.shape[0]),
             "hidden_dim": self.hidden_dim,
             "drug_vocab_size": self.drug_vocab_size,
+            "decoder_mode": self.decoder_mode,
             "label_correlation_enabled": self.label_correlation_enabled,
             "correlation_dim": self.correlation_dim,
             "patient_residual_weight": self.patient_residual_weight,
             "coprescription_residual_weight": self.coprescription_residual_weight,
+            "correlation_residual_norm": correlation_outputs["correlation_residual_norm"],
+            "logit_shift_mean_abs": correlation_outputs["logit_shift_mean_abs"],
+            "logit_shift_max_abs": correlation_outputs["logit_shift_max_abs"],
         }
 
         if resolved_top_k is not None and resolved_top_k > 0:

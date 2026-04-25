@@ -762,6 +762,7 @@ def build_core_model(
         drug_vocab_size=vocab_sizes["drug"],
         dropout=model_dropout,
         top_k_metadata=int(train_config.get("prediction", {}).get("top_k", 10)),
+        decoder_mode=decoder_cfg.get("mode"),
         label_correlation_enabled=bool(label_correlation_cfg.get("enabled", False)),
         correlation_dim=label_correlation_cfg.get("correlation_dim"),
         patient_residual_weight=float(label_correlation_cfg.get("patient_residual_weight", 0.0)),

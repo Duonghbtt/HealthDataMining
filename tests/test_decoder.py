@@ -35,6 +35,16 @@ def test_medication_decoder_forward_shapes_and_metadata(fused_repr: torch.Tensor
     assert outputs["recommendation_metadata"]["batch_size"] == 2
     assert outputs["recommendation_metadata"]["hidden_dim"] == 8
     assert outputs["recommendation_metadata"]["drug_vocab_size"] == 6
+    assert outputs["recommendation_metadata"]["decoder_mode"] == "independent"
+    assert outputs["recommendation_metadata"]["label_correlation_enabled"] is False
+    assert torch.allclose(outputs["drug_logits"], outputs["base_drug_logits"])
+    assert torch.allclose(
+        outputs["label_correlation_logits"],
+        torch.zeros_like(outputs["label_correlation_logits"]),
+    )
+    assert float(outputs["recommendation_metadata"]["correlation_residual_norm"].item()) == 0.0
+    assert float(outputs["recommendation_metadata"]["logit_shift_mean_abs"].item()) == 0.0
+    assert float(outputs["recommendation_metadata"]["logit_shift_max_abs"].item()) == 0.0
     assert outputs["recommendation_metadata"]["topk_indices"].shape == (2, 2)
     assert outputs["recommendation_metadata"]["topk_scores"].shape == (2, 2)
     assert torch.isfinite(outputs["drug_logits"]).all()
@@ -43,7 +53,7 @@ def test_medication_decoder_forward_shapes_and_metadata(fused_repr: torch.Tensor
     assert torch.all(outputs["drug_probs"] <= 1.0)
 
 
-def test_medication_decoder_label_correlation_residual_is_opt_in(
+def test_medication_decoder_label_correlation_residual_mode_is_opt_in(
     fused_repr: torch.Tensor,
 ) -> None:
     decoder = MedicationDecoder(
@@ -51,7 +61,7 @@ def test_medication_decoder_label_correlation_residual_is_opt_in(
         drug_vocab_size=6,
         dropout=0.0,
         top_k_metadata=0,
-        label_correlation_enabled=True,
+        decoder_mode="label_correlation_residual",
         correlation_dim=4,
         patient_residual_weight=0.2,
         coprescription_residual_weight=0.1,
@@ -65,10 +75,73 @@ def test_medication_decoder_label_correlation_residual_is_opt_in(
     assert outputs["patient_correlation_logits"].shape == (2, 6)
     assert outputs["coprescription_correlation_logits"].shape == (2, 6)
     assert outputs["label_correlation_logits"].shape == (2, 6)
+    assert outputs["recommendation_metadata"]["decoder_mode"] == "label_correlation_residual"
     assert outputs["recommendation_metadata"]["label_correlation_enabled"] is True
     assert outputs["recommendation_metadata"]["correlation_dim"] == 4
+    assert outputs["correlation_residual_norm"].ndim == 0
+    assert outputs["logit_shift_mean_abs"].ndim == 0
+    assert outputs["logit_shift_max_abs"].ndim == 0
     assert torch.isfinite(outputs["drug_logits"]).all()
     assert not torch.allclose(outputs["drug_logits"], outputs["base_drug_logits"])
+    assert float(outputs["correlation_residual_norm"].item()) > 0.0
+    assert float(outputs["logit_shift_mean_abs"].item()) > 0.0
+    assert float(outputs["logit_shift_max_abs"].item()) > 0.0
+
+
+def test_medication_decoder_legacy_label_correlation_flag_enables_residual_mode(
+    fused_repr: torch.Tensor,
+) -> None:
+    decoder = MedicationDecoder(
+        hidden_dim=8,
+        drug_vocab_size=6,
+        dropout=0.0,
+        top_k_metadata=0,
+        decoder_mode="independent",
+        label_correlation_enabled=True,
+        correlation_dim=4,
+        patient_residual_weight=0.2,
+        coprescription_residual_weight=0.1,
+        correlation_dropout=0.0,
+    )
+
+    outputs = decoder(fused_repr)
+
+    assert outputs["recommendation_metadata"]["decoder_mode"] == "label_correlation_residual"
+    assert outputs["recommendation_metadata"]["label_correlation_enabled"] is True
+    assert not torch.allclose(outputs["drug_logits"], outputs["base_drug_logits"])
+
+
+def test_medication_decoder_label_correlation_residual_backward_pass() -> None:
+    decoder = MedicationDecoder(
+        hidden_dim=8,
+        drug_vocab_size=6,
+        dropout=0.0,
+        top_k_metadata=0,
+        decoder_mode="label_correlation_residual",
+        correlation_dim=4,
+        patient_residual_weight=0.2,
+        coprescription_residual_weight=0.1,
+        correlation_dropout=0.0,
+    )
+    fused_repr = torch.randn(3, 8, dtype=torch.float32, requires_grad=True)
+
+    outputs = decoder(fused_repr)
+    loss = outputs["drug_logits"].sum()
+    loss.backward()
+
+    assert fused_repr.grad is not None
+    assert torch.isfinite(fused_repr.grad).all()
+    assert decoder.decoder[0].weight.grad is not None
+    assert decoder.drug_correlation_embedding is not None
+    assert decoder.drug_correlation_embedding.weight.grad is not None
+    assert decoder.patient_correlation_projection is not None
+    projection = decoder.patient_correlation_projection[0]
+    assert projection.weight.grad is not None
+
+
+def test_medication_decoder_rejects_unknown_mode() -> None:
+    with pytest.raises(ValueError, match="decoder_mode"):
+        MedicationDecoder(hidden_dim=8, drug_vocab_size=6, decoder_mode="attention")
 
 
 def test_medication_recommendation_loss_adds_sampled_pairwise_ranking() -> None:
