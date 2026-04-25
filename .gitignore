@@ -31,7 +31,7 @@ test_artifacts/
 Thumbs.db
 
 .gitattributes
-*.docx.codex
+*.docx
+*.codex
 
 .codex/
-*.docx.codex/
