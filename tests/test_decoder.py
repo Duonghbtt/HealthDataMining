@@ -6,6 +6,7 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from src.models.medication_decoder import MedicationDecoder
+from src.training.losses import MedicationRecommendationLoss
 
 
 @pytest.fixture
@@ -40,3 +41,136 @@ def test_medication_decoder_forward_shapes_and_metadata(fused_repr: torch.Tensor
     assert torch.isfinite(outputs["drug_probs"]).all()
     assert torch.all(outputs["drug_probs"] >= 0.0)
     assert torch.all(outputs["drug_probs"] <= 1.0)
+
+
+def test_medication_decoder_label_correlation_residual_is_opt_in(
+    fused_repr: torch.Tensor,
+) -> None:
+    decoder = MedicationDecoder(
+        hidden_dim=8,
+        drug_vocab_size=6,
+        dropout=0.0,
+        top_k_metadata=0,
+        label_correlation_enabled=True,
+        correlation_dim=4,
+        patient_residual_weight=0.2,
+        coprescription_residual_weight=0.1,
+        correlation_dropout=0.0,
+    )
+
+    outputs = decoder(fused_repr)
+
+    assert outputs["drug_logits"].shape == (2, 6)
+    assert outputs["base_drug_logits"].shape == (2, 6)
+    assert outputs["patient_correlation_logits"].shape == (2, 6)
+    assert outputs["coprescription_correlation_logits"].shape == (2, 6)
+    assert outputs["label_correlation_logits"].shape == (2, 6)
+    assert outputs["recommendation_metadata"]["label_correlation_enabled"] is True
+    assert outputs["recommendation_metadata"]["correlation_dim"] == 4
+    assert torch.isfinite(outputs["drug_logits"]).all()
+    assert not torch.allclose(outputs["drug_logits"], outputs["base_drug_logits"])
+
+
+def test_medication_recommendation_loss_adds_sampled_pairwise_ranking() -> None:
+    logits = torch.tensor(
+        [
+            [-1.0, 1.0, 0.5],
+            [2.0, -0.5, 0.0],
+        ],
+        dtype=torch.float32,
+    )
+    targets = torch.tensor(
+        [
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ],
+        dtype=torch.float32,
+    )
+    base_loss = MedicationRecommendationLoss(lambda_ddi=0.0, ranking_lambda=0.0)
+    ranking_loss = MedicationRecommendationLoss(
+        lambda_ddi=0.0,
+        ranking_lambda=0.5,
+        ranking_objective="margin",
+        ranking_margin=1.0,
+        ranking_num_negatives=2,
+        ranking_hard_negative_fraction=1.0,
+    )
+
+    base_outputs = base_loss(drug_logits=logits, target_drugs=targets)
+    ranking_outputs = ranking_loss(drug_logits=logits, target_drugs=targets)
+
+    assert float(ranking_outputs["ranking_loss"].item()) > 0.0
+    assert float(ranking_outputs["weighted_ranking_loss"].item()) == pytest.approx(
+        float(ranking_outputs["ranking_loss"].item()) * 0.5
+    )
+    assert float(ranking_outputs["total_loss"].item()) == pytest.approx(
+        float(base_outputs["total_loss"].item())
+        + float(ranking_outputs["weighted_ranking_loss"].item())
+    )
+
+
+def test_medication_recommendation_loss_supports_asymmetric_focal_objective() -> None:
+    logits = torch.tensor([[-6.0, 3.0]], dtype=torch.float32)
+    targets = torch.tensor([[0.0, 0.0]], dtype=torch.float32)
+    bce_loss = MedicationRecommendationLoss(lambda_ddi=0.0, objective="bce")
+    asymmetric_loss = MedicationRecommendationLoss(
+        lambda_ddi=0.0,
+        objective="asymmetric_focal",
+        asymmetric_gamma_pos=0.0,
+        asymmetric_gamma_neg=4.0,
+        asymmetric_clip=0.05,
+    )
+
+    bce_outputs = bce_loss(drug_logits=logits, target_drugs=targets)
+    asymmetric_outputs = asymmetric_loss(drug_logits=logits, target_drugs=targets)
+
+    assert asymmetric_outputs["objective"] == "asymmetric_focal"
+    assert torch.isfinite(asymmetric_outputs["prediction_loss"])
+    assert float(asymmetric_outputs["prediction_loss"].item()) < float(
+        bce_outputs["prediction_loss"].item()
+    )
+    assert float(asymmetric_outputs["asymmetric_gamma_neg"].item()) == pytest.approx(4.0)
+    assert float(asymmetric_outputs["asymmetric_clip"].item()) == pytest.approx(0.05)
+
+
+def test_asymmetric_focal_keeps_positive_class_weighting() -> None:
+    logits = torch.zeros((1, 2), dtype=torch.float32)
+    targets = torch.tensor([[1.0, 0.0]], dtype=torch.float32)
+    unweighted_loss = MedicationRecommendationLoss(
+        lambda_ddi=0.0,
+        objective="asymmetric_focal",
+        asymmetric_gamma_pos=0.0,
+        asymmetric_gamma_neg=0.0,
+        asymmetric_clip=0.0,
+    )
+    weighted_loss = MedicationRecommendationLoss(
+        lambda_ddi=0.0,
+        objective="asymmetric_focal",
+        asymmetric_gamma_pos=0.0,
+        asymmetric_gamma_neg=0.0,
+        asymmetric_clip=0.0,
+        pos_weight=torch.tensor([3.0, 1.0], dtype=torch.float32),
+    )
+
+    unweighted_outputs = unweighted_loss(drug_logits=logits, target_drugs=targets)
+    weighted_outputs = weighted_loss(drug_logits=logits, target_drugs=targets)
+
+    assert float(weighted_outputs["prediction_loss"].item()) > float(
+        unweighted_outputs["prediction_loss"].item()
+    )
+
+
+def test_asymmetric_focal_rejects_invalid_parameters() -> None:
+    with pytest.raises(ValueError, match="asymmetric_gamma_neg"):
+        MedicationRecommendationLoss(
+            lambda_ddi=0.0,
+            objective="asymmetric_focal",
+            asymmetric_gamma_neg=-1.0,
+        )
+
+    with pytest.raises(ValueError, match="asymmetric_clip"):
+        MedicationRecommendationLoss(
+            lambda_ddi=0.0,
+            objective="asymmetric_focal",
+            asymmetric_clip=1.0,
+        )

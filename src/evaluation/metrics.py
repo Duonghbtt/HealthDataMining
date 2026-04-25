@@ -207,6 +207,22 @@ def compute_core_metrics(
     """Compute the core evaluation metric bundle for medication recommendation."""
 
     y_pred_binary = binarize_predictions(y_score, threshold)
+    return compute_core_metrics_from_binary_predictions(
+        y_true,
+        y_score,
+        y_pred_binary,
+        ddi_matrix=ddi_matrix,
+    )
+
+
+def compute_core_metrics_from_binary_predictions(
+    y_true: torch.Tensor,
+    y_score: torch.Tensor,
+    y_pred_binary: torch.Tensor,
+    ddi_matrix: torch.Tensor,
+) -> dict[str, float]:
+    """Compute the core evaluation metric bundle from explicit binary predictions."""
+
     ddi_summary = compute_ddi_rate(y_pred_binary, ddi_matrix)
     return {
         "jaccard": multilabel_jaccard(y_true, y_pred_binary),
@@ -219,6 +235,7 @@ def compute_core_metrics(
 __all__ = [
     "binarize_predictions",
     "compute_core_metrics",
+    "compute_core_metrics_from_binary_predictions",
     "compute_ddi_flags",
     "compute_ddi_rate",
     "compute_samplewise_f1",
