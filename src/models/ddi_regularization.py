@@ -100,6 +100,32 @@ def _normalize_source_metadata(source: str, payload: Any) -> dict[str, Any]:
     }
 
 
+def _coerce_scalar_metadata(value: Any) -> Any:
+    if isinstance(value, (str, bool, int, float)) or value is None:
+        return value
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, list):
+        return [
+            _coerce_scalar_metadata(item)
+            for item in value
+            if isinstance(item, (str, bool, int, float)) or item is None
+        ]
+    if isinstance(value, tuple):
+        return [
+            _coerce_scalar_metadata(item)
+            for item in value
+            if isinstance(item, (str, bool, int, float)) or item is None
+        ]
+    if isinstance(value, Mapping):
+        return {
+            str(key): _coerce_scalar_metadata(item)
+            for key, item in value.items()
+            if item is None or isinstance(item, (str, bool, int, float, list, tuple, Mapping, Path))
+        }
+    return str(value)
+
+
 def load_ddi_artifact(
     ddi_source: str | Path | Mapping[str, Any] | torch.Tensor,
     *,
@@ -124,8 +150,17 @@ def load_ddi_artifact(
 
     matrix = _normalize_binary_matrix(matrix_payload, device=device, dtype=dtype)
     nonzero_pairs = int(torch.triu(matrix, diagonal=1).sum().item())
-    source = str(metadata.get("source") or (str(source_path.resolve()) if source_path is not None else "in_memory"))
+    source = str(
+        metadata.get("effective_source")
+        or metadata.get("ddi_source")
+        or metadata.get("source")
+        or (str(source_path.resolve()) if source_path is not None else "in_memory")
+    )
     source_metadata = _normalize_source_metadata(source, metadata.get("source_metadata"))
+    if "ddi_type" in metadata:
+        source_metadata["kind"] = str(metadata["ddi_type"])
+    if "ddi_research_grade" in metadata:
+        source_metadata["research_grade"] = _coerce_bool(metadata["ddi_research_grade"], default=False)
     matched_pairs = _optional_int(metadata.get("matched_pairs"))
     if matched_pairs is None:
         matched_pairs = nonzero_pairs
@@ -149,7 +184,7 @@ def load_ddi_artifact(
         active = True
         reason = "available"
 
-    return {
+    artifact = {
         "matrix": matrix,
         "active": active,
         "reason": reason,
@@ -159,6 +194,28 @@ def load_ddi_artifact(
         "vocab_size": int(vocab_size),
         "source_metadata": source_metadata,
     }
+    excluded_keys = {
+        "matrix",
+        "active",
+        "reason",
+        "source",
+        "matched_pairs",
+        "nonzero_pairs",
+        "vocab_size",
+        "source_metadata",
+        "pad_idx",
+        "unk_idx",
+    }
+    for key, value in metadata.items():
+        if key in excluded_keys:
+            continue
+        artifact[str(key)] = _coerce_scalar_metadata(value)
+    artifact.setdefault("effective_source", source)
+    artifact.setdefault("effective_source_format", artifact.get("source_format", ""))
+    artifact.setdefault("ddi_type", str(source_metadata.get("kind") or "unknown"))
+    artifact.setdefault("ddi_source", source)
+    artifact.setdefault("ddi_research_grade", bool(source_metadata.get("research_grade", False)))
+    return artifact
 
 
 def load_ddi_matrix(

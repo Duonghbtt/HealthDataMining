@@ -4,7 +4,25 @@ paths:
   raw_root: data/raw
   interim_root: data/interim
   processed_root: data/processed
-  ddi_source_path: data/raw/ddi/drug_ddi_smoke.csv
+  ddi_source_path: data/raw/ddi/twosides/TWOSIDES.csv
+
+ddi:
+  source_path: data/raw/ddi/twosides/TWOSIDES.csv
+  source_format: twosides_csv
+  fallback_source_path: data/raw/ddi/drug_ddi_smoke.csv
+  fallback_source_format: manual_smoke_csv
+  canonical_pairs_path: data/processed/ddi/drug_ddi_pairs.csv.gz
+  min_support_a: 5
+  min_prr_ci_lower_bound: 1.0
+
+drugbank:
+  source_path: data/raw/drugbank/full database.xml
+  summary_path: data/processed/drugbank/drugbank_summary.json
+  records_path: data/processed/drugbank/drugbank_drugs.jsonl.gz
+  vocab_metadata_path: data/interim/vocab/drugbank_drug_metadata.json
+  ddi_pairs_path: data/processed/ddi/drugbank_ddi_pairs.jsonl.gz
+  ddi_matrix_path: data/processed/ddi/drug_ddi_drugbank.pt
+  ddi_report_path: data/processed/ddi/drug_ddi_drugbank_report.json
 
 processed_format: parquet
 

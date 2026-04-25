@@ -11,10 +11,12 @@ import pytest
 
 from src.data.build_cohort import build_cohort
 from src.data.build_ddi_matrix import build_ddi_matrix
+from src.data.build_drugbank_ddi_matrix import build_drugbank_ddi_matrix
+from src.data.build_drugbank_metadata import build_drugbank_metadata
 from src.data.build_trajectories import build_trajectories
 from src.data.build_vocab import build_vocab
 from src.data.stage_filtered_tables import stage_filtered_tables
-from src.utils.io import read_csv_gz, read_json, write_json, write_jsonl_gz
+from src.utils.io import iter_jsonl_gz, load_pt, read_csv_gz, read_json, write_json, write_jsonl_gz
 
 
 def _stage_filtered_tables_or_skip(config_path: Path) -> Path:
@@ -29,6 +31,16 @@ def _stage_filtered_tables_or_skip(config_path: Path) -> Path:
         ):
             pytest.skip(f"Spark gateway is unavailable in this environment: {message}")
         raise
+
+
+def _skip_if_spark_wrapper_unavailable(result: subprocess.CompletedProcess[str]) -> None:
+    message = f"{result.stderr}\n{result.stdout}"
+    if (
+        "JAVA_GATEWAY_EXITED" in message
+        or "Failed to bind" in message
+        or "Operation not permitted" in message
+    ):
+        pytest.skip(f"Spark gateway is unavailable in this environment: {message}")
 
 
 def _write_csv_gz(path: Path, rows: list[dict[str, object]], fieldnames: list[str]) -> None:
@@ -52,6 +64,22 @@ def _write_config(project_root: Path, *, spark_enabled: bool = True) -> Path:
                 "  interim_root: data/interim",
                 "  processed_root: data/processed",
                 "  ddi_source_path: ''",
+                "ddi:",
+                "  source_path: ''",
+                "  source_format: twosides_csv",
+                "  fallback_source_path: data/raw/ddi/drug_ddi_smoke.csv",
+                "  fallback_source_format: manual_smoke_csv",
+                "  canonical_pairs_path: data/processed/ddi/drug_ddi_pairs.csv.gz",
+                "  min_support_a: 5",
+                "  min_prr_ci_lower_bound: 1.0",
+                "drugbank:",
+                "  source_path: 'data/raw/drugbank/full database.xml'",
+                "  summary_path: data/processed/drugbank/drugbank_summary.json",
+                "  records_path: data/processed/drugbank/drugbank_drugs.jsonl.gz",
+                "  vocab_metadata_path: data/interim/vocab/drugbank_drug_metadata.json",
+                "  ddi_pairs_path: data/processed/ddi/drugbank_ddi_pairs.jsonl.gz",
+                "  ddi_matrix_path: data/processed/ddi/drug_ddi_drugbank.pt",
+                "  ddi_report_path: data/processed/ddi/drug_ddi_drugbank_report.json",
                 "processed_format: parquet",
                 "split:",
                 "  train: 1.0",
@@ -196,6 +224,143 @@ def _write_minimal_vocab_bundle(project_root: Path) -> None:
                 "token_to_idx": {"PAD": 0, "UNK": 1},
             },
         )
+
+
+def _write_drugbank_test_vocab_bundle(project_root: Path) -> None:
+    vocab_dir = project_root / "data" / "interim" / "vocab"
+    vocab_dir.mkdir(parents=True, exist_ok=True)
+    vocab_payloads = {
+        "diagnosis": ["PAD", "UNK"],
+        "procedure": ["PAD", "UNK"],
+        "drug": ["PAD", "UNK", "NAME:ASPIRIN", "NAME:HEPARIN"],
+        "lab": ["PAD", "UNK"],
+        "vital": ["PAD", "UNK"],
+    }
+    for name, tokens in vocab_payloads.items():
+        write_json(
+            vocab_dir / f"{name}_vocab.json",
+            {
+                "name": name,
+                "size": len(tokens),
+                "pad_idx": 0,
+                "unk_idx": 1,
+                "idx_to_token": tokens,
+                "token_to_idx": {token: index for index, token in enumerate(tokens)},
+            },
+        )
+    write_json(vocab_dir / "lab_metadata.json", {})
+    write_json(vocab_dir / "vital_metadata.json", {})
+    write_json(
+        vocab_dir / "vocab_summary.json",
+        {
+            "diagnosis_size": 2,
+            "procedure_size": 2,
+            "drug_size": 4,
+            "lab_size": 2,
+            "vital_size": 2,
+            "built_from_split": "train",
+        },
+    )
+
+
+def _write_drugbank_fixture_xml(project_root: Path) -> Path:
+    drugbank_dir = project_root / "data" / "raw" / "drugbank"
+    drugbank_dir.mkdir(parents=True, exist_ok=True)
+    source_path = drugbank_dir / "full database.xml"
+    source_path.write_text(
+        """<?xml version="1.0" encoding="UTF-8"?>
+<drugbank xmlns="http://www.drugbank.ca">
+  <drug type="small molecule">
+    <drugbank-id primary="true">DB00001</drugbank-id>
+    <name>Aspirin</name>
+    <synonyms>
+      <synonym language="english">Acetylsalicylic acid</synonym>
+    </synonyms>
+    <products>
+      <product>
+        <name>Bayer Aspirin</name>
+      </product>
+    </products>
+    <drug-interactions>
+      <drug-interaction>
+        <drugbank-id>DB00002</drugbank-id>
+        <name>Heparin sodium</name>
+        <description>Interaction with Heparin sodium.</description>
+      </drug-interaction>
+      <drug-interaction>
+        <drugbank-id>DB00003</drugbank-id>
+        <name>Trial Agent</name>
+        <description>Interaction with Trial Agent.</description>
+      </drug-interaction>
+      <drug-interaction>
+        <drugbank-id>DB00004</drugbank-id>
+        <name>Legacy Salicylate</name>
+        <description>Interaction with Legacy Salicylate.</description>
+      </drug-interaction>
+    </drug-interactions>
+  </drug>
+  <drug type="small molecule">
+    <drugbank-id primary="true">DB00002</drugbank-id>
+    <drugbank-id>ALT00002</drugbank-id>
+    <name>Heparin sodium</name>
+    <synonyms>
+      <synonym language="english">Heparin</synonym>
+    </synonyms>
+    <products>
+      <product>
+        <name>Heparin Flush</name>
+      </product>
+    </products>
+    <drug-interactions>
+      <drug-interaction>
+        <drugbank-id>DB00001</drugbank-id>
+        <name>Aspirin</name>
+        <description>Interaction with Aspirin.</description>
+      </drug-interaction>
+    </drug-interactions>
+  </drug>
+  <drug type="small molecule">
+    <drugbank-id primary="true">DB00003</drugbank-id>
+    <name>Trial Agent</name>
+    <synonyms>
+      <synonym language="english">Aspirin</synonym>
+      <synonym language="english">Heparin</synonym>
+    </synonyms>
+    <products/>
+    <drug-interactions/>
+  </drug>
+  <drug type="small molecule">
+    <drugbank-id primary="true">DB00004</drugbank-id>
+    <name>Legacy Salicylate</name>
+    <synonyms>
+      <synonym language="english">Old Salicylate</synonym>
+    </synonyms>
+    <products>
+      <product>
+        <name>Aspirin</name>
+      </product>
+    </products>
+    <drug-interactions/>
+  </drug>
+</drugbank>
+""",
+        encoding="utf-8",
+    )
+    return source_path
+
+
+def _assert_optional_drugbank_outputs(project_root: Path) -> None:
+    summary = read_json(project_root / "data" / "processed" / "drugbank" / "drugbank_summary.json")
+    report = read_json(project_root / "data" / "processed" / "ddi" / "drug_ddi_drugbank_report.json")
+    ddi_payload = load_pt(project_root / "data" / "processed" / "ddi" / "drug_ddi.pt")
+    drugbank_ddi_payload = load_pt(project_root / "data" / "processed" / "ddi" / "drug_ddi_drugbank.pt")
+
+    assert summary["active"] is False
+    assert summary["reason"] == "missing_source_path"
+    assert report["active"] is False
+    assert report["reason"] == "missing_source_path"
+    assert ddi_payload["matrix"] is not None
+    assert drugbank_ddi_payload["matrix"] is not None
 
 
 def test_build_vocab_requires_stage_cache_when_spark_enabled(tmp_path: Path) -> None:
@@ -433,6 +598,139 @@ def test_dataset_raises_clear_error_when_outputs_missing(tmp_path: Path) -> None
         MIMICTrajectoryDataset("train", config_path)
 
 
+def test_build_drugbank_metadata_parses_fixture_and_writes_vocab_metadata(tmp_path: Path) -> None:
+    project_root = tmp_path / "drugbank_metadata_project"
+    config_path = _write_config(project_root, spark_enabled=False)
+    _write_drugbank_test_vocab_bundle(project_root)
+    _write_drugbank_fixture_xml(project_root)
+
+    records_path = build_drugbank_metadata(config_path)
+
+    records = list(iter_jsonl_gz(records_path))
+    summary = read_json(project_root / "data" / "processed" / "drugbank" / "drugbank_summary.json")
+    vocab_metadata = read_json(project_root / "data" / "interim" / "vocab" / "drugbank_drug_metadata.json")
+
+    assert len(records) == 4
+    assert records[0]["primary_drugbank_id"] == "DB00001"
+    assert records[1]["name"] == "Heparin sodium"
+    assert summary["active"] is True
+    assert summary["source_format"] == "drugbank_xml"
+    assert summary["drugbank_drugs_parsed"] == 4
+    assert summary["raw_interaction_edges"] == 4
+    assert summary["matched_drugbank_records"] == 3
+    assert summary["matched_vocab_drugs"] == 2
+    assert summary["match_source_counts"] == {
+        "primary_name": 1,
+        "product_name": 1,
+        "synonym": 1,
+    }
+    assert summary["collision_counts"]["ambiguous_record_matches"] == 1
+    assert summary["collision_counts"]["vocab_tokens_with_multiple_drugbank_records"] == 1
+    assert summary["auxiliary_only"] is True
+    assert summary["research_grade"] is False
+    assert summary["ambiguous_examples"][0]["primary_drugbank_id"] == "DB00003"
+    assert vocab_metadata["NAME:ASPIRIN"]["collision"] is True
+    assert vocab_metadata["NAME:ASPIRIN"]["matched_drugbank_ids"] == ["DB00001", "DB00004"]
+    assert vocab_metadata["NAME:HEPARIN"]["match_sources"] == ["synonym"]
+
+
+def test_build_drugbank_metadata_writes_inactive_summary_when_source_missing(tmp_path: Path) -> None:
+    project_root = tmp_path / "drugbank_metadata_missing_project"
+    config_path = _write_config(project_root, spark_enabled=False)
+    _write_drugbank_test_vocab_bundle(project_root)
+
+    records_path = build_drugbank_metadata(config_path)
+
+    records = list(iter_jsonl_gz(records_path))
+    summary = read_json(project_root / "data" / "processed" / "drugbank" / "drugbank_summary.json")
+    vocab_metadata = read_json(project_root / "data" / "interim" / "vocab" / "drugbank_drug_metadata.json")
+
+    assert records == []
+    assert summary["active"] is False
+    assert summary["reason"] == "missing_source_path"
+    assert summary["matched_drugbank_records"] == 0
+    assert summary["matched_vocab_drugs"] == 0
+    assert vocab_metadata == {}
+
+
+def test_build_drugbank_ddi_matrix_builds_separate_auxiliary_artifact(tmp_path: Path) -> None:
+    project_root = tmp_path / "drugbank_ddi_project"
+    config_path = _write_config(project_root, spark_enabled=False)
+    _write_drugbank_test_vocab_bundle(project_root)
+    _write_drugbank_fixture_xml(project_root)
+
+    matrix_path = build_drugbank_ddi_matrix(config_path)
+
+    payload = load_pt(matrix_path)
+    report = read_json(project_root / "data" / "processed" / "ddi" / "drug_ddi_drugbank_report.json")
+    pair_rows = list(iter_jsonl_gz(project_root / "data" / "processed" / "ddi" / "drugbank_ddi_pairs.jsonl.gz"))
+
+    assert tuple((len(payload["matrix"]), len(payload["matrix"][0]))) == (4, 4)
+    assert payload["matrix"][2][3] == 1
+    assert payload["matrix"][3][2] == 1
+    assert payload["matrix"][2][2] == 0
+    assert report["active"] is True
+    assert report["source_format"] == "drugbank_xml"
+    assert report["ddi_type"] == "drugbank_knowledge_base_auxiliary"
+    assert report["ddi_research_grade"] is False
+    assert report["drugbank_drugs_parsed"] == 4
+    assert report["mapped_drugbank_records"] == 3
+    assert report["mapped_vocab_drugs"] == 2
+    assert report["raw_interaction_edges"] == 4
+    assert report["mapped_interaction_edges"] == 2
+    assert report["matched_pairs"] == 1
+    assert report["nonzero_pairs"] == 1
+    assert report["mapped_pairs"] == 1
+    assert report["dropped_interaction_edges"] == 2
+    assert report["self_interaction_edges_skipped"] == 1
+    assert len(pair_rows) == 4
+    assert any(bool(row["kept"]) for row in pair_rows)
+
+
+def test_build_drugbank_ddi_matrix_writes_inactive_artifact_when_source_missing(tmp_path: Path) -> None:
+    project_root = tmp_path / "drugbank_ddi_missing_project"
+    config_path = _write_config(project_root, spark_enabled=False)
+    _write_drugbank_test_vocab_bundle(project_root)
+
+    matrix_path = build_drugbank_ddi_matrix(config_path)
+
+    payload = load_pt(matrix_path)
+    report = read_json(project_root / "data" / "processed" / "ddi" / "drug_ddi_drugbank_report.json")
+    pair_rows = list(iter_jsonl_gz(project_root / "data" / "processed" / "ddi" / "drugbank_ddi_pairs.jsonl.gz"))
+
+    assert report["active"] is False
+    assert report["reason"] == "missing_source_path"
+    assert report["matched_pairs"] == 0
+    assert payload["matrix"][2][3] == 0
+    assert pair_rows == []
+
+
+def test_preprocess_shell_script_smoke_with_missing_drugbank(tmp_path: Path) -> None:
+    pytest.importorskip("pyspark")
+    pytest.importorskip("pyarrow")
+
+    project_root = _build_mock_project(tmp_path)
+    config_path = _write_config(project_root, spark_enabled=True)
+    script_path = Path(__file__).resolve().parents[1] / "scripts" / "preprocess.sh"
+    result = subprocess.run(
+        [
+            "bash",
+            str(script_path),
+            "--config",
+            str(config_path),
+            "--python",
+            sys.executable,
+        ],
+        cwd=project_root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    _skip_if_spark_wrapper_unavailable(result)
+    assert result.returncode == 0, result.stderr
+    _assert_optional_drugbank_outputs(project_root)
+
+
 def test_preprocess_script_smoke_if_pwsh_exists(tmp_path: Path) -> None:
     pytest.importorskip("pyspark")
     pytest.importorskip("pyarrow")
@@ -462,4 +760,6 @@ def test_preprocess_script_smoke_if_pwsh_exists(tmp_path: Path) -> None:
         text=True,
         check=False,
     )
+    _skip_if_spark_wrapper_unavailable(result)
     assert result.returncode == 0, result.stderr
+    _assert_optional_drugbank_outputs(project_root)
