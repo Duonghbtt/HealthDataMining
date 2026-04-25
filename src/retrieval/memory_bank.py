@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import torch
+import torch.nn.functional as F
 
 from src.utils.io import ensure_dir, load_pt, parse_datetime, resolve_path, save_pt
 
@@ -64,6 +65,11 @@ class MemoryBank:
     lab_feature_sets: list[tuple[int, ...]]
     vital_feature_sets: list[tuple[int, ...]]
     split: str
+    _rows_by_stay_cache: list[torch.Tensor] | None = field(init=False, default=None, repr=False)
+    _stay_group_ids_cache: torch.Tensor | None = field(init=False, default=None, repr=False)
+    _unique_stay_ids_cache: torch.Tensor | None = field(init=False, default=None, repr=False)
+    _stay_to_position_cache: dict[int, int] | None = field(init=False, default=None, repr=False)
+    _normalized_visit_states_cache: torch.Tensor | None = field(init=False, default=None, repr=False)
 
     def __post_init__(self) -> None:
         self.visit_states = _coerce_2d_float_tensor(self.visit_states)
@@ -108,6 +114,70 @@ class MemoryBank:
     def __len__(self) -> int:
         return int(self.visit_states.shape[0])
 
+    def _build_stay_cache(self) -> None:
+        if self._rows_by_stay_cache is not None:
+            return
+
+        rows_by_stay: dict[int, list[int]] = {}
+        stay_order: list[int] = []
+        for row_index, stay_id in enumerate(self.stay_ids.tolist()):
+            resolved_stay_id = int(stay_id)
+            if resolved_stay_id not in rows_by_stay:
+                rows_by_stay[resolved_stay_id] = []
+                stay_order.append(resolved_stay_id)
+            rows_by_stay[resolved_stay_id].append(int(row_index))
+
+        self._rows_by_stay_cache = [
+            torch.tensor(rows_by_stay[stay_id], dtype=torch.long)
+            for stay_id in stay_order
+        ]
+        self._unique_stay_ids_cache = torch.tensor(stay_order, dtype=torch.long)
+        self._stay_to_position_cache = {
+            int(stay_id): int(position)
+            for position, stay_id in enumerate(stay_order)
+        }
+        self._stay_group_ids_cache = torch.empty(len(self), dtype=torch.long)
+        for stay_position, row_indices in enumerate(self._rows_by_stay_cache):
+            self._stay_group_ids_cache[row_indices] = int(stay_position)
+
+    @property
+    def rows_by_stay(self) -> list[torch.Tensor]:
+        self._build_stay_cache()
+        if self._rows_by_stay_cache is None:
+            raise RuntimeError("rows_by_stay cache was not initialized")
+        return self._rows_by_stay_cache
+
+    @property
+    def stay_group_ids(self) -> torch.Tensor:
+        self._build_stay_cache()
+        if self._stay_group_ids_cache is None:
+            raise RuntimeError("stay_group_ids cache was not initialized")
+        return self._stay_group_ids_cache
+
+    @property
+    def unique_stay_ids(self) -> torch.Tensor:
+        self._build_stay_cache()
+        if self._unique_stay_ids_cache is None:
+            raise RuntimeError("unique_stay_ids cache was not initialized")
+        return self._unique_stay_ids_cache
+
+    def stay_position(self, stay_id: int) -> int | None:
+        self._build_stay_cache()
+        if self._stay_to_position_cache is None:
+            raise RuntimeError("stay_to_position cache was not initialized")
+        return self._stay_to_position_cache.get(int(stay_id))
+
+    @property
+    def normalized_visit_states(self) -> torch.Tensor:
+        if self._normalized_visit_states_cache is None:
+            self._normalized_visit_states_cache = F.normalize(
+                self.visit_states.to(dtype=torch.float32),
+                p=2,
+                dim=-1,
+                eps=1.0e-12,
+            )
+        return self._normalized_visit_states_cache
+
     @classmethod
     def build_from_batch(
         cls,
@@ -126,9 +196,9 @@ class MemoryBank:
         if len(records) != int(state_sequence.shape[0]):
             raise ValueError("Record count must match encoder output batch size")
 
+        state_rows: list[torch.Tensor] = []
+        repr_rows: list[torch.Tensor] = []
         payload: dict[str, list[Any]] = {
-            "visit_states": [],
-            "visit_repr": [],
             "subject_ids": [],
             "hadm_ids": [],
             "stay_ids": [],
@@ -146,8 +216,8 @@ class MemoryBank:
             for step_index, step in enumerate(record["steps"]):
                 if not bool(visit_mask[batch_index, step_index].item()):
                     continue
-                payload["visit_states"].append(state_sequence[batch_index, step_index].tolist())
-                payload["visit_repr"].append(visit_repr[batch_index, step_index].tolist())
+                state_rows.append(state_sequence[batch_index, step_index])
+                repr_rows.append(visit_repr[batch_index, step_index])
                 payload["subject_ids"].append(int(record["subject_id"]))
                 payload["hadm_ids"].append(int(record["hadm_id"]))
                 payload["stay_ids"].append(int(record["stay_id"]))
@@ -164,7 +234,21 @@ class MemoryBank:
                 payload["lab_feature_sets"].append(_feature_set_from_mask(step.get("lab_mask")))
                 payload["vital_feature_sets"].append(_feature_set_from_mask(step.get("vital_mask")))
 
-        return cls(split=split, **payload)
+        hidden_dim = int(state_sequence.shape[-1])
+        return cls(
+            visit_states=(
+                torch.stack(state_rows, dim=0)
+                if state_rows
+                else torch.empty((0, hidden_dim), dtype=torch.float32)
+            ),
+            visit_repr=(
+                torch.stack(repr_rows, dim=0)
+                if repr_rows
+                else torch.empty((0, hidden_dim), dtype=torch.float32)
+            ),
+            split=split,
+            **payload,
+        )
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -242,14 +326,14 @@ def build_last_visit_queries(
     records: Sequence[Mapping[str, Any]],
     encoder_outputs: Mapping[str, torch.Tensor],
     *,
-    split: str,
+    split: str | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     state_sequence = torch.as_tensor(encoder_outputs["state_sequence"], dtype=torch.float32).cpu()
     visit_mask = torch.as_tensor(encoder_outputs["visit_mask"], dtype=torch.bool).cpu()
     if len(records) != int(state_sequence.shape[0]):
         raise ValueError("Record count must match encoder output batch size")
 
-    query_states = []
+    query_states: list[torch.Tensor] = []
     metadata: dict[str, list[Any]] = {
         "stay_ids": [],
         "subject_ids": [],
@@ -271,7 +355,7 @@ def build_last_visit_queries(
         step = record["steps"][visit_index]
         visit_time_text = _visit_timestamp(record, visit_index)
         dt = parse_datetime(visit_time_text)
-        query_states.append(state_sequence[batch_index, visit_index].tolist())
+        query_states.append(state_sequence[batch_index, visit_index])
         metadata["stay_ids"].append(int(record["stay_id"]))
         metadata["subject_ids"].append(int(record["subject_id"]))
         metadata["hadm_ids"].append(int(record["hadm_id"]))
@@ -284,5 +368,13 @@ def build_last_visit_queries(
         metadata["proc_code_sets"].append(tuple(int(code_id) for code_id in step.get("procedure_ids", [])))
         metadata["lab_feature_sets"].append(_feature_set_from_mask(step.get("lab_mask")))
         metadata["vital_feature_sets"].append(_feature_set_from_mask(step.get("vital_mask")))
-        metadata["split"].append(split)
-    return torch.tensor(query_states, dtype=torch.float32), metadata
+        record_split = record.get("split")
+        resolved_split = split if split is not None else record_split
+        metadata["split"].append(None if resolved_split is None else str(resolved_split))
+    hidden_dim = int(state_sequence.shape[-1])
+    query_state_tensor = (
+        torch.stack(query_states, dim=0)
+        if query_states
+        else torch.empty((0, hidden_dim), dtype=torch.float32)
+    )
+    return query_state_tensor, metadata

@@ -369,30 +369,12 @@ def _max_length(records: list[dict[str, Any]], field_name: str) -> int:
     )
 
 
-def build_collate_fn(
-    *,
-    include_full_targets: bool = True,
-    include_final_target: bool = True,
-    max_visits: int | None = None,
-    max_history: int | None = None,
-):
-    return partial(
-        collate_batch,
-        include_full_targets=include_full_targets,
-        include_final_target=include_final_target,
-        max_visits=max_visits,
-        max_history=max_history,
-    )
-
-
-def collate_batch(
+def _prepare_records(
     records: list[dict[str, Any]],
     *,
-    include_full_targets: bool = True,
-    include_final_target: bool = True,
     max_visits: int | None = None,
     max_history: int | None = None,
-) -> dict[str, Any]:
+) -> list[dict[str, Any]]:
     if not records:
         raise ValueError("collate_batch requires at least one record")
     if max_visits is not None and int(max_visits) <= 0:
@@ -407,14 +389,34 @@ def collate_batch(
         steps = list(record.get("steps", []))
         if resolved_max_visits is not None:
             steps = steps[-resolved_max_visits:]
+        prepared_steps: list[dict[str, Any]] = []
+        for step in steps:
+            prepared_step = dict(step)
+            if resolved_max_history is not None:
+                history_ids = list(prepared_step.get("med_history_ids", []))
+                prepared_step["med_history_ids"] = history_ids[-resolved_max_history:]
+            prepared_steps.append(prepared_step)
         prepared_records.append(
             {
                 **dict(record),
-                "steps": steps,
-                "num_steps": len(steps),
+                "steps": prepared_steps,
+                "num_steps": len(prepared_steps),
             }
         )
+    return prepared_records
 
+
+def _collate_prepared_records(
+    prepared_records: list[dict[str, Any]],
+    *,
+    include_full_targets: bool = True,
+    include_final_target: bool = True,
+    max_history: int | None = None,
+) -> dict[str, Any]:
+    if not prepared_records:
+        raise ValueError("collate_batch requires at least one record")
+
+    resolved_max_history = None if max_history is None else int(max_history)
     batch_size = len(prepared_records)
     max_steps = max(int(record["num_steps"]) for record in prepared_records)
     max_diag_codes = _max_length(prepared_records, "diagnosis_ids")
@@ -515,6 +517,68 @@ def collate_batch(
         batch["target_drugs"] = target_drugs
     if include_final_target:
         batch["final_target_drugs"] = final_target_drugs
+    return batch
+
+
+def build_collate_fn(
+    *,
+    include_full_targets: bool = True,
+    include_final_target: bool = True,
+    max_visits: int | None = None,
+    max_history: int | None = None,
+    include_records: bool = False,
+):
+    collate_fn = collate_batch_with_records if bool(include_records) else collate_batch
+    return partial(
+        collate_fn,
+        include_full_targets=include_full_targets,
+        include_final_target=include_final_target,
+        max_visits=max_visits,
+        max_history=max_history,
+    )
+
+
+def collate_batch(
+    records: list[dict[str, Any]],
+    *,
+    include_full_targets: bool = True,
+    include_final_target: bool = True,
+    max_visits: int | None = None,
+    max_history: int | None = None,
+) -> dict[str, Any]:
+    prepared_records = _prepare_records(
+        records,
+        max_visits=max_visits,
+        max_history=max_history,
+    )
+    return _collate_prepared_records(
+        prepared_records,
+        include_full_targets=include_full_targets,
+        include_final_target=include_final_target,
+        max_history=max_history,
+    )
+
+
+def collate_batch_with_records(
+    records: list[dict[str, Any]],
+    *,
+    include_full_targets: bool = True,
+    include_final_target: bool = True,
+    max_visits: int | None = None,
+    max_history: int | None = None,
+) -> dict[str, Any]:
+    prepared_records = _prepare_records(
+        records,
+        max_visits=max_visits,
+        max_history=max_history,
+    )
+    batch = _collate_prepared_records(
+        prepared_records,
+        include_full_targets=include_full_targets,
+        include_final_target=include_final_target,
+        max_history=max_history,
+    )
+    batch["records"] = prepared_records
     return batch
 
 

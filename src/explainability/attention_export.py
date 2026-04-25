@@ -435,10 +435,11 @@ def save_attention_artifacts(
     name: str,
     selection_outputs: Mapping[str, Any],
     fusion_outputs: Mapping[str, Any],
+    output_dir: str | Path | None = None,
 ) -> dict[str, Path]:
-    output_dir = artifact_dir(project_root)
+    resolved_output_dir = artifact_dir(project_root) if output_dir is None else ensure_dir(output_dir)
     json_path = write_json(
-        output_dir / f"{name}_attention.json",
+        resolved_output_dir / f"{name}_attention.json",
         {
             "queries": build_attention_payload(selection_outputs, fusion_outputs)["queries"],
             "selection_summary": build_selection_summary(selection_outputs),
@@ -447,7 +448,7 @@ def save_attention_artifacts(
         },
     )
     csv_path = write_csv_gz(
-        output_dir / f"{name}_attention.csv.gz",
+        resolved_output_dir / f"{name}_attention.csv.gz",
         build_attention_rows(selection_outputs, fusion_outputs),
         fieldnames=[
             "query_index",

@@ -6,8 +6,9 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from src.retrieval.dynamic_graph import build_edge_artifact
-from src.retrieval.memory_bank import MemoryBank
+from src.retrieval.memory_bank import MemoryBank, build_last_visit_queries
 from src.retrieval.topk_retriever import (
+    _retrieve_patient_neighbors_reference,
     retrieve_patient_neighbors,
     retrieve_personal_history,
     validate_retrieval_payload,
@@ -203,6 +204,156 @@ def test_retrieval_rejects_mixed_query_splits() -> None:
             top_k=2,
             temporal_decay_alpha=0.2,
         )
+
+
+def test_retrieval_train_bank_only_allows_cross_split_eval_queries() -> None:
+    bank = _build_memory_bank()
+    payload = retrieve_patient_neighbors(
+        torch.tensor([[0.96, 0.04]], dtype=torch.float32),
+        {
+            "stay_ids": [399],
+            "subject_ids": [199],
+            "hadm_ids": [299],
+            "visit_indices": [0],
+            "visit_time_days": [4.0],
+            "diag_code_sets": [(10, 20, 30)],
+            "proc_code_sets": [(1, 2)],
+            "lab_feature_sets": [(0, 1, 2)],
+            "vital_feature_sets": [(0, 1)],
+            "split": ["val"],
+        },
+        bank,
+        top_k=2,
+        temporal_decay_alpha=0.2,
+        cross_split_policy="train_bank_only",
+    )
+    validate_retrieval_payload(payload)
+    assert payload["query_split"] == "val"
+    assert payload["bank_split"] == "train"
+    assert payload["cross_split_policy"] == "train_bank_only"
+
+
+def test_retrieval_scoring_mode_changes_neighbor_scores() -> None:
+    bank = _build_memory_bank()
+    query = torch.tensor([[0.96, 0.04]], dtype=torch.float32)
+    metadata = {
+        "stay_ids": [399],
+        "subject_ids": [199],
+        "hadm_ids": [299],
+        "visit_indices": [0],
+        "visit_time_days": [4.0],
+        "diag_code_sets": [(10, 20, 30)],
+        "proc_code_sets": [(1, 2)],
+        "lab_feature_sets": [(0, 1, 2)],
+        "vital_feature_sets": [(0, 1)],
+        "split": ["train"],
+    }
+    static_payload = retrieve_patient_neighbors(
+        query,
+        metadata,
+        bank,
+        top_k=2,
+        temporal_decay_alpha=0.5,
+        scoring_mode="static_cosine",
+    )
+    temporal_payload = retrieve_patient_neighbors(
+        query,
+        metadata,
+        bank,
+        top_k=2,
+        temporal_decay_alpha=0.5,
+        scoring_mode="temporal_cosine",
+    )
+    assert static_payload["retrieval_scoring_mode"] == "static_cosine"
+    assert temporal_payload["retrieval_scoring_mode"] == "temporal_cosine"
+    assert temporal_payload["neighbor_scores"][0, 0].item() != pytest.approx(
+        static_payload["neighbor_scores"][0, 0].item()
+    )
+
+
+@pytest.mark.parametrize("scoring_mode", ["static_cosine", "temporal_cosine", "temporal_relevance"])
+def test_optimized_bruteforce_matches_reference(scoring_mode: str) -> None:
+    bank = _build_memory_bank()
+    query = torch.tensor([[0.96, 0.04], [0.95, 0.03]], dtype=torch.float32)
+    metadata = {
+        "stay_ids": [399, 400],
+        "subject_ids": [199, 200],
+        "hadm_ids": [299, 300],
+        "visit_indices": [0, 0],
+        "visit_time_days": [4.0, 4.0],
+        "diag_code_sets": [(10, 20, 30), (10, 20, 30)],
+        "proc_code_sets": [(1, 2), (1, 2)],
+        "lab_feature_sets": [(0, 1, 2), (0, 1, 2)],
+        "vital_feature_sets": [(0, 1), (0, 1)],
+        "split": ["val", "val"],
+    }
+    optimized = retrieve_patient_neighbors(
+        query,
+        metadata,
+        bank,
+        top_k=2,
+        temporal_decay_alpha=0.2,
+        backend="bruteforce",
+        use_faiss_if_available=False,
+        cross_split_policy="train_bank_only",
+        scoring_mode=scoring_mode,
+    )
+    reference = _retrieve_patient_neighbors_reference(
+        query,
+        metadata,
+        bank,
+        top_k=2,
+        temporal_decay_alpha=0.2,
+        backend="bruteforce",
+        use_faiss_if_available=False,
+        cross_split_policy="train_bank_only",
+        scoring_mode=scoring_mode,
+    )
+
+    assert optimized["query_split"] == reference["query_split"]
+    assert optimized["bank_split"] == reference["bank_split"]
+    assert optimized["cross_split_policy"] == reference["cross_split_policy"]
+    for field in (
+        "neighbor_indices",
+        "neighbor_scores",
+        "neighbor_static_scores",
+        "neighbor_time_gaps_days",
+        "neighbor_subject_ids",
+        "neighbor_hadm_ids",
+        "neighbor_stay_ids",
+        "matched_visit_indices",
+        "aux_personal_history_indices",
+        "aux_personal_history_scores",
+    ):
+        assert torch.equal(optimized[field], reference[field]), field
+
+
+def test_build_last_visit_queries_uses_record_split_when_not_overridden() -> None:
+    records = [
+        {
+            "subject_id": 1,
+            "hadm_id": 11,
+            "stay_id": 111,
+            "split": "test",
+            "intime": "2020-01-01 00:00:00",
+            "steps": [
+                {
+                    "delta_hours": 0.0,
+                    "diagnosis_ids": [2],
+                    "procedure_ids": [3],
+                    "lab_mask": [1, 0],
+                    "vital_mask": [1, 1],
+                }
+            ],
+        }
+    ]
+    encoder_outputs = {
+        "state_sequence": torch.tensor([[[1.0, 0.0]]], dtype=torch.float32),
+        "visit_mask": torch.tensor([[True]], dtype=torch.bool),
+    }
+    query_states, metadata = build_last_visit_queries(records, encoder_outputs)
+    assert query_states.shape == (1, 2)
+    assert metadata["split"] == ["test"]
 
 
 def test_faiss_backend_falls_back_when_package_missing(monkeypatch: pytest.MonkeyPatch) -> None:
