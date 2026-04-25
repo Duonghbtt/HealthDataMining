@@ -22,6 +22,7 @@ from src.evaluation.prediction_control import (
     normalize_prediction_config,
     resolve_prediction_control,
 )
+from src.losses.contrastive import compute_contrastive_loss
 from src.models.ddi_regularization import DDIRegularizer, load_ddi_artifact
 from src.training.train_core import (
     TqdmCoreTrainer,
@@ -2967,6 +2968,122 @@ def test_medication_recommendation_loss_supports_focal_and_fusion_regularization
         + float(focal_outputs["weighted_fusion_entropy_loss"].item())
         + float(focal_outputs["weighted_fusion_balance_loss"].item())
     )
+
+
+def test_contrastive_loss_positive_and_zero_anchor_cases() -> None:
+    torch = pytest.importorskip("torch")
+
+    embeddings = torch.tensor(
+        [
+            [1.0, 0.0],
+            [0.8, 0.2],
+            [0.0, 1.0],
+        ],
+        dtype=torch.float32,
+    )
+    positive_subject_ids = torch.tensor([10, 10, 20], dtype=torch.long)
+    unique_subject_ids = torch.tensor([10, 20, 30], dtype=torch.long)
+
+    positive_loss = compute_contrastive_loss(
+        embeddings,
+        positive_subject_ids,
+        temperature=0.07,
+    )
+    zero_loss = compute_contrastive_loss(
+        embeddings,
+        unique_subject_ids,
+        temperature=0.07,
+    )
+
+    assert float(positive_loss.item()) > 0.0
+    assert float(zero_loss.item()) == pytest.approx(0.0)
+
+
+def test_core_trainer_contrastive_enabled_runs_and_backpropagates(tmp_path: Path) -> None:
+    torch = pytest.importorskip("torch")
+
+    class ContrastiveRuntimeModel(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.embeddings = torch.nn.Parameter(
+                torch.tensor(
+                    [
+                        [1.0, 0.0, 0.2],
+                        [0.7, 0.2, 0.1],
+                        [0.0, 1.0, 0.3],
+                    ],
+                    dtype=torch.float32,
+                )
+            )
+            self.decoder = torch.nn.Linear(3, 2)
+
+        def forward(self, batch, *, mode, decoder_top_k, compute_ddi_metrics):
+            _ = mode
+            _ = decoder_top_k
+            _ = compute_ddi_metrics
+            batch_size = int(batch["visit_mask"].shape[0])
+            pooled_state = self.embeddings[:batch_size]
+            logits = self.decoder(pooled_state)
+            return {
+                "pooled_state": pooled_state,
+                "fused_repr": pooled_state,
+                "drug_logits": logits,
+                "drug_probs": torch.sigmoid(logits),
+            }
+
+    dataset = [
+        {
+            "visit_mask": torch.tensor([True], dtype=torch.bool),
+            "lab_values": torch.tensor([[0.1]], dtype=torch.float32),
+            "vital_values": torch.tensor([[0.2]], dtype=torch.float32),
+            "time_delta_hours": torch.tensor([0.0], dtype=torch.float32),
+            "final_target_drugs": torch.tensor([1.0, 0.0], dtype=torch.float32),
+            "subject_ids": 7,
+        },
+        {
+            "visit_mask": torch.tensor([True], dtype=torch.bool),
+            "lab_values": torch.tensor([[0.2]], dtype=torch.float32),
+            "vital_values": torch.tensor([[0.1]], dtype=torch.float32),
+            "time_delta_hours": torch.tensor([1.0], dtype=torch.float32),
+            "final_target_drugs": torch.tensor([1.0, 0.0], dtype=torch.float32),
+            "subject_ids": 7,
+        },
+        {
+            "visit_mask": torch.tensor([True], dtype=torch.bool),
+            "lab_values": torch.tensor([[0.3]], dtype=torch.float32),
+            "vital_values": torch.tensor([[0.4]], dtype=torch.float32),
+            "time_delta_hours": torch.tensor([2.0], dtype=torch.float32),
+            "final_target_drugs": torch.tensor([0.0, 1.0], dtype=torch.float32),
+            "subject_ids": 9,
+        },
+    ]
+    dataloader = torch.utils.data.DataLoader(dataset, batch_size=3, shuffle=False)
+    model = ContrastiveRuntimeModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    initial_embeddings = model.embeddings.detach().clone()
+    trainer = TqdmCoreTrainer(
+        model=model,
+        loss_fn=MedicationRecommendationLoss(lambda_ddi=0.0),
+        optimizer=optimizer,
+        device=torch.device("cpu"),
+        checkpoint_dir=tmp_path / "checkpoints",
+        log_dir=tmp_path / "logs",
+        contrastive_lambda=0.05,
+        contrastive_temperature=0.07,
+    )
+
+    metrics = trainer.train_one_epoch(dataloader)
+
+    assert metrics["train_contrastive_loss"] > 0.0
+    assert metrics["train_weighted_contrastive_loss"] > 0.0
+    assert metrics["train_total_loss"] == pytest.approx(
+        metrics["train_prediction_loss"]
+        + metrics["train_weighted_ddi_loss"]
+        + metrics["train_weighted_contrastive_loss"],
+        rel=1.0e-5,
+    )
+    assert not torch.allclose(model.embeddings.detach(), initial_embeddings)
+    assert torch.isfinite(model.embeddings).all().item()
 
 
 def test_extended_trainer_train_only_policy_uses_train_bank_for_validation(tmp_path: Path) -> None:

@@ -59,6 +59,8 @@ loss:
   ranking_margin: 1.0
   ranking_num_negatives: 32
   ranking_hard_negative_fraction: 0.5
+  contrastive_lambda: 0.0
+  contrastive_temperature: 0.07
   ddi_lambda_candidates: [0.0, 0.05, 0.01]
 
 threshold_tuning:

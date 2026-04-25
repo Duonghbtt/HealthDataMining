@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import itertools
 import random
 import tempfile
 import time
@@ -44,6 +45,7 @@ from src.data.dataset import (
     detect_trajectory_layout,
 )
 from src.evaluation.thresholding import normalize_threshold_tuning_config, sweep_multilabel_thresholds
+from src.losses.contrastive import compute_contrastive_loss, compute_embedding_similarity_stats
 from src.models.ddi_regularization import DDIRegularizer, load_ddi_artifact
 from src.models.full_model import RetrievalEvidenceFusionModel
 from src.models.fusion import FusionModule
@@ -52,9 +54,27 @@ from src.models.medication_decoder import MedicationDecoder
 from src.models.patient_state_encoder import PatientStateEncoder
 from src.retrieval.memory_bank import MemoryBank
 from src.training.losses import MedicationRecommendationLoss, extract_last_valid_targets
-from src.training.trainer import Trainer
+from src.training.trainer import (
+    Trainer,
+    _LOSS_KEYS,
+    _accumulate_fusion_diagnostics,
+    _accumulate_retrieval_diagnostics,
+    _move_batch_to_device,
+    _to_float,
+)
 from src.utils.io import ensure_dir, load_yaml_config, read_json, resolve_path
 from src.utils.runtime_truth import build_core_runtime_truth, normalize_ddi_context
+
+
+_CORE_CONTRASTIVE_METRIC_KEYS = (
+    "contrastive_loss",
+    "weighted_contrastive_loss",
+    "embedding_norm_mean",
+    "embedding_norm_std",
+    "similarity_mean",
+    "similarity_std",
+)
+_CORE_EPOCH_METRIC_KEYS = (*_LOSS_KEYS, *_CORE_CONTRASTIVE_METRIC_KEYS)
 
 
 class TqdmCoreTrainer(Trainer):
@@ -65,11 +85,21 @@ class TqdmCoreTrainer(Trainer):
         *args: Any,
         retrieval_memory_bank: MemoryBank | None = None,
         retrieval_enabled: bool = False,
+        contrastive_lambda: float = 0.0,
+        contrastive_temperature: float = 0.07,
         **kwargs: Any,
     ) -> None:
+        if float(contrastive_lambda) < 0.0:
+            raise ValueError(f"contrastive_lambda must be non-negative, got {contrastive_lambda!r}")
+        if float(contrastive_temperature) <= 0.0:
+            raise ValueError(
+                f"contrastive_temperature must be positive, got {contrastive_temperature!r}"
+            )
         super().__init__(*args, **kwargs)
         self.retrieval_memory_bank = retrieval_memory_bank
         self.retrieval_enabled = bool(retrieval_enabled)
+        self.contrastive_lambda = float(contrastive_lambda)
+        self.contrastive_temperature = float(contrastive_temperature)
 
     def _forward_model(self, batch_on_device: Mapping[str, Any]) -> dict[str, Any]:
         if not self.retrieval_enabled:
@@ -82,6 +112,40 @@ class TqdmCoreTrainer(Trainer):
             memory_bank=self.retrieval_memory_bank if self.retrieval_enabled else None,
             records=batch_on_device.get("records") if self.retrieval_enabled else None,
         )
+
+    def _compute_loss_outputs(
+        self,
+        *,
+        outputs: Mapping[str, Any],
+        batch_on_device: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        loss_outputs = dict(
+            super()._compute_loss_outputs(
+                outputs=outputs,
+                batch_on_device=batch_on_device,
+            )
+        )
+        pooled_state = outputs.get("pooled_state")
+        if not isinstance(pooled_state, torch.Tensor):
+            raise RuntimeError("Model did not return `pooled_state` for contrastive diagnostics.")
+
+        if self.contrastive_lambda > 0.0:
+            if "subject_ids" not in batch_on_device:
+                raise KeyError("Batch is missing `subject_ids` required for contrastive loss.")
+            contrastive_loss = compute_contrastive_loss(
+                pooled_state,
+                batch_on_device["subject_ids"],
+                temperature=self.contrastive_temperature,
+            )
+        else:
+            contrastive_loss = loss_outputs["total_loss"].new_zeros(())
+
+        weighted_contrastive_loss = contrastive_loss * self.contrastive_lambda
+        loss_outputs["total_loss"] = loss_outputs["total_loss"] + weighted_contrastive_loss
+        loss_outputs["contrastive_loss"] = contrastive_loss
+        loss_outputs["weighted_contrastive_loss"] = weighted_contrastive_loss
+        loss_outputs.update(compute_embedding_similarity_stats(pooled_state))
+        return loss_outputs
 
     def _create_progress(
         self,
@@ -137,7 +201,198 @@ class TqdmCoreTrainer(Trainer):
             postfix["ddi_loss"] = f"{running_ddi_loss:.4f}"
         else:
             postfix["ddi"] = "inactive"
+        if self.contrastive_lambda > 0.0 and "contrastive_loss" in totals:
+            postfix["ctr_loss"] = f"{float(totals['contrastive_loss']) / float(total_examples):.4f}"
         progress.set_postfix(**postfix)
+
+    def _run_one_epoch(
+        self,
+        dataloader: DataLoader,
+        *,
+        training: bool,
+    ) -> dict[str, float]:
+        phase = "train" if training else "val"
+        totals = {key: 0.0 for key in _CORE_EPOCH_METRIC_KEYS}
+        timing_totals = {
+            "data_time": 0.0,
+            "transfer_time": 0.0,
+            "forward_time": 0.0,
+            "loss_time": 0.0,
+            "backward_time": 0.0,
+            "optimizer_time": 0.0,
+            "step_time": 0.0,
+        }
+        detailed_timing_totals: dict[str, float] = {}
+        fusion_diagnostic_totals: dict[str, float] = {}
+        total_examples = 0
+        step_count = 0
+        max_steps = self._max_epoch_steps(dataloader)
+        prediction_payload_collector = self._prediction_payload_collector(training=training)
+
+        self.model.train(mode=training)
+        grad_context = torch.enable_grad if training else torch.no_grad
+        progress = self._create_progress(
+            dataloader,
+            phase=phase,
+            training=training,
+            max_steps=max_steps,
+        )
+        iterable_source = dataloader if progress is None else progress
+        iterable = iterable_source if max_steps is None else itertools.islice(iterable_source, max_steps)
+        batches_since_step = 0
+        self.optimizer.zero_grad(set_to_none=True)
+        last_step_end = time.perf_counter()
+
+        try:
+            for step_index, batch in enumerate(iterable, start=1):
+                step_context = f"{phase} step {step_index}"
+                data_time = time.perf_counter() - last_step_end
+
+                transfer_start = time.perf_counter()
+                batch_on_device = _move_batch_to_device(
+                    batch,
+                    self.device,
+                    non_blocking=self.non_blocking_transfer,
+                )
+                self._sync_timing()
+                transfer_time = time.perf_counter() - transfer_start
+
+                batch_size = int(batch_on_device["visit_mask"].shape[0])
+                if batch_size <= 0:
+                    last_step_end = time.perf_counter()
+                    continue
+                self._validate_batch_inputs_finite(
+                    batch_on_device,
+                    context=f"{step_context} before forward",
+                )
+
+                with grad_context():
+                    forward_start = time.perf_counter()
+                    with self._autocast_context():
+                        outputs = self._forward_model(batch_on_device)
+                    self._validate_model_outputs_finite(
+                        outputs,
+                        context=f"{step_context} after forward",
+                    )
+                    self._collect_runtime_timing(detailed_timing_totals, outputs)
+                    _accumulate_fusion_diagnostics(
+                        fusion_diagnostic_totals,
+                        outputs,
+                        batch_size=batch_size,
+                    )
+                    _accumulate_retrieval_diagnostics(
+                        fusion_diagnostic_totals,
+                        outputs,
+                        batch_size=batch_size,
+                    )
+                    if prediction_payload_collector is not None:
+                        self._collect_prediction_payload_batch(
+                            collector=prediction_payload_collector,
+                            outputs=outputs,
+                            batch_on_device=batch_on_device,
+                        )
+                    self._sync_timing()
+                    forward_time = time.perf_counter() - forward_start
+
+                    loss_start = time.perf_counter()
+                    with self._autocast_context():
+                        loss_outputs = self._compute_loss_outputs(
+                            outputs=outputs,
+                            batch_on_device=batch_on_device,
+                        )
+                    self._sync_timing()
+                    loss_time = time.perf_counter() - loss_start
+
+                    backward_time = 0.0
+                    optimizer_time = 0.0
+                    if training:
+                        backward_start = time.perf_counter()
+                        scaled_loss = loss_outputs["total_loss"] / float(self.grad_accum_steps)
+                        if self.grad_scaler_enabled and self.scaler is not None:
+                            self.scaler.scale(scaled_loss).backward()
+                        else:
+                            scaled_loss.backward()
+                        self._sync_timing()
+                        backward_time = time.perf_counter() - backward_start
+                        batches_since_step += 1
+
+                        if batches_since_step >= self.grad_accum_steps:
+                            optimizer_start = time.perf_counter()
+                            self._optimizer_step(
+                                context=f"{step_context} after optimizer step",
+                            )
+                            self._sync_timing()
+                            optimizer_time = time.perf_counter() - optimizer_start
+                            batches_since_step = 0
+
+                step_compute_time = transfer_time + forward_time + loss_time + backward_time + optimizer_time
+                total_examples += batch_size
+                step_count += 1
+                for key in _CORE_EPOCH_METRIC_KEYS:
+                    totals[key] += _to_float(loss_outputs[key]) * batch_size
+                timing_totals["data_time"] += data_time
+                timing_totals["transfer_time"] += transfer_time
+                timing_totals["forward_time"] += forward_time
+                timing_totals["loss_time"] += loss_time
+                timing_totals["backward_time"] += backward_time
+                timing_totals["optimizer_time"] += optimizer_time
+                timing_totals["step_time"] += step_compute_time
+
+                if step_index == 1 or step_index % self.log_interval == 0:
+                    self._update_progress(
+                        progress,
+                        phase=phase,
+                        step_index=step_index,
+                        total_examples=total_examples,
+                        totals=totals,
+                        timing_totals=timing_totals,
+                    )
+                last_step_end = time.perf_counter()
+        finally:
+            self._close_progress(progress)
+            self._finalize_prediction_payload_collector(
+                collector=prediction_payload_collector,
+                dataloader=dataloader,
+                training=training,
+            )
+
+        if training and batches_since_step > 0:
+            optimizer_start = time.perf_counter()
+            self._optimizer_step(context=f"{phase} epoch-end optimizer flush")
+            self._sync_timing()
+            optimizer_flush_time = time.perf_counter() - optimizer_start
+            timing_totals["optimizer_time"] += optimizer_flush_time
+            timing_totals["step_time"] += optimizer_flush_time
+
+        if total_examples <= 0:
+            raise ValueError(f"{phase} dataloader produced zero valid examples")
+
+        epoch_metrics = {
+            f"{phase}_{key}": totals[key] / float(total_examples)
+            for key in _CORE_EPOCH_METRIC_KEYS
+        }
+        epoch_metrics.update(
+            {
+                f"{phase}_{key}": value / float(total_examples)
+                for key, value in fusion_diagnostic_totals.items()
+            }
+        )
+        epoch_metrics.update(
+            self._timing_metric_payload(
+                phase=phase,
+                timing_totals=timing_totals,
+                total_examples=total_examples,
+                step_count=step_count,
+            )
+        )
+        epoch_metrics.update(
+            self._detailed_timing_metric_payload(
+                phase=phase,
+                timing_totals=detailed_timing_totals,
+                step_count=step_count,
+            )
+        )
+        return epoch_metrics
 
     def _threshold_tuning_config(self) -> dict[str, Any]:
         raw_config = self.run_context.get("threshold_tuning")
@@ -1308,6 +1563,8 @@ def main() -> None:
     train_budget_label = resolve_train_budget_label(train_config)
     monitor_metric, monitor_mode = resolve_core_monitor_config(train_config, threshold_tuning_cfg)
     loss_objective_metadata = build_loss_objective_metadata(loss_fn)
+    contrastive_lambda = float(train_config.get("loss", {}).get("contrastive_lambda", 0.0))
+    contrastive_temperature = float(train_config.get("loss", {}).get("contrastive_temperature", 0.07))
     print(
         "Core runtime truth: "
         f"pipeline_level={runtime_truth.get('pipeline_level', 'unknown')} "
@@ -1328,6 +1585,12 @@ def main() -> None:
         f"asymmetric_gamma_pos={loss_objective_metadata['asymmetric_gamma_pos']:.2f} "
         f"asymmetric_gamma_neg={loss_objective_metadata['asymmetric_gamma_neg']:.2f} "
         f"asymmetric_clip={loss_objective_metadata['asymmetric_clip']:.3f}"
+    )
+    print(
+        "Contrastive settings: "
+        f"enabled={contrastive_lambda > 0.0} "
+        f"lambda={contrastive_lambda:.6f} "
+        f"temperature={contrastive_temperature:.4f}"
     )
     print(
         "Threshold tuning settings: "
@@ -1379,6 +1642,8 @@ def main() -> None:
         detailed_timing=bool(runtime_cfg.get("detailed_timing", False)),
         retrieval_memory_bank=retrieval_memory_bank,
         retrieval_enabled=retrieval_enabled,
+        contrastive_lambda=contrastive_lambda,
+        contrastive_temperature=contrastive_temperature,
         run_context={
             **runtime_truth,
             **initialization_context,
@@ -1408,6 +1673,11 @@ def main() -> None:
                 "hard_negative_fraction": float(
                     getattr(loss_fn, "ranking_hard_negative_fraction", 0.0)
                 ),
+            },
+            "contrastive_loss": {
+                "lambda": contrastive_lambda,
+                "temperature": contrastive_temperature,
+                "enabled": contrastive_lambda > 0.0,
             },
             "dataset_layouts": dataset_layouts,
             "runtime": {
@@ -1468,6 +1738,11 @@ def main() -> None:
                 "hard_negative_fraction": float(
                     getattr(loss_fn, "ranking_hard_negative_fraction", 0.0)
                 ),
+            },
+            "contrastive_loss": {
+                "lambda": contrastive_lambda,
+                "temperature": contrastive_temperature,
+                "enabled": contrastive_lambda > 0.0,
             },
             "dataset_layouts": dataset_layouts,
             "trainer_runtime": {
