@@ -84,6 +84,98 @@ def test_fusion_module_with_group_mask_degrades_gracefully() -> None:
     assert torch.isfinite(out["branch_balance_score"]).all()
 
 
+def test_fusion_module_can_drop_current_branch_when_auxiliary_context_exists() -> None:
+    module = FusionModule(hidden_dim=4, dropout=0.0, current_branch_dropout=1.0)
+    module.train()
+    out = module(
+        current_state=torch.tensor([[1.0, 0.0, 0.0, 0.0]], dtype=torch.float32),
+        self_history_context=torch.tensor([[0.0, 1.0, 0.0, 0.0]], dtype=torch.float32),
+        neighbor_history_context=torch.tensor([[0.0, 0.0, 1.0, 0.0]], dtype=torch.float32),
+        branch_masks={
+            "current": torch.tensor([True]),
+            "self": torch.tensor([True]),
+            "neighbor": torch.tensor([True]),
+            "group": torch.tensor([False]),
+        },
+    )
+    assert out["current_branch_dropped"].tolist() == [True]
+    assert out["branch_mask"][0, BRANCH_ORDER.index("current")].item() is False
+    assert out["fusion_weights"][0, BRANCH_ORDER.index("current")].item() == pytest.approx(0.0)
+    assert out["dominant_branch_name"][0] in {"self", "neighbor"}
+
+
+def test_gated_residual_fusion_outputs_finite_residual_diagnostics() -> None:
+    module = FusionModule(hidden_dim=4, dropout=0.0, strategy="gated_residual")
+    out = module(
+        current_state=torch.randn(3, 4),
+        self_history_context=torch.randn(3, 4),
+        neighbor_history_context=torch.randn(3, 4),
+        branch_masks={
+            "current": torch.tensor([True, True, True]),
+            "self": torch.tensor([True, True, False]),
+            "neighbor": torch.tensor([True, False, False]),
+            "group": torch.tensor([False, False, False]),
+        },
+    )
+
+    assert out["fused_repr"].shape == (3, 4)
+    assert out["fusion_weights"].shape == (3, len(BRANCH_ORDER))
+    assert out["current_self_balance_weights"].shape == (3, 2)
+    assert out["residual_update_norm"].shape == (3,)
+    assert torch.isfinite(out["fused_repr"]).all()
+    assert torch.isfinite(out["current_self_balance_weights"]).all()
+    assert torch.isfinite(out["residual_update_norm"]).all()
+
+
+def test_gated_residual_fusion_uses_current_only_balance_without_self_history() -> None:
+    module = FusionModule(hidden_dim=4, dropout=0.0, strategy="gated_residual")
+    out = module(
+        current_state=torch.randn(2, 4),
+        self_history_context=torch.randn(2, 4),
+        branch_masks={
+            "current": torch.tensor([True, True]),
+            "self": torch.tensor([False, False]),
+            "neighbor": torch.tensor([False, False]),
+            "group": torch.tensor([False, False]),
+        },
+    )
+
+    assert torch.allclose(out["current_self_current_weight"], torch.ones(2))
+    assert torch.allclose(out["current_self_history_weight"], torch.zeros(2))
+
+
+def test_gated_residual_fusion_weights_sum_over_available_branches() -> None:
+    module = FusionModule(hidden_dim=4, dropout=0.0, strategy="gated_residual")
+    out = module(
+        current_state=torch.randn(2, 4),
+        self_history_context=torch.randn(2, 4),
+        neighbor_history_context=torch.randn(2, 4),
+        group_context=torch.randn(2, 4),
+        branch_masks={
+            "current": torch.tensor([True, True]),
+            "self": torch.tensor([True, False]),
+            "neighbor": torch.tensor([False, True]),
+            "group": torch.tensor([True, False]),
+        },
+    )
+
+    assert torch.allclose(out["fusion_weights"].sum(dim=-1), torch.ones(2))
+    assert out["fusion_weights"][0, BRANCH_ORDER.index("neighbor")].item() == pytest.approx(0.0)
+    assert out["fusion_weights"][1, BRANCH_ORDER.index("self")].item() == pytest.approx(0.0)
+    assert out["fusion_weights"][1, BRANCH_ORDER.index("group")].item() == pytest.approx(0.0)
+
+
+def test_default_gated_fusion_state_dict_has_no_residual_parameters() -> None:
+    module = FusionModule(hidden_dim=4, dropout=0.0)
+    state_keys = set(module.state_dict())
+
+    assert not any("current_self_balance" in key for key in state_keys)
+    assert not any("residual_update" in key for key in state_keys)
+
+    reloaded = FusionModule(hidden_dim=4, dropout=0.0)
+    reloaded.load_state_dict(module.state_dict(), strict=True)
+
+
 def test_hypergraph_builder_emits_semantic_edges() -> None:
     bank = MemoryBank(
         visit_states=torch.tensor(

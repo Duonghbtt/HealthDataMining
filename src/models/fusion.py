@@ -14,12 +14,24 @@ def _safe_entropy(weights: torch.Tensor) -> torch.Tensor:
 
 
 class FusionModule(nn.Module):
-    def __init__(self, hidden_dim: int, *, dropout: float = 0.1, strategy: str = "gated") -> None:
+    def __init__(
+        self,
+        hidden_dim: int,
+        *,
+        dropout: float = 0.1,
+        strategy: str = "gated",
+        current_branch_dropout: float = 0.0,
+    ) -> None:
         super().__init__()
         self.hidden_dim = hidden_dim
-        if strategy not in {"gated", "mean", "concat"}:
+        if strategy not in {"gated", "mean", "concat", "gated_residual"}:
             raise ValueError(f"Unsupported fusion strategy: {strategy}")
+        if not 0.0 <= float(current_branch_dropout) <= 1.0:
+            raise ValueError(
+                f"current_branch_dropout must be in [0, 1], got {current_branch_dropout!r}"
+            )
         self.strategy = strategy
+        self.current_branch_dropout = float(current_branch_dropout)
         self.branch_projection = nn.ModuleDict(
             {
                 name: nn.Sequential(
@@ -46,6 +58,21 @@ class FusionModule(nn.Module):
                 for name in BRANCH_ORDER
             }
         )
+        self.current_self_balance: nn.Module | None = None
+        self.residual_update: nn.Module | None = None
+        if strategy == "gated_residual":
+            self.current_self_balance = nn.Sequential(
+                nn.Linear(hidden_dim * 2, hidden_dim),
+                nn.Tanh(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, 2),
+            )
+            self.residual_update = nn.Sequential(
+                nn.Linear(hidden_dim * 3, hidden_dim),
+                nn.Tanh(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, hidden_dim),
+            )
 
     def _resolve_branch(
         self,
@@ -109,15 +136,70 @@ class FusionModule(nn.Module):
         projected_tensor = torch.stack(projected, dim=1)
         logits_tensor = torch.stack(logits, dim=1)
         branch_mask_tensor = torch.stack(mask_columns, dim=1).to(device=device, dtype=torch.bool)
+        current_drop_mask = torch.zeros(branch_mask_tensor.shape[0], dtype=torch.bool, device=device)
+        if self.training and self.current_branch_dropout > 0.0:
+            auxiliary_available = branch_mask_tensor[:, 1:].any(dim=1)
+            current_available = branch_mask_tensor[:, 0]
+            eligible = current_available & auxiliary_available
+            if bool(eligible.any().item()):
+                sampled_keep = torch.rand(branch_mask_tensor.shape[0], device=device) >= self.current_branch_dropout
+                current_drop_mask = eligible & ~sampled_keep
+                branch_mask_tensor = branch_mask_tensor.clone()
+                branch_mask_tensor[current_drop_mask, 0] = False
         masked_logits = logits_tensor.masked_fill(~branch_mask_tensor, float("-inf"))
         gate_weights = torch.softmax(masked_logits, dim=1)
         gate_weights = torch.where(branch_mask_tensor, gate_weights, torch.zeros_like(gate_weights))
         gate_normalizer = gate_weights.sum(dim=1, keepdim=True)
         gate_weights = gate_weights / torch.where(gate_normalizer > 0, gate_normalizer, torch.ones_like(gate_normalizer))
 
+        balance_weights = torch.zeros(
+            projected_tensor.shape[0],
+            2,
+            dtype=projected_tensor.dtype,
+            device=device,
+        )
+        residual_update_norm = torch.zeros(
+            projected_tensor.shape[0],
+            dtype=projected_tensor.dtype,
+            device=device,
+        )
         if self.strategy == "gated":
             fusion_weights = gate_weights
             fused_repr = (projected_tensor * fusion_weights.unsqueeze(-1)).sum(dim=1)
+        elif self.strategy == "gated_residual":
+            if self.current_self_balance is None or self.residual_update is None:
+                raise RuntimeError("gated_residual fusion was initialized without residual modules")
+            fusion_weights = gate_weights
+            gated_repr = (projected_tensor * fusion_weights.unsqueeze(-1)).sum(dim=1)
+            current_proj = projected_tensor[:, BRANCH_ORDER.index("current")]
+            self_proj = projected_tensor[:, BRANCH_ORDER.index("self")]
+            current_self_logits = self.current_self_balance(torch.cat([current_proj, self_proj], dim=-1))
+            self_available = branch_mask_tensor[:, BRANCH_ORDER.index("self")]
+            balance_mask = torch.stack(
+                [
+                    torch.ones_like(self_available, dtype=torch.bool),
+                    self_available,
+                ],
+                dim=1,
+            )
+            masked_balance_logits = current_self_logits.masked_fill(~balance_mask, float("-inf"))
+            balance_weights = torch.softmax(masked_balance_logits, dim=1)
+            balance_weights = torch.where(balance_mask, balance_weights, torch.zeros_like(balance_weights))
+            balance_normalizer = balance_weights.sum(dim=1, keepdim=True)
+            balance_weights = balance_weights / torch.where(
+                balance_normalizer > 0,
+                balance_normalizer,
+                torch.ones_like(balance_normalizer),
+            )
+            current_self_mix = (
+                torch.stack([current_proj, self_proj], dim=1)
+                * balance_weights.unsqueeze(-1)
+            ).sum(dim=1)
+            residual_delta = self.residual_update(
+                torch.cat([current_proj, current_self_mix, gated_repr], dim=-1)
+            )
+            residual_update_norm = residual_delta.norm(dim=-1)
+            fused_repr = current_proj + 0.5 * residual_delta
         elif self.strategy == "mean":
             fusion_weights = branch_mask_tensor.to(dtype=projected_tensor.dtype)
             fusion_weights = fusion_weights / fusion_weights.sum(dim=1, keepdim=True).clamp(min=1.0)
@@ -165,6 +247,11 @@ class FusionModule(nn.Module):
             "branch_logits": logits_tensor,
             "gate_weights": gate_weights,
             "branch_mask": branch_mask_tensor,
+            "current_branch_dropped": current_drop_mask,
+            "current_self_balance_weights": balance_weights,
+            "current_self_current_weight": balance_weights[:, 0],
+            "current_self_history_weight": balance_weights[:, 1],
+            "residual_update_norm": residual_update_norm,
             "branch_order": list(BRANCH_ORDER),
             "fusion_strategy": self.strategy,
             "branch_entropy": branch_entropy,
