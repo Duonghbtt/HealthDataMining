@@ -1,871 +1,496 @@
 from __future__ import annotations
 
 import argparse
-import math
-import shutil
-from collections import defaultdict
-from datetime import datetime
+import json
+import logging
+import re
+import sys
+from collections import Counter, defaultdict
 from pathlib import Path
+from typing import Any, Iterable, Mapping
 
-from src.data.build_vocab import cohort_path_from_config, load_vocab_bundle
-from src.data.load_mimic import (
-    MIMICDataPaths,
-    build_spark_session,
-    choose_stay_for_event,
-    iter_table,
-    spark_config,
-    spark_enabled,
-)
-from src.data.stage_filtered_tables import require_stage_cache
-from src.features.lab_processor import LabProcessor
-from src.features.medication_history import (
-    dedupe_preserve_order,
-    extract_medication_token,
-    medication_event_time,
-)
-from src.features.vital_processor import VitalProcessor
+if __package__ in {None, ""}:
+    sys.path.append(str(Path(__file__).resolve().parents[2]))
+
 from src.utils.io import (
     ensure_dir,
     hours_between,
     load_yaml_config,
     parse_datetime,
-    parse_float,
-    parse_int,
     read_csv_gz,
+    read_json,
     resolve_path,
     write_json,
     write_jsonl_gz,
-    write_parquet_pylist,
 )
 
 
-def _trajectory_root(config: dict) -> Path:
-    processed_root = resolve_path(config["_project_root"], config["paths"]["processed_root"])
-    return ensure_dir(Path(processed_root) / "trajectories")
+LOGGER = logging.getLogger(__name__)
 
 
-def _legacy_trajectory_file(config: dict, split: str) -> Path:
-    return _trajectory_root(config) / split / "trajectories.jsonl.gz"
+def _normalize_free_text(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9]+", "_", str(value).upper()).strip("_")
 
 
-def _cohort_keys_path(config: dict) -> Path:
-    interim_root = resolve_path(config["_project_root"], config["paths"]["interim_root"])
-    return Path(interim_root) / "cohort" / "cohort_keys.parquet"
+def _canonicalize_medication_text(value: str, *, prefer_code: bool = False) -> str | None:
+    raw_value = str(value).strip()
+    if not raw_value:
+        return None
+    if raw_value.startswith(("NAME:", "CODE:")):
+        return raw_value
+    normalized = _normalize_free_text(raw_value)
+    if not normalized:
+        return None
+    prefix = "CODE" if prefer_code else "NAME"
+    return f"{prefix}:{normalized}"
 
 
-def _bucket_index(stay: dict[str, object], event_time: datetime | None, bucket_hours: int) -> int:
-    num_steps = int(stay["num_steps"])
-    if num_steps <= 1 or event_time is None:
-        return 0
-    start = stay["intime_dt"]
-    end = stay["outtime_dt"]
-    if event_time <= start:
-        return 0
-    if event_time >= end:
-        return num_steps - 1
-    delta_hours = max((event_time - start).total_seconds() / 3600.0, 0.0)
-    return min(int(delta_hours // bucket_hours), num_steps - 1)
-
-
-def _load_stays(config: dict) -> tuple[list[dict[str, object]], dict[int, dict[str, object]], dict[int, list[dict[str, object]]]]:
-    cohort_rows = read_csv_gz(cohort_path_from_config(config))
-    stays: list[dict[str, object]] = []
-    stays_by_id: dict[int, dict[str, object]] = {}
-    stays_by_hadm: dict[int, list[dict[str, object]]] = defaultdict(list)
-    bucket_hours = int(config.get("features", {}).get("time_bucket_hours", 24))
-    for row in cohort_rows:
-        stay_id = parse_int(row.get("stay_id"))
-        hadm_id = parse_int(row.get("hadm_id"))
-        subject_id = parse_int(row.get("subject_id"))
-        intime = parse_datetime(row.get("intime"))
-        outtime = parse_datetime(row.get("outtime"))
-        split = str(row.get("split", "train"))
-        if None in (stay_id, hadm_id, subject_id) or intime is None or outtime is None:
-            continue
-        num_steps = max(1, int(math.ceil(hours_between(intime, outtime) / float(bucket_hours))))
-        stay = {
-            "subject_id": subject_id,
-            "hadm_id": hadm_id,
-            "stay_id": stay_id,
-            "split": split,
-            "intime": row.get("intime", ""),
-            "outtime": row.get("outtime", ""),
-            "intime_dt": intime,
-            "outtime_dt": outtime,
-            "num_steps": num_steps,
-        }
-        stays.append(stay)
-        stays_by_id[stay_id] = stay
-        stays_by_hadm[hadm_id].append(stay)
-    for hadm_stays in stays_by_hadm.values():
-        hadm_stays.sort(key=lambda item: item["intime_dt"])
-    stays.sort(key=lambda item: (item["subject_id"], item["hadm_id"], item["stay_id"]))
-    return stays, stays_by_id, stays_by_hadm
-
-
-def _build_trajectories_python(config: dict) -> dict[str, Path]:
-    paths = MIMICDataPaths.from_config(config)
-    vocab_bundle = load_vocab_bundle(config)
-    trajectory_root = _trajectory_root(config)
-    stays, stays_by_id, stays_by_hadm = _load_stays(config)
-    feature_cfg = config.get("features", {})
-    bucket_hours = int(feature_cfg.get("time_bucket_hours", 24))
-    max_med_history = int(feature_cfg.get("max_med_history", 32))
-    normalization_eps = float(feature_cfg.get("normalization_eps", 1e-6))
-
-    num_lab_features = max(len(vocab_bundle["lab"]["idx_to_token"]) - 2, 0)
-    num_vital_features = max(len(vocab_bundle["vital"]["idx_to_token"]) - 2, 0)
-    drug_vocab_size = len(vocab_bundle["drug"]["idx_to_token"])
-
-    lab_stats = LabProcessor.init_running_stats(num_lab_features)
-    vital_stats = VitalProcessor.init_running_stats(num_vital_features)
-
-    store: dict[int, dict[str, object]] = {}
-    for stay in stays:
-        store[int(stay["stay_id"])] = {
-            "diagnosis_ids": set(),
-            "procedure_by_bucket": defaultdict(set),
-            "lab_sparse": {},
-            "vital_sparse": {},
-            "target_drugs_by_bucket": defaultdict(list),
-        }
-
-    for row in iter_table(paths, "diagnoses_icd", fields=["hadm_id", "icd_code", "icd_version"]):
-        hadm_id = parse_int(row.get("hadm_id"))
-        code = str(row.get("icd_code", "")).strip()
-        version = str(row.get("icd_version", "")).strip()
-        if hadm_id not in stays_by_hadm or not code or not version:
-            continue
-        token = f"ICD{version}:{code}"
-        diagnosis_id = vocab_bundle["diagnosis"]["token_to_idx"].get(token, 1)
-        for stay in stays_by_hadm[hadm_id]:
-            store[int(stay["stay_id"])]["diagnosis_ids"].add(diagnosis_id)
-
-    for row in iter_table(paths, "procedures_icd", fields=["hadm_id", "chartdate", "icd_code", "icd_version"]):
-        hadm_id = parse_int(row.get("hadm_id"))
-        code = str(row.get("icd_code", "")).strip()
-        version = str(row.get("icd_version", "")).strip()
-        if hadm_id not in stays_by_hadm or not code or not version:
-            continue
-        event_time = parse_datetime(row.get("chartdate"))
-        stay = choose_stay_for_event(stays_by_hadm[hadm_id], event_time)
-        if stay is None:
-            continue
-        procedure_id = vocab_bundle["procedure"]["token_to_idx"].get(f"PROC{version}:{code}", 1)
-        bucket_index = _bucket_index(stay, event_time, bucket_hours)
-        store[int(stay["stay_id"])]["procedure_by_bucket"][bucket_index].add(procedure_id)
-
-    for row in iter_table(paths, "labevents", fields=["hadm_id", "itemid", "valuenum", "charttime"]):
-        hadm_id = parse_int(row.get("hadm_id"))
-        itemid = str(row.get("itemid", "")).strip()
-        value = parse_float(row.get("valuenum"))
-        if hadm_id not in stays_by_hadm or not itemid or value is None:
-            continue
-        vocab_index = vocab_bundle["lab"]["token_to_idx"].get(f"LAB:{itemid}")
-        if vocab_index is None or vocab_index < 2:
-            continue
-        feature_index = vocab_index - 2
-        event_time = parse_datetime(row.get("charttime"))
-        stay = choose_stay_for_event(stays_by_hadm[hadm_id], event_time)
-        if stay is None:
-            continue
-        bucket_index = _bucket_index(stay, event_time, bucket_hours)
-        LabProcessor.update_latest(
-            store[int(stay["stay_id"])]["lab_sparse"],
-            bucket_index,
-            feature_index,
-            event_time,
-            value,
+def _extract_medication_token(row: Mapping[str, Any]) -> str | None:
+    for field in ("medication", "drug", "formulary_drug_cd"):
+        token = _canonicalize_medication_text(
+            str(row.get(field, "")),
+            prefer_code=(field == "formulary_drug_cd"),
         )
-        if stay["split"] == "train":
-            LabProcessor.update_running_stats(lab_stats, feature_index, value)
+        if token:
+            return token
+    return None
 
-    for row in iter_table(paths, "chartevents", fields=["stay_id", "itemid", "valuenum", "charttime"]):
-        stay_id = parse_int(row.get("stay_id"))
-        itemid = str(row.get("itemid", "")).strip()
-        value = parse_float(row.get("valuenum"))
-        if stay_id not in stays_by_id or not itemid or value is None:
+
+def _dedupe_preserve_order(values: Iterable[int]) -> list[int]:
+    seen: set[int] = set()
+    ordered: list[int] = []
+    for value in values:
+        resolved = int(value)
+        if resolved in seen:
             continue
-        vocab_index = vocab_bundle["vital"]["token_to_idx"].get(f"VITAL:{itemid}")
-        if vocab_index is None or vocab_index < 2:
-            continue
-        feature_index = vocab_index - 2
-        stay = stays_by_id[stay_id]
-        event_time = parse_datetime(row.get("charttime"))
-        bucket_index = _bucket_index(stay, event_time, bucket_hours)
-        VitalProcessor.update_latest(
-            store[int(stay["stay_id"])]["vital_sparse"],
-            bucket_index,
-            feature_index,
-            event_time,
-            value,
-        )
-        if stay["split"] == "train":
-            VitalProcessor.update_running_stats(vital_stats, feature_index, value)
+        seen.add(resolved)
+        ordered.append(resolved)
+    return ordered
 
-    for table_name, fields in (
-        ("emar", ["hadm_id", "medication", "charttime", "scheduletime", "storetime"]),
-        ("prescriptions", ["hadm_id", "drug", "formulary_drug_cd", "starttime", "stoptime"]),
-        ("pharmacy", ["hadm_id", "medication", "starttime", "verifiedtime", "entertime"]),
-    ):
-        for row in iter_table(paths, table_name, fields=fields):
-            hadm_id = parse_int(row.get("hadm_id"))
-            if hadm_id not in stays_by_hadm:
-                continue
-            token = extract_medication_token(row)
-            if not token:
-                continue
-            drug_id = vocab_bundle["drug"]["token_to_idx"].get(token, 1)
-            event_time = medication_event_time(table_name, row)
-            stay = choose_stay_for_event(stays_by_hadm[hadm_id], event_time)
-            if stay is None:
-                continue
-            bucket_index = _bucket_index(stay, event_time, bucket_hours)
-            store[int(stay["stay_id"])]["target_drugs_by_bucket"][bucket_index].append(drug_id)
 
-    lab_processor = LabProcessor(
-        num_lab_features,
-        LabProcessor.finalize_running_stats(lab_stats, eps=normalization_eps),
-        eps=normalization_eps,
-    )
-    vital_processor = VitalProcessor(
-        num_vital_features,
-        VitalProcessor.finalize_running_stats(vital_stats, eps=normalization_eps),
-        eps=normalization_eps,
+def _configure_logging() -> None:
+    if logging.getLogger().handlers:
+        return
+    logging.basicConfig(
+        level=logging.INFO,
+        format="[%(name)s] %(levelname)s: %(message)s",
     )
 
-    records_by_split: dict[str, list[dict[str, object]]] = defaultdict(list)
-    for stay in stays:
-        stay_id = int(stay["stay_id"])
-        state = store[stay_id]
-        num_steps = int(stay["num_steps"])
-        diagnosis_ids = sorted(int(code_id) for code_id in state["diagnosis_ids"])
-        bucket_drugs = [
-            dedupe_preserve_order(state["target_drugs_by_bucket"].get(step_index, []))
-            for step_index in range(num_steps)
-        ]
-        history: list[int] = []
-        lab_values, lab_mask = lab_processor.build_dense_steps(state["lab_sparse"], num_steps)
-        vital_values, vital_mask = vital_processor.build_dense_steps(state["vital_sparse"], num_steps)
 
-        steps: list[dict[str, object]] = []
-        for step_index in range(num_steps):
-            steps.append(
+def _trajectory_output_root(config: Mapping[str, Any]) -> Path:
+    paths_cfg = dict(config.get("paths", {}))
+    trajectory_root = paths_cfg.get("trajectory_interim_root")
+    if trajectory_root:
+        return ensure_dir(resolve_path(config["_project_root"], trajectory_root))
+    interim_root = resolve_path(config["_project_root"], paths_cfg["interim_root"])
+    return ensure_dir(Path(interim_root) / "trajectories")
+
+
+def _vocab_dir_from_config(config: Mapping[str, Any]) -> Path:
+    paths_cfg = dict(config.get("paths", {}))
+    vocab_root = paths_cfg.get("vocab_root")
+    if vocab_root:
+        return Path(resolve_path(config["_project_root"], vocab_root))
+    interim_root = resolve_path(config["_project_root"], paths_cfg["interim_root"])
+    return Path(interim_root) / "vocab"
+
+
+def _cohort_path_from_config(config: Mapping[str, Any]) -> Path:
+    paths_cfg = dict(config.get("paths", {}))
+    cohort_root = paths_cfg.get("cohort_root")
+    if cohort_root:
+        return Path(resolve_path(config["_project_root"], cohort_root)) / "cohort.csv.gz"
+    interim_root = resolve_path(config["_project_root"], paths_cfg["interim_root"])
+    return Path(interim_root) / "cohort" / "cohort.csv.gz"
+
+
+def _trajectory_file(root: Path, split: str) -> Path:
+    return root / split / "trajectories.jsonl.gz"
+
+
+def _read_first_existing_json(vocab_dir: Path, candidate_names: tuple[str, ...]) -> dict[str, Any]:
+    for filename in candidate_names:
+        path = vocab_dir / filename
+        if path.exists():
+            payload = read_json(path)
+            if not isinstance(payload, dict):
+                raise ValueError(f"Invalid vocab artifact at {path}: expected object payload.")
+            return payload
+    raise FileNotFoundError(
+        f"Missing expected vocab artifact under {vocab_dir}. Checked: {list(candidate_names)}"
+    )
+
+
+def _load_vocab_bundle_for_trajectories(config: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    vocab_dir = _vocab_dir_from_config(config)
+    med_main_vocab = _read_first_existing_json(
+        vocab_dir,
+        ("med_vocab_main.json",),
+    )
+    return {
+        "diagnosis": _read_first_existing_json(
+            vocab_dir,
+            ("diag_vocab.json", "diagnosis_vocab.json"),
+        ),
+        "procedure": _read_first_existing_json(
+            vocab_dir,
+            ("proc_vocab.json", "procedure_vocab.json"),
+        ),
+        "drug": med_main_vocab,
+        "med_main": med_main_vocab,
+        "lab": _read_first_existing_json(vocab_dir, ("lab_vocab.json",)),
+        "vital": _read_first_existing_json(vocab_dir, ("vital_vocab.json",)),
+    }
+
+
+def _load_med_vocab_main_metadata(config: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    vocab_dir = _vocab_dir_from_config(config)
+    metadata_path = vocab_dir / "med_vocab_main_metadata.json"
+    if not metadata_path.exists():
+        raise FileNotFoundError(
+            "Missing medication vocab metadata required by build_trajectories: "
+            f"{metadata_path}. Run build_vocab.py first."
+        )
+    payload = read_json(metadata_path)
+    if not isinstance(payload, dict):
+        raise ValueError(
+            f"Invalid med_vocab_main_metadata artifact at {metadata_path}: expected object."
+        )
+    return payload
+
+
+def _parse_json_list(value: str | None, *, field_name: str) -> list[Any]:
+    text = str(value or "").strip()
+    if not text:
+        return []
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as exc:
+        LOGGER.warning("Failed to parse %s JSON payload: %s", field_name, exc)
+        return []
+    if isinstance(parsed, list):
+        return parsed
+    LOGGER.warning("Expected %s to decode to a list, got %s", field_name, type(parsed).__name__)
+    return []
+
+
+def _build_raw_medication_token_to_ids(
+    vocab_bundle: Mapping[str, dict[str, Any]],
+    med_vocab_metadata: Mapping[str, Mapping[str, Any]],
+) -> dict[str, tuple[int, ...]]:
+    primary_med_vocab = vocab_bundle["med_main"]
+    token_to_idx = {
+        str(token): int(index)
+        for token, index in primary_med_vocab["token_to_idx"].items()
+        if int(index) >= 2
+    }
+
+    raw_token_to_ids: dict[str, list[int]] = defaultdict(list)
+    for canonical_token, metadata_row in med_vocab_metadata.items():
+        med_id = token_to_idx.get(str(canonical_token))
+        if med_id is None:
+            continue
+        for raw_token in metadata_row.get("source_raw_tokens", []):
+            raw_token_text = str(raw_token).strip()
+            if not raw_token_text:
+                continue
+            raw_token_to_ids[raw_token_text].append(int(med_id))
+
+    finalized: dict[str, tuple[int, ...]] = {}
+    for raw_token, ids in raw_token_to_ids.items():
+        finalized[raw_token] = tuple(_dedupe_preserve_order(sorted(int(value) for value in ids)))
+    return finalized
+
+
+def _encode_visit_row(
+    row: Mapping[str, str],
+    *,
+    diag_token_to_idx: Mapping[str, int],
+    proc_token_to_idx: Mapping[str, int],
+    raw_medication_token_to_ids: Mapping[str, tuple[int, ...]],
+    max_med_history: int,
+    diagnostics: Counter[str],
+) -> dict[str, Any]:
+    diagnosis_tokens = [
+        str(token).strip()
+        for token in _parse_json_list(row.get("diagnosis_codes"), field_name="diagnosis_codes")
+        if str(token).strip()
+    ]
+    procedure_tokens = [
+        str(token).strip()
+        for token in _parse_json_list(row.get("procedure_codes"), field_name="procedure_codes")
+        if str(token).strip()
+    ]
+    raw_medication_records = [
+        dict(record)
+        for record in _parse_json_list(row.get("raw_medication_records"), field_name="raw_medication_records")
+        if isinstance(record, Mapping)
+    ]
+
+    diagnosis_ids = _dedupe_preserve_order([int(diag_token_to_idx.get(token, 1)) for token in diagnosis_tokens])
+    procedure_ids = _dedupe_preserve_order([int(proc_token_to_idx.get(token, 1)) for token in procedure_tokens])
+
+    target_drugs: list[int] = []
+    unmapped_med_tokens: list[str] = []
+    medication_tokens_seen = 0
+    mapped_medication_tokens = 0
+    for medication_record in raw_medication_records:
+        token = _extract_medication_token(medication_record)
+        if not token:
+            continue
+        medication_tokens_seen += 1
+        mapped_ids = raw_medication_token_to_ids.get(str(token), ())
+        if not mapped_ids:
+            unmapped_med_tokens.append(str(token))
+            continue
+        mapped_medication_tokens += 1
+        target_drugs.extend(int(value) for value in mapped_ids)
+    target_drugs = _dedupe_preserve_order(target_drugs)
+
+    if not target_drugs:
+        diagnostics["visits_with_empty_targets_after_normalization"] += 1
+    diagnostics["diagnosis_ids_total"] += len(diagnosis_ids)
+    diagnostics["procedure_ids_total"] += len(procedure_ids)
+    diagnostics["raw_medication_tokens_seen"] += medication_tokens_seen
+    diagnostics["raw_medication_tokens_mapped"] += mapped_medication_tokens
+    diagnostics["target_medication_ids_total"] += len(target_drugs)
+    diagnostics["visits_total"] += 1
+
+    intime = str(row.get("intime", "")).strip()
+    outtime = str(row.get("outtime", "")).strip()
+    return {
+        "subject_id": int(row["subject_id"]),
+        "hadm_id": int(row["hadm_id"]),
+        "stay_id": int(row["stay_id"]),
+        "split": str(row.get("split", "train")).strip() or "train",
+        "visit_order": int(row.get("visit_order", 0) or 0),
+        "patient_num_visits": int(row.get("patient_num_visits", 0) or 0),
+        "intime": intime,
+        "outtime": outtime,
+        "intime_dt": parse_datetime(intime),
+        "outtime_dt": parse_datetime(outtime),
+        "diagnosis_ids": diagnosis_ids,
+        "procedure_ids": procedure_ids,
+        "target_drugs": target_drugs,
+        "lab_values": [],
+        "lab_mask": [],
+        "vital_values": [],
+        "vital_mask": [],
+        "unmapped_medication_tokens": unmapped_med_tokens[:10],
+        "max_med_history": int(max_med_history),
+    }
+
+
+def _copy_step(step: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "step_index": int(step["step_index"]),
+        "diagnosis_ids": [int(value) for value in step.get("diagnosis_ids", [])],
+        "procedure_ids": [int(value) for value in step.get("procedure_ids", [])],
+        "lab_values": list(step.get("lab_values", [])),
+        "lab_mask": list(step.get("lab_mask", [])),
+        "vital_values": list(step.get("vital_values", [])),
+        "vital_mask": list(step.get("vital_mask", [])),
+        "med_history_ids": [int(value) for value in step.get("med_history_ids", [])],
+        "delta_hours": float(step.get("delta_hours", 0.0)),
+        "target_drugs": [int(value) for value in step.get("target_drugs", [])],
+    }
+
+
+def _build_patient_prefix_trajectories(
+    encoded_visits_by_subject: Mapping[int, list[dict[str, Any]]],
+    *,
+    drug_vocab_size: int,
+    max_med_history: int,
+) -> tuple[dict[str, list[dict[str, Any]]], dict[str, Any]]:
+    records_by_split: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    diagnostics: Counter[str] = Counter()
+    trajectory_lengths: list[int] = []
+    visit_target_sizes: list[int] = []
+
+    for subject_id in sorted(encoded_visits_by_subject):
+        visits = sorted(
+            encoded_visits_by_subject[subject_id],
+            key=lambda item: (int(item["visit_order"]), str(item["intime"]), int(item["hadm_id"])),
+        )
+        if not visits:
+            continue
+
+        split = str(visits[0]["split"])
+        patient_num_visits = int(visits[0]["patient_num_visits"] or len(visits))
+        cumulative_history: list[int] = []
+        trajectory_steps: list[dict[str, Any]] = []
+        previous_intime_dt = None
+        trajectory_start_time = str(visits[0]["intime"])
+
+        for step_index, visit in enumerate(visits):
+            current_intime_dt = visit.get("intime_dt")
+            delta_hours = (
+                0.0
+                if step_index == 0 or previous_intime_dt is None or current_intime_dt is None
+                else float(hours_between(previous_intime_dt, current_intime_dt))
+            )
+            step = {
+                "step_index": int(step_index),
+                "diagnosis_ids": list(visit["diagnosis_ids"]),
+                "procedure_ids": list(visit["procedure_ids"]),
+                "lab_values": [],
+                "lab_mask": [],
+                "vital_values": [],
+                "vital_mask": [],
+                "med_history_ids": cumulative_history[:max_med_history],
+                "delta_hours": float(delta_hours),
+                "target_drugs": list(visit["target_drugs"]),
+            }
+            trajectory_steps.append(step)
+            trajectory_lengths.append(step_index + 1)
+            visit_target_sizes.append(len(step["target_drugs"]))
+
+            records_by_split[split].append(
                 {
-                    "step_index": step_index,
-                    "diagnosis_ids": diagnosis_ids,
-                    "procedure_ids": sorted(state["procedure_by_bucket"].get(step_index, set())),
-                    "lab_values": lab_values[step_index],
-                    "lab_mask": lab_mask[step_index],
-                    "vital_values": vital_values[step_index],
-                    "vital_mask": vital_mask[step_index],
-                    "med_history_ids": history[:max_med_history],
-                    "delta_hours": 0.0 if step_index == 0 else float(bucket_hours),
-                    "target_drugs": bucket_drugs[step_index],
+                    "patient_id": int(subject_id),
+                    "subject_id": int(subject_id),
+                    "hadm_id": int(visit["hadm_id"]),
+                    "stay_id": int(visit["stay_id"]),
+                    "split": split,
+                    "intime": trajectory_start_time,
+                    "outtime": str(visit["outtime"]),
+                    "num_steps": int(step_index + 1),
+                    "visit_index": int(step_index),
+                    "visit_position": int(step_index + 1),
+                    "history_length": int(step_index + 1),
+                    "patient_num_visits": int(patient_num_visits),
+                    "drug_vocab_size": int(drug_vocab_size),
+                    "drug_representation": "med_vocab_main",
+                    "lab_feature_size": 0,
+                    "vital_feature_size": 0,
+                    "steps": [_copy_step(existing_step) for existing_step in trajectory_steps],
                 }
             )
-            for drug_id in reversed(bucket_drugs[step_index]):
-                if drug_id in history:
-                    history.remove(drug_id)
-                history.insert(0, drug_id)
-            history = history[:max_med_history]
 
-        records_by_split[str(stay["split"])].append(
-            {
-                "subject_id": stay["subject_id"],
-                "hadm_id": stay["hadm_id"],
-                "stay_id": stay_id,
-                "split": stay["split"],
-                "intime": stay["intime"],
-                "outtime": stay["outtime"],
-                "num_steps": num_steps,
-                "drug_vocab_size": drug_vocab_size,
-                "lab_feature_size": num_lab_features,
-                "vital_feature_size": num_vital_features,
-                "steps": steps,
-            }
-        )
+            for drug_id in reversed(step["target_drugs"]):
+                if drug_id in cumulative_history:
+                    cumulative_history.remove(drug_id)
+                cumulative_history.insert(0, int(drug_id))
+            cumulative_history = cumulative_history[:max_med_history]
+            previous_intime_dt = current_intime_dt
+            diagnostics["num_unique_visits"] += 1
 
-    output_paths: dict[str, Path] = {}
-    for split_name in ("train", "val", "test"):
-        split_dir = ensure_dir(trajectory_root / split_name)
-        output_paths[split_name] = write_jsonl_gz(
-            split_dir / "trajectories.jsonl.gz",
-            records_by_split.get(split_name, []),
-        )
-
-    write_json(
-        trajectory_root / "normalization_stats.json",
-        {
-            "lab": [stat.__dict__ for stat in lab_processor.stats],
-            "vital": [stat.__dict__ for stat in vital_processor.stats],
-            "eps": normalization_eps,
-        },
-    )
-    write_json(
-        trajectory_root / "metadata.json",
-        {
-            "bucket_hours": bucket_hours,
-            "max_med_history": max_med_history,
-            "drug_vocab_size": drug_vocab_size,
-            "lab_feature_size": num_lab_features,
-            "vital_feature_size": num_vital_features,
-            "counts_by_split": {split: len(records) for split, records in records_by_split.items()},
-        },
-    )
-    return output_paths
-
-
-def _feature_mapping_rows(vocab: dict[str, object], prefix: str) -> list[dict[str, int | str]]:
-    rows: list[dict[str, int | str]] = []
-    for token, index in vocab["token_to_idx"].items():
-        if token in {"PAD", "UNK"}:
-            continue
-        rows.append(
-            {
-                "token": token,
-                "itemid": token.split(":", 1)[1] if ":" in token else token.removeprefix(prefix),
-                "index": int(index),
-                "feature_index": int(index) - 2,
-            }
-        )
-    return rows
-
-
-def _create_mapping_df(spark, rows: list[dict[str, object]], schema: str):
-    if rows:
-        return spark.createDataFrame(rows)
-    return spark.createDataFrame([], schema=schema)
-
-
-def _step_index_expr(F, event_col, start_col, end_col, num_steps_col, bucket_hours: int):
-    bucket_seconds = float(bucket_hours) * 3600.0
-    delta = (F.col(event_col).cast("long") - F.col(start_col).cast("long")) / F.lit(bucket_seconds)
-    return (
-        F.when(F.col(event_col).isNull(), F.lit(0))
-        .when(F.col(event_col) <= F.col(start_col), F.lit(0))
-        .when(F.col(event_col) >= F.col(end_col), F.col(num_steps_col) - F.lit(1))
-        .otherwise(F.least(F.floor(delta).cast("int"), F.col(num_steps_col) - F.lit(1)))
-    ).cast("int")
-
-
-def _collect_numeric_stats(dataframe, feature_size: int) -> list[dict[str, float]]:
-    stats = [{"mean": 0.0, "std": 1.0, "count": 0} for _ in range(feature_size)]
-    for row in dataframe.collect():
-        feature_index = int(row["feature_index"])
-        if not 0 <= feature_index < feature_size:
-            continue
-        std = float(row["std"]) if row["std"] is not None and float(row["std"]) > 0.0 else 1.0
-        stats[feature_index] = {
-            "mean": float(row["mean"] or 0.0),
-            "std": std,
-            "count": int(row["count"] or 0),
-        }
-    return stats
-
-
-def _sparse_pairs_to_dense(
-    pairs: list[dict[str, object]] | None,
-    feature_size: int,
-    stats: list[dict[str, float]],
-    eps: float,
-) -> tuple[list[float], list[int]]:
-    dense = [0.0] * feature_size
-    mask = [0] * feature_size
-    for pair in pairs or []:
-        if pair is None:
-            continue
-        feature_index = int(pair["feature_index"])
-        value = float(pair["value"])
-        if not 0 <= feature_index < feature_size:
-            continue
-        stat = stats[feature_index]
-        dense[feature_index] = (value - float(stat["mean"])) / max(float(stat["std"]), eps)
-        mask[feature_index] = 1
-    return dense, mask
-
-
-def _write_shard(split_dir: Path, shard_index: int, rows: list[dict[str, object]]) -> Path:
-    shard_path = split_dir / f"part-{shard_index:05d}.parquet"
-    return write_parquet_pylist(shard_path, rows)
-
-
-def _flush_record(
-    split: str,
-    buffer: list[dict[str, object]],
-    shard_counts: dict[str, int],
-    manifests: dict[str, list[dict[str, object]]],
-    trajectory_root: Path,
-) -> None:
-    if not buffer:
-        return
-    split_dir = ensure_dir(trajectory_root / split)
-    shard_index = shard_counts[split]
-    shard_path = _write_shard(split_dir, shard_index, buffer)
-    manifests[split].append(
-        {
-            "path": str(shard_path.relative_to(trajectory_root)),
-            "rows": len(buffer),
-        }
-    )
-    shard_counts[split] += 1
-    buffer.clear()
-
-
-def _finalize_split_from_step_rows(
-    split: str,
-    source_dir: Path,
-    trajectory_root: Path,
-    *,
-    bucket_hours: int,
-    max_med_history: int,
-    trajectory_rows_per_file: int,
-    lab_feature_size: int,
-    vital_feature_size: int,
-    drug_vocab_size: int,
-    lab_stats: list[dict[str, float]],
-    vital_stats: list[dict[str, float]],
-    normalization_eps: float,
-    manifests: dict[str, list[dict[str, object]]],
-    record_counts: dict[str, int],
-) -> None:
-    try:
-        import pyarrow.parquet as pq
-    except ImportError as exc:
-        raise RuntimeError(
-            "pyarrow is required for parquet trajectory finalization. Install requirements.txt first."
-        ) from exc
-
-    split_dir = trajectory_root / split
-    shutil.rmtree(split_dir, ignore_errors=True)
-    ensure_dir(split_dir)
-    shard_counts = {split: 0}
-    trajectory_buffer: list[dict[str, object]] = []
-
-    parquet_files = sorted(item for item in source_dir.rglob("*.parquet") if item.is_file()) if source_dir.exists() else []
-    for parquet_file in parquet_files:
-        current_record: dict[str, object] | None = None
-        history: list[int] = []
-        parquet_reader = pq.ParquetFile(parquet_file)
-        for batch in parquet_reader.iter_batches(batch_size=256, use_threads=False):
-            for row in batch.to_pylist():
-                stay_id = int(row["stay_id"])
-                if current_record is None or int(current_record["stay_id"]) != stay_id:
-                    if current_record is not None:
-                        trajectory_buffer.append(current_record)
-                        record_counts[split] += 1
-                        if len(trajectory_buffer) >= trajectory_rows_per_file:
-                            _flush_record(split, trajectory_buffer, shard_counts, manifests, trajectory_root)
-                    history = []
-                    current_record = {
-                        "subject_id": int(row["subject_id"]),
-                        "hadm_id": int(row["hadm_id"]),
-                        "stay_id": stay_id,
-                        "split": split,
-                        "intime": str(row["intime"]),
-                        "outtime": str(row["outtime"]),
-                        "num_steps": int(row["num_steps"]),
-                        "drug_vocab_size": drug_vocab_size,
-                        "lab_feature_size": lab_feature_size,
-                        "vital_feature_size": vital_feature_size,
-                        "steps": [],
-                    }
-
-                target_drugs = dedupe_preserve_order(int(value) for value in (row.get("target_drugs") or []) if value is not None)
-                lab_values, lab_mask = _sparse_pairs_to_dense(
-                    row.get("lab_pairs"),
-                    lab_feature_size,
-                    lab_stats,
-                    normalization_eps,
-                )
-                vital_values, vital_mask = _sparse_pairs_to_dense(
-                    row.get("vital_pairs"),
-                    vital_feature_size,
-                    vital_stats,
-                    normalization_eps,
-                )
-                current_record["steps"].append(
-                    {
-                        "step_index": int(row["step_index"]),
-                        "diagnosis_ids": [int(value) for value in (row.get("diagnosis_ids") or [])],
-                        "procedure_ids": [int(value) for value in (row.get("procedure_ids") or [])],
-                        "lab_values": lab_values,
-                        "lab_mask": lab_mask,
-                        "vital_values": vital_values,
-                        "vital_mask": vital_mask,
-                        "med_history_ids": history[:max_med_history],
-                        "delta_hours": 0.0 if int(row["step_index"]) == 0 else float(bucket_hours),
-                        "target_drugs": target_drugs,
-                    }
-                )
-                for drug_id in reversed(target_drugs):
-                    if drug_id in history:
-                        history.remove(drug_id)
-                    history.insert(0, drug_id)
-                history = history[:max_med_history]
-        if current_record is not None:
-            trajectory_buffer.append(current_record)
-            record_counts[split] += 1
-            if len(trajectory_buffer) >= trajectory_rows_per_file:
-                _flush_record(split, trajectory_buffer, shard_counts, manifests, trajectory_root)
-
-    _flush_record(split, trajectory_buffer, shard_counts, manifests, trajectory_root)
-
-
-def _build_trajectories_spark(config: dict) -> dict[str, Path]:
-    cache_dir, _ = require_stage_cache(config)
-    cohort_keys_path = _cohort_keys_path(config)
-    if not cohort_keys_path.exists():
-        raise FileNotFoundError(
-            f"Cohort keys parquet is missing at {cohort_keys_path}. "
-            f"Run `python -m src.data.build_cohort --config {config['_config_path']}` first."
-        )
-
-    vocab_bundle = load_vocab_bundle(config)
-    feature_cfg = config.get("features", {})
-    bucket_hours = int(feature_cfg.get("time_bucket_hours", 24))
-    max_med_history = int(feature_cfg.get("max_med_history", 32))
-    normalization_eps = float(feature_cfg.get("normalization_eps", 1e-6))
-    spark_cfg = spark_config(config)
-    trajectory_rows_per_file = int(spark_cfg.get("trajectory_rows_per_file", 2048))
-    trajectory_root = _trajectory_root(config)
-    step_rows_root = trajectory_root / "_step_rows"
-
-    shutil.rmtree(step_rows_root, ignore_errors=True)
-    for split_name in ("train", "val", "test"):
-        shutil.rmtree(trajectory_root / split_name, ignore_errors=True)
-    manifest_path = trajectory_root / "manifest.json"
-    if manifest_path.exists():
-        manifest_path.unlink()
-
-    spark = build_spark_session(config, app_name="build-trajectories")
-    try:
-        from pyspark.sql import Window
-        from pyspark.sql import functions as F
-
-        cohort = (
-            spark.read.parquet(str(cohort_keys_path))
-            .select("subject_id", "hadm_id", "stay_id", "split", "intime", "outtime")
-            .withColumn("subject_id", F.col("subject_id").cast("long"))
-            .withColumn("hadm_id", F.col("hadm_id").cast("long"))
-            .withColumn("stay_id", F.col("stay_id").cast("long"))
-            .withColumn("intime_ts", F.to_timestamp("intime"))
-            .withColumn("outtime_ts", F.to_timestamp("outtime"))
-            .withColumn(
-                "num_steps",
-                F.greatest(
-                    F.lit(1),
-                    F.ceil(
-                        (F.col("outtime_ts").cast("long") - F.col("intime_ts").cast("long"))
-                        / F.lit(float(bucket_hours) * 3600.0)
-                    ).cast("int"),
-                ),
-            )
-        )
-
-        diag_map = F.broadcast(
-            _create_mapping_df(
-                spark,
-                [
-                    {"diagnosis_token": token, "diagnosis_id": int(index)}
-                    for token, index in vocab_bundle["diagnosis"]["token_to_idx"].items()
-                    if token not in {"PAD", "UNK"}
-                ],
-                "diagnosis_token string, diagnosis_id int",
-            )
-        )
-        proc_map = F.broadcast(
-            _create_mapping_df(
-                spark,
-                [
-                    {"procedure_token": token, "procedure_id": int(index)}
-                    for token, index in vocab_bundle["procedure"]["token_to_idx"].items()
-                    if token not in {"PAD", "UNK"}
-                ],
-                "procedure_token string, procedure_id int",
-            )
-        )
-        drug_map = F.broadcast(
-            _create_mapping_df(
-                spark,
-                [
-                    {"drug_token": token, "drug_id": int(index)}
-                    for token, index in vocab_bundle["drug"]["token_to_idx"].items()
-                    if token not in {"PAD", "UNK"}
-                ],
-                "drug_token string, drug_id int",
-            )
-        )
-        lab_map = F.broadcast(
-            _create_mapping_df(
-                spark,
-                [
-                    {"itemid": row["itemid"], "feature_index": int(row["feature_index"])}
-                    for row in _feature_mapping_rows(vocab_bundle["lab"], "LAB:")
-                ],
-                "itemid string, feature_index int",
-            )
-        )
-        vital_map = F.broadcast(
-            _create_mapping_df(
-                spark,
-                [
-                    {"itemid": row["itemid"], "feature_index": int(row["feature_index"])}
-                    for row in _feature_mapping_rows(vocab_bundle["vital"], "VITAL:")
-                ],
-                "itemid string, feature_index int",
-            )
-        )
-
-        diagnosis_rows = spark.read.parquet(str(cache_dir / "diagnoses_icd")).select("hadm_id", "diagnosis_token")
-        diagnosis_by_stay = (
-            diagnosis_rows.join(diag_map, "diagnosis_token", "inner")
-            .join(F.broadcast(cohort.select("hadm_id", "stay_id")), "hadm_id", "inner")
-            .groupBy("stay_id")
-            .agg(F.sort_array(F.collect_set("diagnosis_id")).alias("diagnosis_ids"))
-        )
-
-        procedure_rows = (
-            spark.read.parquet(str(cache_dir / "procedures_icd"))
-            .select("hadm_id", "event_time", "procedure_token")
-            .join(proc_map, "procedure_token", "inner")
-            .join(
-                F.broadcast(
-                    cohort.select("hadm_id", "stay_id", "intime_ts", "outtime_ts", "num_steps")
-                ),
-                "hadm_id",
-                "inner",
-            )
-            .withColumn(
-                "step_index",
-                _step_index_expr(F, "event_time", "intime_ts", "outtime_ts", "num_steps", bucket_hours),
-            )
-            .groupBy("stay_id", "step_index")
-            .agg(F.sort_array(F.collect_set("procedure_id")).alias("procedure_ids"))
-        )
-
-        lab_events = (
-            spark.read.parquet(str(cache_dir / "labevents"))
-            .select("hadm_id", F.trim(F.col("itemid")).alias("itemid"), "valuenum", "event_time")
-            .join(lab_map, "itemid", "inner")
-            .join(
-                F.broadcast(
-                    cohort.select("hadm_id", "stay_id", "split", "intime_ts", "outtime_ts", "num_steps")
-                ),
-                "hadm_id",
-                "inner",
-            )
-            .withColumn(
-                "step_index",
-                _step_index_expr(F, "event_time", "intime_ts", "outtime_ts", "num_steps", bucket_hours),
-            )
-        )
-        lab_stats = _collect_numeric_stats(
-            lab_events.filter(F.col("split") == "train")
-            .groupBy("feature_index")
-            .agg(
-                F.count("*").alias("count"),
-                F.avg("valuenum").alias("mean"),
-                F.stddev_pop("valuenum").alias("std"),
-            ),
-            max(len(vocab_bundle["lab"]["idx_to_token"]) - 2, 0),
-        )
-        lab_window = Window.partitionBy("stay_id", "step_index", "feature_index").orderBy(F.col("event_time").desc_nulls_last())
-        lab_pairs = (
-            lab_events.withColumn("row_num", F.row_number().over(lab_window))
-            .filter(F.col("row_num") == 1)
-            .groupBy("stay_id", "step_index")
-            .agg(
-                F.sort_array(
-                    F.collect_list(F.struct(F.col("feature_index"), F.col("valuenum").alias("value")))
-                ).alias("lab_pairs")
-            )
-        )
-
-        vital_events = (
-            spark.read.parquet(str(cache_dir / "chartevents"))
-            .select("stay_id", F.trim(F.col("itemid")).alias("itemid"), "valuenum", "event_time")
-            .join(vital_map, "itemid", "inner")
-            .join(
-                F.broadcast(
-                    cohort.select("stay_id", "split", "intime_ts", "outtime_ts", "num_steps")
-                ),
-                "stay_id",
-                "inner",
-            )
-            .withColumn(
-                "step_index",
-                _step_index_expr(F, "event_time", "intime_ts", "outtime_ts", "num_steps", bucket_hours),
-            )
-        )
-        vital_stats = _collect_numeric_stats(
-            vital_events.filter(F.col("split") == "train")
-            .groupBy("feature_index")
-            .agg(
-                F.count("*").alias("count"),
-                F.avg("valuenum").alias("mean"),
-                F.stddev_pop("valuenum").alias("std"),
-            ),
-            max(len(vocab_bundle["vital"]["idx_to_token"]) - 2, 0),
-        )
-        vital_window = Window.partitionBy("stay_id", "step_index", "feature_index").orderBy(F.col("event_time").desc_nulls_last())
-        vital_pairs = (
-            vital_events.withColumn("row_num", F.row_number().over(vital_window))
-            .filter(F.col("row_num") == 1)
-            .groupBy("stay_id", "step_index")
-            .agg(
-                F.sort_array(
-                    F.collect_list(F.struct(F.col("feature_index"), F.col("valuenum").alias("value")))
-                ).alias("vital_pairs")
-            )
-        )
-
-        medication_rows = (
-            spark.read.parquet(str(cache_dir / "medications"))
-            .select("hadm_id", "event_time", "drug_token")
-            .join(drug_map, "drug_token", "inner")
-            .join(
-                F.broadcast(
-                    cohort.select("hadm_id", "stay_id", "intime_ts", "outtime_ts", "num_steps")
-                ),
-                "hadm_id",
-                "inner",
-            )
-            .withColumn(
-                "step_index",
-                _step_index_expr(F, "event_time", "intime_ts", "outtime_ts", "num_steps", bucket_hours),
-            )
-            .groupBy("stay_id", "step_index")
-            .agg(
-                F.expr(
-                    "transform(sort_array(collect_list(named_struct('event_time', event_time, 'drug_id', drug_id))), x -> x.drug_id)"
-                ).alias("target_drugs")
-            )
-        )
-
-        step_rows = (
-            cohort.select(
-                "split",
-                "subject_id",
-                "hadm_id",
-                "stay_id",
-                "intime",
-                "outtime",
-                "num_steps",
-                F.explode(F.sequence(F.lit(0), F.col("num_steps") - F.lit(1))).alias("step_index"),
-            )
-            .join(diagnosis_by_stay, "stay_id", "left")
-            .join(procedure_rows, ["stay_id", "step_index"], "left")
-            .join(lab_pairs, ["stay_id", "step_index"], "left")
-            .join(vital_pairs, ["stay_id", "step_index"], "left")
-            .join(medication_rows, ["stay_id", "step_index"], "left")
-            .select(
-                "split",
-                "subject_id",
-                "hadm_id",
-                "stay_id",
-                "intime",
-                "outtime",
-                "num_steps",
-                "step_index",
-                "diagnosis_ids",
-                "procedure_ids",
-                "lab_pairs",
-                "vital_pairs",
-                "target_drugs",
-            )
-        )
-
-        for split_name, partitions in (("train", 4), ("val", 2), ("test", 2)):
-            split_df = step_rows.filter(F.col("split") == split_name).drop("split")
-            split_output = step_rows_root / split_name
-            if split_df.rdd.isEmpty():
-                ensure_dir(split_output)
-                continue
-            (
-                split_df.repartition(partitions, "stay_id")
-                .sortWithinPartitions("stay_id", "step_index")
-                .write.mode("overwrite")
-                .option("compression", "snappy")
-                .parquet(str(split_output))
-            )
-
-        lab_feature_size = max(len(vocab_bundle["lab"]["idx_to_token"]) - 2, 0)
-        vital_feature_size = max(len(vocab_bundle["vital"]["idx_to_token"]) - 2, 0)
-        drug_vocab_size = len(vocab_bundle["drug"]["idx_to_token"])
-        manifests: dict[str, list[dict[str, object]]] = {split: [] for split in ("train", "val", "test")}
-        record_counts: dict[str, int] = {split: 0 for split in ("train", "val", "test")}
-        output_paths: dict[str, Path] = {}
-        for split_name in ("train", "val", "test"):
-            output_paths[split_name] = trajectory_root / split_name
-            _finalize_split_from_step_rows(
-                split_name,
-                step_rows_root / split_name,
-                trajectory_root,
-                bucket_hours=bucket_hours,
-                max_med_history=max_med_history,
-                trajectory_rows_per_file=trajectory_rows_per_file,
-                lab_feature_size=lab_feature_size,
-                vital_feature_size=vital_feature_size,
-                drug_vocab_size=drug_vocab_size,
-                lab_stats=lab_stats,
-                vital_stats=vital_stats,
-                normalization_eps=normalization_eps,
-                manifests=manifests,
-                record_counts=record_counts,
-            )
-
-        write_json(
-            trajectory_root / "normalization_stats.json",
-            {
-                "lab": lab_stats,
-                "vital": vital_stats,
-                "eps": normalization_eps,
-            },
-        )
-        write_json(
-            trajectory_root / "metadata.json",
-            {
-                "bucket_hours": bucket_hours,
-                "max_med_history": max_med_history,
-                "drug_vocab_size": drug_vocab_size,
-                "lab_feature_size": lab_feature_size,
-                "vital_feature_size": vital_feature_size,
-                "counts_by_split": record_counts,
-                "processed_format": "parquet",
-            },
-        )
-        write_json(
-            manifest_path,
-            {
-                "format": "parquet",
-                "schema_version": 1,
-                "trajectory_rows_per_file": trajectory_rows_per_file,
-                "counts_by_split": record_counts,
-                "splits": {
-                    split_name: {
-                        "rows": record_counts[split_name],
-                        "shards": manifests[split_name],
-                    }
-                    for split_name in ("train", "val", "test")
-                },
-            },
-        )
-        return output_paths
-    finally:
-        spark.stop()
+    num_trajectories = sum(len(records) for records in records_by_split.values())
+    num_unique_visits = int(diagnostics["num_unique_visits"])
+    empty_visit_count = sum(1 for size in visit_target_sizes if int(size) <= 0)
+    summary = {
+        "num_trajectories": int(num_trajectories),
+        "num_unique_visits": int(num_unique_visits),
+        "trajectory_length_min": int(min(trajectory_lengths)) if trajectory_lengths else 0,
+        "trajectory_length_max": int(max(trajectory_lengths)) if trajectory_lengths else 0,
+        "trajectory_length_avg": (
+            round(sum(trajectory_lengths) / len(trajectory_lengths), 4) if trajectory_lengths else 0.0
+        ),
+        "avg_num_meds_per_visit": (
+            round(sum(visit_target_sizes) / len(visit_target_sizes), 4) if visit_target_sizes else 0.0
+        ),
+        "empty_visit_rate": (
+            round(empty_visit_count / len(visit_target_sizes), 6) if visit_target_sizes else 0.0
+        ),
+        "empty_visit_count": int(empty_visit_count),
+        "counts_by_split": {split: len(records) for split, records in sorted(records_by_split.items())},
+    }
+    return records_by_split, summary
 
 
 def build_trajectories(config_path: str | Path) -> dict[str, Path]:
+    _configure_logging()
     config = load_yaml_config(config_path)
-    if spark_enabled(config):
-        return _build_trajectories_spark(config)
-    return _build_trajectories_python(config)
+    trajectory_root = _trajectory_output_root(config)
+    vocab_bundle = _load_vocab_bundle_for_trajectories(config)
+    med_vocab_metadata = _load_med_vocab_main_metadata(config)
+    feature_cfg = dict(config.get("features", {}))
+    max_med_history = int(feature_cfg.get("max_med_history", 32))
+    if max_med_history < 1:
+        raise ValueError(f"features.max_med_history must be >= 1, got {max_med_history}")
+
+    cohort_path = _cohort_path_from_config(config)
+    if not cohort_path.exists():
+        raise FileNotFoundError(
+            f"Cohort artifact is missing at {cohort_path}. Run build_cohort.py first."
+        )
+
+    primary_med_vocab = vocab_bundle["med_main"]
+    diag_token_to_idx = {str(token): int(index) for token, index in vocab_bundle["diagnosis"]["token_to_idx"].items()}
+    proc_token_to_idx = {str(token): int(index) for token, index in vocab_bundle["procedure"]["token_to_idx"].items()}
+    raw_medication_token_to_ids = _build_raw_medication_token_to_ids(vocab_bundle, med_vocab_metadata)
+
+    LOGGER.info("Loading cohort rows from %s", cohort_path)
+    cohort_rows = read_csv_gz(cohort_path)
+    visit_encoding_diagnostics: Counter[str] = Counter()
+    encoded_visits_by_subject: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    for row in cohort_rows:
+        subject_id_text = str(row.get("subject_id", "")).strip()
+        hadm_id_text = str(row.get("hadm_id", "")).strip()
+        stay_id_text = str(row.get("stay_id", "")).strip()
+        if not subject_id_text or not hadm_id_text or not stay_id_text:
+            continue
+        encoded_visit = _encode_visit_row(
+            row,
+            diag_token_to_idx=diag_token_to_idx,
+            proc_token_to_idx=proc_token_to_idx,
+            raw_medication_token_to_ids=raw_medication_token_to_ids,
+            max_med_history=max_med_history,
+            diagnostics=visit_encoding_diagnostics,
+        )
+        encoded_visits_by_subject[int(encoded_visit["subject_id"])].append(encoded_visit)
+
+    records_by_split, trajectory_summary = _build_patient_prefix_trajectories(
+        encoded_visits_by_subject,
+        drug_vocab_size=len(primary_med_vocab["idx_to_token"]),
+        max_med_history=max_med_history,
+    )
+
+    output_paths: dict[str, Path] = {}
+    for split_name in ("train", "val", "test"):
+        split_path = _trajectory_file(trajectory_root, split_name)
+        output_paths[split_name] = write_jsonl_gz(split_path, records_by_split.get(split_name, []))
+
+    metadata = {
+        "benchmark_unit": "patient_visit_prefix",
+        "trajectory_definition": "each record is one patient prefix ending at the current visit",
+        "drug_representation": "med_vocab_main",
+        "drug_vocab_size": int(primary_med_vocab["size"]),
+        "drug_vocab_name": str(primary_med_vocab.get("name", "med_vocab_main")),
+        "lab_feature_size": 0,
+        "vital_feature_size": 0,
+        "max_med_history": int(max_med_history),
+        "counts_by_split": {
+            split_name: len(records_by_split.get(split_name, []))
+            for split_name in ("train", "val", "test")
+        },
+    }
+    summary = {
+        **trajectory_summary,
+        "visit_encoding": {key: int(value) for key, value in sorted(visit_encoding_diagnostics.items())},
+    }
+
+    write_json(trajectory_root / "metadata.json", metadata)
+    write_json(trajectory_root / "trajectory_summary.json", summary)
+
+    LOGGER.info("Built trajectories at %s", trajectory_root)
+    LOGGER.info("Trajectories: %s", summary["num_trajectories"])
+    LOGGER.info(
+        "Trajectory length min/avg/max: %s / %.4f / %s",
+        summary["trajectory_length_min"],
+        summary["trajectory_length_avg"],
+        summary["trajectory_length_max"],
+    )
+    LOGGER.info("Avg meds/visit: %.4f", summary["avg_num_meds_per_visit"])
+    LOGGER.info("Empty visit rate: %.6f", summary["empty_visit_rate"])
+    return output_paths
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Build bucketed ICU stay trajectories.")
-    parser.add_argument("--config", required=True, help="Path to configs/data.yaml")
+    parser = argparse.ArgumentParser(
+        description="Build patient-level ordered visit trajectories aligned to med_vocab_main."
+    )
+    parser.add_argument("--config", default="configs/data.yaml", help="Path to configs/data.yaml")
     args = parser.parse_args()
     build_trajectories(args.config)
 

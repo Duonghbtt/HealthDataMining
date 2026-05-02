@@ -11,45 +11,65 @@ embedding:
   vital_dim: 64
   time_dim: 32
 
+encoder:
+  mode: modality_aware_gru
+  modality_hidden_dim: 128
+  fusion_hidden_dim: 128
+  modality_dropout: 0.1
+  use_temporal_attention: true
+  temporal_attention_heads: 1
+  temporal_attention_dropout: 0.1
+
 sequence:
   rnn_type: gru
   bidirectional: false
 
-# Experimental extension only.
-# train_core.py and the default evaluators do not read this block.
 retrieval:
+  enabled: false
+  mode: bruteforce
   top_k: 5
   temporal_decay_alpha: 0.05
+  exclude_same_stay: true
   backend: bruteforce
   use_faiss_if_available: true
-  scoring_mode: temporal_relevance
-  cross_split_policy: same_split
+  graph_top_k: 5
+  allow_same_patient: false
+  exclude_future: true
+  exclude_exact_match: true
+  exclude_future_same_patient: true
+  exclude_future_all_patients_if_absolute_time: true
+  require_absolute_time_for_cross_patient_temporal_filter: false
+  similarity_mode: cosine_decay
+  use_time_gap: true
+  dropout: 0.1
+
+full_model:
+  history_mode: self_only
+
+debug:
+  return_retrieval_aux: false
+
+training:
+  device: cuda
 
 history_selector:
+  enabled: true
+  mode: visit_attribute
   dropout: 0.1
+  top_k: 3
   score_bias_weight: 0.5
   self_top_k: 3
-  # Neighbor history only becomes active inside the experimental retrieval path.
+  attention_type: softmax_topk
+  return_attention_weights: true
+  save_selected_indices: true
   neighbor_top_k: 3
   use_retrieval_bias: true
 
 fusion:
+  mode: gated
   dropout: 0.1
   strategy: gated
-  current_branch_dropout: 0.0
 
-decoder:
-  # Optional research path for PRAUC-oriented structured label modeling.
-  # Disabled by default so existing benchmark configs remain comparable.
-  mode: independent
-  label_correlation:
-    enabled: false
-    correlation_dim: 64
-    patient_residual_weight: 0.10
-    coprescription_residual_weight: 0.05
-    dropout: 0.1
-
-# Experimental extension only. Not part of the verified core path.
 hypergraph:
   num_layers: 2
   dropout: 0.1
@@ -57,47 +77,3 @@ hypergraph:
   use_semantic_edges: true
   use_weighted_edges: true
   prototype_top_k: 2
-
-profiles:
-  safe:
-    model:
-      hidden_dim: 128
-      num_layers: 1
-      dropout: 0.1
-    embedding:
-      diag_dim: 128
-      proc_dim: 128
-      drug_dim: 128
-      lab_dim: 64
-      vital_dim: 64
-      time_dim: 32
-    history_selector:
-      self_top_k: 3
-  balanced:
-    model:
-      hidden_dim: 128
-      num_layers: 1
-      dropout: 0.1
-    embedding:
-      diag_dim: 128
-      proc_dim: 128
-      drug_dim: 128
-      lab_dim: 64
-      vital_dim: 64
-      time_dim: 32
-    history_selector:
-      self_top_k: 3
-  fast:
-    model:
-      hidden_dim: 96
-      num_layers: 1
-      dropout: 0.1
-    embedding:
-      diag_dim: 96
-      proc_dim: 96
-      drug_dim: 96
-      lab_dim: 48
-      vital_dim: 48
-      time_dim: 16
-    history_selector:
-      self_top_k: 2

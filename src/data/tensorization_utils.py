@@ -1,76 +1,15 @@
 from __future__ import annotations
 
-"""Legacy trajectory dataset fallback for non-tensorized loading paths."""
+"""Shared tensorization helpers for the canonical patient-visit-prefix benchmark."""
 
-from bisect import bisect_right
-from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Mapping
 
 import torch
-from torch.utils.data import Dataset
 
-from src.data.build_vocab import load_vocab_bundle
-from src.data.tensorization_utils import (
-    _augment_record as _tensor_augment_record,
-    _load_optional_ddi_tensors as _tensor_load_optional_ddi_tensors,
-    _resolve_record_int as _tensor_resolve_record_int,
-    _validate_collated_batch as _tensor_validate_collated_batch,
-    collate_batch as _tensor_collate_batch,
-)
-from src.utils.io import iter_jsonl_gz, load_pt, load_yaml_config, parse_datetime, read_json, resolve_path
+from src.utils.io import load_pt, parse_datetime, resolve_path
 
-_SPLIT_NAMES = ("train", "val", "test")
 _STATIC_BATCH_TENSOR_KEYS = ("ddi_adj", "ddi_severity_adj")
-
-
-def _resolve_max_open_shards(config: Mapping[str, Any]) -> int:
-    spark_cfg = config.get("spark", {})
-    if isinstance(spark_cfg, dict) and spark_cfg.get("max_open_shards_per_dataset") is not None:
-        return int(spark_cfg["max_open_shards_per_dataset"])
-    return 8
-
-
-def _processed_root(config: Mapping[str, Any]) -> Path:
-    return resolve_path(config["_project_root"], config["paths"]["processed_root"])
-
-
-def _trajectory_root_candidates(config: Mapping[str, Any]) -> list[Path]:
-    candidates: list[Path] = []
-    trajectory_interim_root = config.get("paths", {}).get("trajectory_interim_root")
-    if trajectory_interim_root:
-        candidates.append(Path(resolve_path(config["_project_root"], trajectory_interim_root)))
-    interim_root = config.get("paths", {}).get("interim_root")
-    if interim_root:
-        candidates.append(Path(resolve_path(config["_project_root"], interim_root)) / "trajectories")
-
-    processed_root = _processed_root(config)
-    candidates.append(processed_root)
-    candidates.append(processed_root / "trajectories")
-
-    deduped: list[Path] = []
-    seen: set[Path] = set()
-    for candidate in candidates:
-        if candidate in seen:
-            continue
-        seen.add(candidate)
-        deduped.append(candidate)
-    return deduped
-
-
-def _manifest_candidates(config: Mapping[str, Any]) -> list[Path]:
-    return [candidate / "manifest.json" for candidate in _trajectory_root_candidates(config)]
-
-
-def _legacy_trajectory_candidates(config: Mapping[str, Any], split: str) -> list[Path]:
-    return [candidate / split / "trajectories.jsonl.gz" for candidate in _trajectory_root_candidates(config)]
-
-
-def _metadata_candidates(parquet_root: Path) -> list[Path]:
-    return [
-        parquet_root / "metadata.json",
-        parquet_root.parent / "metadata.json",
-    ]
 
 
 def _ddi_payload_path_from_config(config: Mapping[str, Any]) -> Path | None:
@@ -105,11 +44,13 @@ def _normalize_ddi_tensor(
     return resolved
 
 
-def _load_optional_ddi_tensors(
+def load_optional_ddi_tensors(
     config: Mapping[str, Any],
     *,
     expected_drug_vocab_size: int,
 ) -> dict[str, torch.Tensor]:
+    """Load the optional benchmark DDI tensors and validate their shapes."""
+
     ddi_payload_path = _ddi_payload_path_from_config(config)
     if ddi_payload_path is None or not ddi_payload_path.exists():
         return {}
@@ -138,60 +79,6 @@ def _load_optional_ddi_tensors(
     return tensors
 
 
-def _cohort_split_dir_candidates(config: Mapping[str, Any]) -> list[Path]:
-    project_root = config["_project_root"]
-    candidates: list[Path] = []
-    cohort_root = config.get("paths", {}).get("cohort_root")
-    if cohort_root:
-        candidates.append(Path(resolve_path(project_root, cohort_root)) / "splits")
-    interim_root = config.get("paths", {}).get("interim_root")
-    if interim_root:
-        candidates.append(Path(resolve_path(project_root, interim_root)) / "cohort" / "splits")
-    return candidates
-
-
-def load_split_subject_ids(config_path: str | Path | Mapping[str, Any]) -> dict[str, set[int]]:
-    config = config_path if isinstance(config_path, Mapping) else load_yaml_config(config_path)
-    split_dir = next((path for path in _cohort_split_dir_candidates(config) if path.exists()), None)
-    if split_dir is None:
-        return {}
-
-    split_subject_ids: dict[str, set[int]] = {}
-    for split_name in _SPLIT_NAMES:
-        split_path = split_dir / f"{split_name}_subject_ids.json"
-        if not split_path.exists():
-            split_subject_ids[split_name] = set()
-            continue
-        split_subject_ids[split_name] = {int(value) for value in read_json(split_path)}
-    return split_subject_ids
-
-
-def validate_patient_level_splits(config_path: str | Path | Mapping[str, Any]) -> dict[str, Any]:
-    config = config_path if isinstance(config_path, Mapping) else load_yaml_config(config_path)
-    split_subject_ids = load_split_subject_ids(config)
-    if not split_subject_ids:
-        return {"validated": False, "reason": "split_subject_ids_missing"}
-
-    overlaps: dict[str, list[int]] = {}
-    for index, left_split in enumerate(_SPLIT_NAMES):
-        left_ids = split_subject_ids.get(left_split, set())
-        for right_split in _SPLIT_NAMES[index + 1 :]:
-            shared_ids = sorted(left_ids.intersection(split_subject_ids.get(right_split, set())))
-            if shared_ids:
-                overlaps[f"{left_split}:{right_split}"] = shared_ids[:10]
-
-    if overlaps:
-        raise ValueError(
-            "Patient-level split leakage detected across split subject manifests: "
-            f"{overlaps}"
-        )
-
-    return {
-        "validated": True,
-        "counts": {split_name: len(split_subject_ids.get(split_name, set())) for split_name in _SPLIT_NAMES},
-    }
-
-
 def _infer_feature_size(
     record: Mapping[str, Any],
     *,
@@ -210,13 +97,15 @@ def _infer_feature_size(
     )
 
 
-def _augment_record(
+def augment_record(
     record: Mapping[str, Any],
     *,
     drug_vocab_size: int,
     default_lab_feature_size: int = 0,
     default_vital_feature_size: int = 0,
 ) -> dict[str, Any]:
+    """Normalize one trajectory record before collation or tensor export."""
+
     resolved = dict(record)
     steps = [dict(step) for step in resolved.get("steps", [])]
     resolved["steps"] = steps
@@ -232,8 +121,6 @@ def _augment_record(
     )
     resolved["visit_index"] = visit_index
     resolved["visit_position"] = visit_position
-    # history_length is inclusive of the current visit so subgrouping can use
-    # direct visit counts such as <=2 visits vs >2 visits.
     resolved["history_length"] = int(resolved.get("history_length", visit_position))
     resolved["lab_feature_size"] = _infer_feature_size(
         resolved,
@@ -283,7 +170,38 @@ def _assert_finite_tensor(name: str, value: torch.Tensor) -> None:
             raise ValueError(f"Batch tensor `{name}` contains non-finite values")
 
 
-def _validate_collated_batch(batch: Mapping[str, Any]) -> None:
+def _record_keys_for_error(record: Mapping[str, Any]) -> list[str]:
+    return sorted(str(key) for key in record.keys())
+
+
+def _resolve_record_int(
+    record: Mapping[str, Any],
+    *,
+    candidate_keys: tuple[str, ...],
+    field_label: str,
+) -> int:
+    for candidate_key in candidate_keys:
+        if candidate_key not in record:
+            continue
+        value = record.get(candidate_key)
+        if value is None:
+            continue
+        try:
+            return int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Record field `{candidate_key}` for {field_label} must be int-like, "
+                f"got {value!r}; keys={_record_keys_for_error(record)}"
+            ) from exc
+    raise KeyError(
+        f"Missing {field_label} in record; checked {list(candidate_keys)}; "
+        f"keys={_record_keys_for_error(record)}"
+    )
+
+
+def validate_collated_batch(batch: Mapping[str, Any]) -> None:
+    """Check tensorized or freshly-collated batches for shape/value issues."""
+
     visit_mask = batch.get("visit_mask")
     if not isinstance(visit_mask, torch.Tensor):
         raise TypeError("Collated batch is missing tensor field `visit_mask`.")
@@ -380,164 +298,6 @@ def _validate_collated_batch(batch: Mapping[str, Any]) -> None:
             raise ValueError(f"{key} must contain {batch_size} entries, got {len(value)}")
 
 
-class MIMICTrajectoryDataset(Dataset):
-    def __init__(self, split: str, config_path: str | Path) -> None:
-        self.config = load_yaml_config(config_path)
-        self.split = str(split)
-        self.vocab_bundle = load_vocab_bundle(self.config)
-        self.drug_vocab_size = len(self.vocab_bundle["med_main"]["idx_to_token"])
-        self.ddi_tensors = _load_optional_ddi_tensors(
-            self.config,
-            expected_drug_vocab_size=self.drug_vocab_size,
-        )
-        self.max_open_shards = _resolve_max_open_shards(self.config)
-
-        self._storage_mode = "jsonl_legacy"
-        self._parquet_root: Path | None = None
-        self.records: list[dict[str, Any]] = []
-        self.shards: list[dict[str, Any]] = []
-        self.cumulative_rows: list[int] = []
-        self._shard_cache: OrderedDict[int, list[dict[str, Any]]] = OrderedDict()
-        self.default_lab_feature_size = 0
-        self.default_vital_feature_size = 0
-
-        manifest_path = next((path for path in _manifest_candidates(self.config) if path.exists()), None)
-        if manifest_path is not None:
-            self._init_from_manifest(manifest_path)
-            return
-
-        legacy_path = next((path for path in _legacy_trajectory_candidates(self.config, self.split) if path.exists()), None)
-        if legacy_path is not None:
-            self.records = [
-                _augment_record(
-                    record,
-                    drug_vocab_size=self.drug_vocab_size,
-                    default_lab_feature_size=self.default_lab_feature_size,
-                    default_vital_feature_size=self.default_vital_feature_size,
-                )
-                for record in iter_jsonl_gz(legacy_path)
-            ]
-            return
-
-        checked = [
-            *[str(path) for path in _manifest_candidates(self.config)],
-            *[str(path) for path in _legacy_trajectory_candidates(self.config, self.split)],
-        ]
-        raise FileNotFoundError(
-            "Neither legacy parquet manifest nor legacy trajectory file exists. "
-            f"Checked: {checked}"
-        )
-
-    @property
-    def storage_mode(self) -> str:
-        return self._storage_mode
-
-    @property
-    def num_shards(self) -> int:
-        return len(self.shards)
-
-    def _init_from_manifest(self, manifest_path: Path) -> None:
-        manifest = read_json(manifest_path)
-        split_payload = manifest.get("splits", {}).get(self.split)
-        if split_payload is None:
-            raise FileNotFoundError(
-                f"Split `{self.split}` is missing from trajectory manifest {manifest_path}."
-            )
-
-        self._storage_mode = "parquet_legacy"
-        self._parquet_root = manifest_path.parent
-        self._load_metadata_defaults(self._parquet_root)
-
-        total = 0
-        for shard in split_payload.get("shards", []):
-            shard_path = self._parquet_root / shard["path"]
-            rows = int(shard["rows"])
-            self.shards.append({"path": shard_path, "rows": rows})
-            total += rows
-            self.cumulative_rows.append(total)
-
-    def _load_metadata_defaults(self, parquet_root: Path) -> None:
-        metadata_path = next((path for path in _metadata_candidates(parquet_root) if path.exists()), None)
-        if metadata_path is None:
-            return
-        metadata = read_json(metadata_path)
-        self.default_lab_feature_size = int(metadata.get("lab_feature_size", 0))
-        self.default_vital_feature_size = int(metadata.get("vital_feature_size", 0))
-
-    def __len__(self) -> int:
-        if self._storage_mode == "parquet_legacy":
-            return self.cumulative_rows[-1] if self.cumulative_rows else 0
-        return len(self.records)
-
-    def _touch_cached_shard(self, shard_index: int) -> list[dict[str, Any]] | None:
-        cached_rows = self._shard_cache.pop(shard_index, None)
-        if cached_rows is not None:
-            self._shard_cache[shard_index] = cached_rows
-        return cached_rows
-
-    def _store_cached_shard(self, shard_index: int, rows: list[dict[str, Any]]) -> None:
-        self._shard_cache[shard_index] = rows
-        while len(self._shard_cache) > self.max_open_shards:
-            self._shard_cache.popitem(last=False)
-
-    def _load_shard(self, shard_index: int) -> list[dict[str, Any]]:
-        cached_rows = self._touch_cached_shard(shard_index)
-        if cached_rows is not None:
-            return cached_rows
-        try:
-            import pyarrow.parquet as pq
-        except ImportError as exc:
-            raise RuntimeError(
-                "pyarrow is required for parquet trajectory loading. Install requirements.txt first."
-            ) from exc
-
-        shard = self.shards[shard_index]
-        shard_path = Path(shard["path"])
-        if not shard_path.exists():
-            raise FileNotFoundError(
-                f"Trajectory shard for split `{self.split}` is missing: {shard_path}"
-            )
-
-        # A cache miss is expensive: decode the full parquet shard, convert it to
-        # Python rows, augment the rows once, then keep the augmented shard in the
-        # LRU cache so later random accesses avoid re-reading parquet entirely.
-        raw_rows = pq.read_table(shard_path, use_threads=True).to_pylist()
-        rows = [
-            _augment_record(
-                row,
-                drug_vocab_size=self.drug_vocab_size,
-                default_lab_feature_size=self.default_lab_feature_size,
-                default_vital_feature_size=self.default_vital_feature_size,
-            )
-            for row in raw_rows
-        ]
-        if len(rows) != int(shard["rows"]):
-            raise RuntimeError(
-                f"Trajectory shard row count mismatch for split `{self.split}` at {shard_path}: "
-                f"manifest={shard['rows']} actual={len(rows)}"
-            )
-        self._store_cached_shard(shard_index, rows)
-        return rows
-
-    def __getitem__(self, index: int) -> dict[str, Any]:
-        if self._storage_mode == "jsonl_legacy":
-            record = dict(self.records[index])
-            if self.ddi_tensors:
-                record.update(self.ddi_tensors)
-            return record
-
-        if index < 0 or index >= len(self):
-            raise IndexError(index)
-        shard_index = bisect_right(self.cumulative_rows, index)
-        shard_start = 0 if shard_index == 0 else self.cumulative_rows[shard_index - 1]
-        local_index = index - shard_start
-        rows = self._load_shard(shard_index)
-        record = dict(rows[local_index])
-        if self.ddi_tensors:
-            record.update(self.ddi_tensors)
-        return record
-
-
 def _write_id_sequence(
     target: torch.Tensor,
     mask: torch.Tensor,
@@ -592,9 +352,7 @@ def _build_absolute_visit_times(
     if intime_dt is None:
         return absolute_hours, absolute_mask
 
-    # Retrieval can use these per-visit absolute times to block future visits
-    # across patients. When they are unavailable we fall back to same-patient
-    # visit ordering only and report that weaker policy explicitly.
+    # Absolute visit timestamps remain optional auxiliary chronology signals.
     base_hours = float(intime_dt.timestamp() / 3600.0)
     cumulative_hours = 0.0
     for step_index, step in enumerate(steps):
@@ -606,6 +364,8 @@ def _build_absolute_visit_times(
 
 
 def collate_batch(records: list[dict[str, Any]]) -> dict[str, Any]:
+    """Collate canonical trajectory records into the dense batch API used by the model."""
+
     if not records:
         raise ValueError("collate_batch requires at least one record")
 
@@ -637,28 +397,28 @@ def collate_batch(records: list[dict[str, Any]]) -> dict[str, Any]:
             )
         record_steps.append(steps)
         patient_ids.append(
-            _tensor_resolve_record_int(
+            _resolve_record_int(
                 record,
                 candidate_keys=("patient_id", "subject_id"),
                 field_label="patient identifier (`patient_id` or `subject_id`)",
             )
         )
         subject_ids.append(
-            _tensor_resolve_record_int(
+            _resolve_record_int(
                 record,
                 candidate_keys=("subject_id", "patient_id"),
                 field_label="subject identifier (`subject_id` or `patient_id`)",
             )
         )
         hadm_ids.append(
-            _tensor_resolve_record_int(
+            _resolve_record_int(
                 record,
                 candidate_keys=("hadm_id",),
                 field_label="hospital admission identifier `hadm_id`",
             )
         )
         stay_ids.append(
-            _tensor_resolve_record_int(
+            _resolve_record_int(
                 record,
                 candidate_keys=("stay_id",),
                 field_label="ICU stay identifier `stay_id`",
@@ -838,14 +598,21 @@ def collate_batch(records: list[dict[str, Any]]) -> dict[str, Any]:
         value = _resolve_shared_static_tensor(records, key)
         if value is not None:
             batch[key] = value
-    _validate_collated_batch(batch)
+    validate_collated_batch(batch)
     return batch
 
 
-# Canonical tensorization helpers now live in `src.data.tensorization_utils`.
-# Re-export them here so older runtime code can keep importing from `dataset.py`
-# while the mainline benchmark no longer depends on this module.
-_augment_record = _tensor_augment_record
-_load_optional_ddi_tensors = _tensor_load_optional_ddi_tensors
-_validate_collated_batch = _tensor_validate_collated_batch
-collate_batch = _tensor_collate_batch
+_augment_record = augment_record
+_load_optional_ddi_tensors = load_optional_ddi_tensors
+_validate_collated_batch = validate_collated_batch
+
+
+__all__ = [
+    "augment_record",
+    "collate_batch",
+    "load_optional_ddi_tensors",
+    "validate_collated_batch",
+    "_augment_record",
+    "_load_optional_ddi_tensors",
+    "_validate_collated_batch",
+]

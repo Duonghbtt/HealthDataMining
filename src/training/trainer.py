@@ -1,13 +1,9 @@
 from __future__ import annotations
 
-import contextlib
-import copy
-import inspect
-import itertools
+import csv
 import json
 import time
-import warnings
-from dataclasses import dataclass
+from collections.abc import Mapping as MappingABC, Sequence
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -16,83 +12,50 @@ from torch import nn
 from torch.optim import Optimizer
 from torch.utils.data import DataLoader
 
+from src.evaluation.metrics import compute_core_metrics
+from src.training.losses import extract_last_valid_targets
+
+try:
+    from tqdm.auto import tqdm
+except ImportError:  # pragma: no cover - optional progress dependency
+    def tqdm(iterable, *args, **kwargs):
+        return iterable
+
 from src.utils.io import ensure_dir
 
 
-_LOSS_KEYS = ("total_loss", "prediction_loss", "ddi_loss", "weighted_ddi_loss")
-_TIMING_KEYS = (
-    "data_time",
-    "transfer_time",
-    "forward_time",
-    "loss_time",
-    "backward_time",
-    "optimizer_time",
-    "step_time",
-    "samples_per_sec",
+_LOSS_KEYS = (
+    "total_loss",
+    "prediction_loss",
+    "pred_bce_loss",
+    "margin_loss",
+    "weighted_margin_loss",
+    "ddi_loss",
+    "weighted_ddi_loss",
+    "lambda_ddi_current",
 )
-_KEEP_CPU_BATCH_KEYS = frozenset({"visit_lengths"})
-_BATCH_FINITE_CHECK_KEYS = ("lab_values", "vital_values", "time_delta_hours")
-_OUTPUT_FINITE_CHECK_KEYS = ("pooled_state", "fused_repr", "drug_logits", "drug_probs")
-_FUSION_SCALAR_DIAGNOSTICS = (
-    "normalized_branch_entropy",
-    "dominant_branch_weight",
-    "branch_balance_score",
-    "branch_collapse_flag",
-    "current_self_current_weight",
-    "current_self_history_weight",
-    "residual_update_norm",
+_TIME_KEYS = ("data_time", "step_time")
+_GRAD_KEYS = ("grad_norm", "clipped_grad_norm")
+_CODE_EMBEDDING_SPECS = (
+    {
+        "label": "diagnosis",
+        "parameter_name": "encoder.diagnosis_encoder.embedding.weight",
+        "batch_key": "diag_codes",
+        "mask_key": "diag_mask",
+    },
+    {
+        "label": "procedure",
+        "parameter_name": "encoder.procedure_encoder.embedding.weight",
+        "batch_key": "proc_codes",
+        "mask_key": "proc_mask",
+    },
+    {
+        "label": "medication_history",
+        "parameter_name": "encoder.medication_history_encoder.embedding.weight",
+        "batch_key": "med_history",
+        "mask_key": "med_history_mask",
+    },
 )
-
-
-@dataclass(frozen=True)
-class PrecisionPolicy:
-    requested_amp: bool
-    resolved_precision: str
-    use_autocast: bool
-    autocast_dtype: torch.dtype | None
-    grad_scaler_enabled: bool
-    warning_message: str | None = None
-
-
-def _cuda_bfloat16_supported() -> bool:
-    support_check = getattr(torch.cuda, "is_bf16_supported", None)
-    if support_check is None:
-        return False
-    try:
-        return bool(support_check())
-    except Exception:
-        return False
-
-
-def resolve_precision_policy(*, requested_amp: bool, device: torch.device) -> PrecisionPolicy:
-    resolved_requested_amp = bool(requested_amp)
-    if not resolved_requested_amp or device.type != "cuda":
-        return PrecisionPolicy(
-            requested_amp=resolved_requested_amp,
-            resolved_precision="fp32",
-            use_autocast=False,
-            autocast_dtype=None,
-            grad_scaler_enabled=False,
-        )
-    if _cuda_bfloat16_supported():
-        return PrecisionPolicy(
-            requested_amp=True,
-            resolved_precision="bf16",
-            use_autocast=True,
-            autocast_dtype=torch.bfloat16,
-            grad_scaler_enabled=False,
-        )
-    return PrecisionPolicy(
-        requested_amp=True,
-        resolved_precision="fp32",
-        use_autocast=False,
-        autocast_dtype=None,
-        grad_scaler_enabled=False,
-        warning_message=(
-            "AMP was requested on CUDA, but bfloat16 autocast is not supported on this device; "
-            "falling back to float32 for stability."
-        ),
-    )
 
 
 def _to_float(value: Any) -> float:
@@ -103,115 +66,258 @@ def _to_float(value: Any) -> float:
     return float(value)
 
 
-def _move_batch_to_device(
-    batch: Mapping[str, Any],
-    device: torch.device,
-    *,
-    non_blocking: bool = False,
-    keep_cpu_keys: set[str] | frozenset[str] | None = None,
-) -> dict[str, Any]:
-    resolved_keep_cpu_keys = _KEEP_CPU_BATCH_KEYS if keep_cpu_keys is None else keep_cpu_keys
+def _move_batch_to_device(batch: Mapping[str, Any], device: torch.device) -> dict[str, Any]:
     return {
-        key: (
-            value
-            if key in resolved_keep_cpu_keys
-            else value.to(device, non_blocking=non_blocking)
-        )
-        if isinstance(value, torch.Tensor)
-        else value
+        key: value.to(device) if isinstance(value, torch.Tensor) else value
         for key, value in batch.items()
     }
 
 
-def _resolve_target_tensor(batch: Mapping[str, Any]) -> torch.Tensor:
-    target = batch.get("final_target_drugs")
-    if isinstance(target, torch.Tensor):
-        return target
-    target = batch.get("target_drugs")
-    if isinstance(target, torch.Tensor):
-        return target
-    raise KeyError("Batch must contain either `final_target_drugs` or `target_drugs`.")
+def _synchronize_device(device: torch.device) -> None:
+    if device.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.synchronize(device)
 
 
-def _accumulate_fusion_diagnostics(
-    totals: dict[str, float],
+def _log_line(message: str) -> None:
+    writer = getattr(tqdm, "write", None)
+    if callable(writer):
+        writer(message)
+        return
+    print(message)
+
+
+def _resolve_loss_output(
     outputs: Mapping[str, Any],
     *,
-    batch_size: int,
-) -> None:
-    fusion_weights = outputs.get("fusion_weights")
-    branch_order = outputs.get("branch_order")
-    if isinstance(fusion_weights, torch.Tensor) and isinstance(branch_order, list):
-        detached_weights = fusion_weights.detach().to(dtype=torch.float32)
-        if detached_weights.ndim == 2 and detached_weights.shape[1] == len(branch_order):
-            branch_means = detached_weights.mean(dim=0)
-            for branch_index, branch_name in enumerate(branch_order):
-                totals[f"fusion_weight_{branch_name}"] = totals.get(
-                    f"fusion_weight_{branch_name}",
-                    0.0,
-                ) + float(branch_means[branch_index].cpu().item()) * batch_size
+    key: str,
+    fallback_key: str | None = None,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    value = outputs.get(key)
+    if value is None and fallback_key is not None:
+        value = outputs.get(fallback_key)
+    if value is None:
+        return torch.zeros((), device=device, dtype=dtype)
+    return torch.as_tensor(value, device=device, dtype=dtype)
 
-    for key in _FUSION_SCALAR_DIAGNOSTICS:
-        value = outputs.get(key)
-        if not isinstance(value, torch.Tensor) or value.numel() <= 0:
+
+def _tensor_debug_summary(name: str, value: torch.Tensor) -> str:
+    resolved = value.detach()
+    shape = tuple(resolved.shape)
+    dtype = resolved.dtype
+    if resolved.numel() == 0:
+        return f"{name}: shape={shape} dtype={dtype} numel=0"
+    if not (resolved.is_floating_point() or resolved.is_complex()):
+        return (
+            f"{name}: shape={shape} dtype={dtype} "
+            f"min={resolved.min().item()} max={resolved.max().item()}"
+        )
+    nan_count = int(torch.isnan(resolved).sum().item())
+    inf_count = int(torch.isinf(resolved).sum().item())
+    finite = resolved[torch.isfinite(resolved)]
+    if finite.numel() == 0:
+        return (
+            f"{name}: shape={shape} dtype={dtype} nan_count={nan_count} "
+            f"inf_count={inf_count} finite_values=0"
+        )
+    return (
+        f"{name}: shape={shape} dtype={dtype} nan_count={nan_count} "
+        f"inf_count={inf_count} min={finite.min().item():.6g} "
+        f"max={finite.max().item():.6g} mean={finite.mean().item():.6g}"
+    )
+
+
+def assert_finite(name: str, value: torch.Tensor) -> None:
+    if value.is_floating_point() or value.is_complex():
+        if not torch.isfinite(value).all():
+            raise ValueError(
+                f"Non-finite tensor detected at `{name}`; {_tensor_debug_summary(name, value)}"
+            )
+
+
+def _assert_finite_tree(prefix: str, value: Any) -> None:
+    if isinstance(value, torch.Tensor):
+        assert_finite(prefix, value)
+        return
+    if isinstance(value, MappingABC):
+        for key, child in value.items():
+            _assert_finite_tree(f"{prefix}.{key}", child)
+        return
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        for index, child in enumerate(value):
+            _assert_finite_tree(f"{prefix}[{index}]", child)
+
+
+def _get_named_parameter(model: nn.Module, parameter_name: str) -> nn.Parameter | None:
+    for name, parameter in model.named_parameters():
+        if name == parameter_name:
+            return parameter
+    return None
+
+
+def _assert_finite_gradients(model: nn.Module) -> None:
+    first_nonfinite_name: str | None = None
+    first_nonfinite_grad: torch.Tensor | None = None
+    for name, parameter in model.named_parameters():
+        grad = parameter.grad
+        if grad is None:
             continue
-        detached_value = value.detach().to(dtype=torch.float32)
-        totals[f"fusion_{key}"] = totals.get(f"fusion_{key}", 0.0) + (
-            float(detached_value.mean().cpu().item()) * batch_size
+        if grad.is_floating_point() or grad.is_complex():
+            if not torch.isfinite(grad).all():
+                first_nonfinite_name = f"gradients.{name}"
+                first_nonfinite_grad = grad
+                break
+    if first_nonfinite_name is not None:
+        finite_global_norm = _compute_global_grad_norm(model, finite_only=True)
+        extra_context = ""
+        if finite_global_norm is not None:
+            extra_context = f" finite_global_grad_norm={finite_global_norm:.6f}"
+        raise ValueError(
+            f"Non-finite gradients detected; first offending parameter=`{first_nonfinite_name}`."
+            f"{extra_context} {_tensor_debug_summary(first_nonfinite_name, first_nonfinite_grad)}"
         )
 
 
-def _accumulate_retrieval_diagnostics(
-    totals: dict[str, float],
-    outputs: Mapping[str, Any],
+def _compute_global_grad_norm(model: nn.Module, *, finite_only: bool = False) -> float | None:
+    total_sq_norm = 0.0
+    saw_gradient = False
+    for _, parameter in model.named_parameters():
+        grad = parameter.grad
+        if grad is None:
+            continue
+        if not (grad.is_floating_point() or grad.is_complex()):
+            continue
+        resolved_grad = grad.detach()
+        if finite_only:
+            finite_grad = resolved_grad[torch.isfinite(resolved_grad)]
+            if finite_grad.numel() == 0:
+                continue
+            grad_norm = torch.linalg.vector_norm(finite_grad)
+        else:
+            if not torch.isfinite(resolved_grad).all():
+                return None
+            grad_norm = torch.linalg.vector_norm(resolved_grad)
+        total_sq_norm += float(grad_norm.item()) ** 2
+        saw_gradient = True
+    if not saw_gradient:
+        return 0.0
+    return total_sq_norm ** 0.5
+
+
+def _count_valid_code_tokens(
+    batch: Mapping[str, Any] | None,
     *,
-    batch_size: int,
-) -> None:
-    retrieval_used = bool(outputs.get("retrieval_used", False))
-    totals["retrieval_active"] = totals.get("retrieval_active", 0.0) + float(retrieval_used) * batch_size
-    payload = outputs.get("retrieval_payload")
-    if isinstance(payload, Mapping):
-        neighbor_indices = payload.get("neighbor_indices")
-        neighbor_scores = payload.get("neighbor_scores")
-        if isinstance(neighbor_indices, torch.Tensor):
-            mask = neighbor_indices >= 0
-            row_valid = mask.any(dim=1) if mask.ndim == 2 else torch.zeros(batch_size, dtype=torch.bool)
-            totals["retrieval_valid_neighbor_rate"] = totals.get("retrieval_valid_neighbor_rate", 0.0) + (
-                float(row_valid.to(dtype=torch.float32).mean().cpu().item()) * batch_size
-            )
-            totals["retrieval_empty_neighbor_rate"] = totals.get("retrieval_empty_neighbor_rate", 0.0) + (
-                float((~row_valid).to(dtype=torch.float32).mean().cpu().item()) * batch_size
-            )
-            if mask.ndim == 2:
-                totals["retrieval_top_k"] = totals.get("retrieval_top_k", 0.0) + float(mask.shape[1]) * batch_size
-        if isinstance(neighbor_scores, torch.Tensor):
-            finite_scores = neighbor_scores.detach().to(dtype=torch.float32)
-            finite_scores = finite_scores[torch.isfinite(finite_scores)]
-            if finite_scores.numel() > 0:
-                totals["retrieval_mean_similarity"] = totals.get("retrieval_mean_similarity", 0.0) + (
-                    float(finite_scores.mean().cpu().item()) * batch_size
-                )
-                totals["retrieval_max_similarity"] = totals.get("retrieval_max_similarity", 0.0) + (
-                    float(finite_scores.max().cpu().item()) * batch_size
-                )
-                totals["retrieval_min_similarity"] = totals.get("retrieval_min_similarity", 0.0) + (
-                    float(finite_scores.min().cpu().item()) * batch_size
-                )
-    neighbor_context = outputs.get("neighbor_history_context")
-    if isinstance(neighbor_context, torch.Tensor) and neighbor_context.numel() > 0:
-        totals["neighbor_evidence_norm"] = totals.get("neighbor_evidence_norm", 0.0) + (
-            float(neighbor_context.detach().to(dtype=torch.float32).norm(dim=-1).mean().cpu().item()) * batch_size
+    batch_key: str,
+    mask_key: str,
+) -> int:
+    if batch is None:
+        return 0
+    code_tensor = batch.get(batch_key)
+    if not isinstance(code_tensor, torch.Tensor):
+        return 0
+    code_mask = batch.get(mask_key)
+    if isinstance(code_mask, torch.Tensor) and tuple(code_mask.shape) == tuple(code_tensor.shape):
+        resolved_mask = code_mask.to(device=code_tensor.device, dtype=torch.bool)
+    elif code_tensor.dtype.is_floating_point:
+        resolved_mask = code_tensor > 0
+    else:
+        resolved_mask = code_tensor.ne(0)
+    return int(resolved_mask.sum().item())
+
+
+def _resolve_debug_check_now(
+    *,
+    enabled: bool,
+    light_mode: bool,
+    check_every_n_steps: int,
+    step_index: int,
+) -> bool:
+    if not enabled:
+        return False
+    if not light_mode:
+        return True
+    resolved_every = max(int(check_every_n_steps), 1)
+    return int(step_index) == 1 or int(step_index) % resolved_every == 0
+
+
+def _sanitize_code_embedding_gradients(
+    model: nn.Module,
+    *,
+    batch: Mapping[str, Any] | None,
+    max_norm: float | None,
+    phase: str,
+    epoch: int,
+    step: int,
+) -> dict[str, dict[str, float | int | bool]]:
+    reports: dict[str, dict[str, float | int | bool]] = {}
+    for spec in _CODE_EMBEDDING_SPECS:
+        label = str(spec["label"])
+        parameter_name = str(spec["parameter_name"])
+        valid_code_tokens = _count_valid_code_tokens(
+            batch,
+            batch_key=str(spec["batch_key"]),
+            mask_key=str(spec["mask_key"]),
         )
+        parameter = _get_named_parameter(model, parameter_name)
+        if parameter is None or parameter.grad is None:
+            reports[label] = {
+                "had_nonfinite": False,
+                "pre_clip_norm": 0.0,
+                "post_clip_norm": 0.0,
+                "valid_code_tokens": valid_code_tokens,
+            }
+            continue
+        grad = parameter.grad
+        if not (grad.is_floating_point() or grad.is_complex()):
+            reports[label] = {
+                "had_nonfinite": False,
+                "pre_clip_norm": 0.0,
+                "post_clip_norm": 0.0,
+                "valid_code_tokens": valid_code_tokens,
+            }
+            continue
+
+        raw_grad = grad.detach().clone()
+        had_nonfinite = not torch.isfinite(raw_grad).all()
+        if had_nonfinite:
+            sanitized_grad = torch.nan_to_num(raw_grad, nan=0.0, posinf=0.0, neginf=0.0)
+            parameter.grad.copy_(sanitized_grad)
+        working_grad = parameter.grad.detach()
+        pre_clip_norm = (
+            float(torch.linalg.vector_norm(working_grad).item()) if working_grad.numel() > 0 else 0.0
+        )
+        if max_norm is not None and float(max_norm) > 0.0 and pre_clip_norm > float(max_norm):
+            clip_scale = float(max_norm) / max(pre_clip_norm, 1.0e-12)
+            parameter.grad.mul_(clip_scale)
+            working_grad = parameter.grad.detach()
+        post_clip_norm = (
+            float(torch.linalg.vector_norm(working_grad).item()) if working_grad.numel() > 0 else 0.0
+        )
+        if had_nonfinite:
+            _log_line(
+                "[code-embedding-grad-sanitize] "
+                f"branch={label} phase={phase} epoch={epoch} step={step} "
+                f"valid_code_tokens={valid_code_tokens} "
+                f"raw={_tensor_debug_summary(parameter_name, raw_grad)} "
+                f"post_clip_norm={post_clip_norm:.6f}"
+            )
+        reports[label] = {
+            "had_nonfinite": had_nonfinite,
+            "pre_clip_norm": pre_clip_norm,
+            "post_clip_norm": post_clip_norm,
+            "valid_code_tokens": valid_code_tokens,
+        }
+    return reports
 
 
 class Trainer:
-    """Minimal trainer for stable core-model optimization."""
+    """Trainer for the self-history-only core pipeline."""
 
     def __init__(
         self,
         *,
         model: nn.Module,
-        loss_fn: nn.Module,
         optimizer: Optimizer,
         device: torch.device,
         checkpoint_dir: str | Path,
@@ -220,587 +326,418 @@ class Trainer:
         monitor_metric: str = "val_total_loss",
         monitor_mode: str = "min",
         decoder_top_k: int | None = None,
-        run_context: Mapping[str, Any] | None = None,
-        amp: bool = False,
-        grad_accum_steps: int = 1,
-        max_grad_norm: float | None = None,
-        non_blocking_transfer: bool = False,
-        log_interval: int = 50,
-        profile_steps: int | None = None,
-        early_stopping_patience: int | None = None,
-        timing_enabled: bool = True,
-        detailed_timing: bool = False,
+        loss_fn: nn.Module | None = None,
+        validation_threshold: float = 0.5,
+        use_self_history: bool = True,
+        use_ddi: bool = True,
+        max_train_batches: int | None = None,
+        max_val_batches: int | None = None,
+        max_grad_norm: float | None = 1.0,
+        sanitize_code_embedding_grads: bool = True,
+        code_embedding_grad_max_norm: float | None = 0.5,
+        freeze_code_embedding_epochs: int = 1,
+        debug_checks_enabled: bool = True,
+        debug_checks_light_mode: bool = True,
+        debug_check_every_n_steps: int = 100,
+        sync_timing: bool = False,
     ) -> None:
         if monitor_mode not in {"min", "max"}:
             raise ValueError(f"monitor_mode must be 'min' or 'max', got {monitor_mode!r}")
-        if int(grad_accum_steps) <= 0:
-            raise ValueError(f"grad_accum_steps must be positive, got {grad_accum_steps!r}")
-        if max_grad_norm is not None and float(max_grad_norm) <= 0.0:
-            raise ValueError(f"max_grad_norm must be positive when provided, got {max_grad_norm!r}")
-        if int(log_interval) <= 0:
-            raise ValueError(f"log_interval must be positive, got {log_interval!r}")
-        if profile_steps is not None and int(profile_steps) <= 0:
-            raise ValueError(f"profile_steps must be positive when provided, got {profile_steps!r}")
-        if early_stopping_patience is not None and int(early_stopping_patience) <= 0:
-            raise ValueError(
-                "early_stopping_patience must be positive when provided, "
-                f"got {early_stopping_patience!r}"
-            )
+        if not 0.0 <= float(validation_threshold) <= 1.0:
+            raise ValueError(f"validation_threshold must be in [0, 1], got {validation_threshold!r}")
 
         self.model = model.to(device)
-        self.loss_fn = loss_fn.to(device) if isinstance(loss_fn, nn.Module) else loss_fn
         self.optimizer = optimizer
         self.scheduler = scheduler
         self.device = device
         self.monitor_metric = str(monitor_metric)
-        self.monitor_mode = monitor_mode
+        self.monitor_mode = str(monitor_mode)
         self.decoder_top_k = decoder_top_k
-        self._loss_fn_keyword_names: set[str] | None = None
-        self._loss_fn_accepts_var_kwargs = False
-        loss_callable = getattr(self.loss_fn, "forward", self.loss_fn)
-        if callable(loss_callable):
-            try:
-                loss_signature = inspect.signature(loss_callable)
-            except (TypeError, ValueError):
-                loss_signature = None
-            if loss_signature is not None:
-                self._loss_fn_accepts_var_kwargs = any(
-                    parameter.kind == inspect.Parameter.VAR_KEYWORD
-                    for parameter in loss_signature.parameters.values()
-                )
-                self._loss_fn_keyword_names = {
-                    str(name)
-                    for name, parameter in loss_signature.parameters.items()
-                    if parameter.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
-                }
-        self.run_context = copy.deepcopy(dict(run_context or {}))
-        model_runtime_truth = getattr(model, "runtime_truth", None)
-        if isinstance(model_runtime_truth, Mapping):
-            for key, value in dict(model_runtime_truth).items():
-                self.run_context.setdefault(str(key), copy.deepcopy(value))
-
-        self.precision_policy = resolve_precision_policy(requested_amp=bool(amp), device=device)
-        self.requested_amp = self.precision_policy.requested_amp
-        self.resolved_precision = self.precision_policy.resolved_precision
-        self.use_autocast = self.precision_policy.use_autocast
-        self.use_amp = self.use_autocast
-        self.autocast_dtype = self.precision_policy.autocast_dtype
-        self.grad_scaler_enabled = self.precision_policy.grad_scaler_enabled
-        self.grad_accum_steps = int(grad_accum_steps)
-        self.max_grad_norm = None if max_grad_norm is None else float(max_grad_norm)
-        self.non_blocking_transfer = bool(non_blocking_transfer)
-        self.log_interval = int(log_interval)
-        self.profile_steps = None if profile_steps is None else int(profile_steps)
-        self.early_stopping_patience = None if early_stopping_patience is None else int(early_stopping_patience)
-        self.timing_enabled = bool(timing_enabled)
-        self.detailed_timing_enabled = bool(detailed_timing)
-        if self.precision_policy.warning_message:
-            warnings.warn(self.precision_policy.warning_message, RuntimeWarning, stacklevel=2)
-        if self.grad_scaler_enabled:
-            if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
-                self.scaler = torch.amp.GradScaler("cuda", enabled=True)
-            else:  # pragma: no cover - compatibility path for older torch
-                self.scaler = torch.cuda.amp.GradScaler(enabled=True)
-        else:
-            self.scaler = None
-
-        runtime_context = self.run_context.get("runtime")
-        if not isinstance(runtime_context, dict):
-            runtime_context = {}
-            self.run_context["runtime"] = runtime_context
-        runtime_context["requested_amp"] = self.requested_amp
-        runtime_context["resolved_precision"] = self.resolved_precision
-        runtime_context["grad_scaler_enabled"] = self.grad_scaler_enabled
-        runtime_context["max_grad_norm"] = self.max_grad_norm
-        runtime_context["detailed_timing"] = self.detailed_timing_enabled
+        self.loss_fn = loss_fn
+        self.validation_threshold = float(validation_threshold)
+        self.use_self_history = bool(use_self_history)
+        self.use_ddi = bool(use_ddi)
+        self.use_retrieval = bool(getattr(self.model, "use_retrieval", False))
+        self.history_mode = str(getattr(self.model, "history_mode", "self_only"))
+        self.max_train_batches = None if max_train_batches is None else int(max_train_batches)
+        self.max_val_batches = None if max_val_batches is None else int(max_val_batches)
+        self.max_grad_norm = (
+            None if max_grad_norm is None or float(max_grad_norm) <= 0.0 else float(max_grad_norm)
+        )
+        self.sanitize_code_embedding_grads = bool(sanitize_code_embedding_grads)
+        self.code_embedding_grad_max_norm = (
+            None
+            if code_embedding_grad_max_norm is None or float(code_embedding_grad_max_norm) <= 0.0
+            else float(code_embedding_grad_max_norm)
+        )
+        self.freeze_code_embedding_epochs = max(int(freeze_code_embedding_epochs), 0)
+        self.debug_checks_enabled = bool(debug_checks_enabled)
+        self.debug_checks_light_mode = bool(debug_checks_light_mode)
+        self.debug_check_every_n_steps = max(int(debug_check_every_n_steps), 1)
+        self.sync_timing = bool(sync_timing)
+        self._retrieval_policy_logged = False
+        self._code_embeddings_are_frozen: bool | None = None
 
         self.checkpoint_dir = ensure_dir(checkpoint_dir)
         self.log_dir = ensure_dir(log_dir)
         self.best_checkpoint_path = self.checkpoint_dir / "train_core_best.pt"
         self.metrics_log_path = self.log_dir / "train_core_metrics.jsonl"
+        self.metrics_per_epoch_json_path = self.log_dir / "metrics_per_epoch.json"
+        self.metrics_per_epoch_csv_path = self.log_dir / "metrics_per_epoch.csv"
+        self.best_metrics_path = self.log_dir / "best_metrics.json"
         self.best_metric = float("inf") if monitor_mode == "min" else float("-inf")
-        self.epochs_without_improvement = 0
-        self.stopped_early = False
-        self.stop_reason: str | None = None
-        self._cached_validation_prediction_payload: tuple[torch.Tensor, torch.Tensor] | None = None
-        self._cached_validation_payload_dataloader_id: int | None = None
-        self._last_checkpoint_write_time = 0.0
-        self._last_metrics_log_write_time = 0.0
+        self.best_epoch_metrics: dict[str, float] | None = None
 
-    def _sync_timing(self) -> None:
-        if self.device.type == "cuda" and self.timing_enabled:
-            torch.cuda.synchronize(self.device)
-
-    def _autocast_context(self):
-        if not self.use_autocast or self.autocast_dtype is None:
-            return contextlib.nullcontext()
-        return torch.autocast(device_type=self.device.type, dtype=self.autocast_dtype)
-
-    def _raise_non_finite_tensor(self, tensor: torch.Tensor, *, name: str, context: str) -> None:
-        invalid = ~torch.isfinite(tensor)
-        if not bool(invalid.any().item()):
-            return
-        first_invalid = torch.nonzero(invalid, as_tuple=False)[0].tolist()
-        raise RuntimeError(
-            f"{context}: tensor `{name}` contains non-finite values at index {first_invalid} "
-            f"(shape={tuple(tensor.shape)}, dtype={tensor.dtype})"
-        )
-
-    def _validate_tensor_finite(self, tensor: Any, *, name: str, context: str) -> None:
-        if not isinstance(tensor, torch.Tensor):
-            return
-        if not tensor.is_floating_point() and not tensor.is_complex():
-            return
-        self._raise_non_finite_tensor(tensor, name=name, context=context)
-
-    def _validate_batch_inputs_finite(
-        self,
-        batch_on_device: Mapping[str, Any],
-        *,
-        context: str,
-    ) -> None:
-        for key in _BATCH_FINITE_CHECK_KEYS:
-            self._validate_tensor_finite(batch_on_device.get(key), name=key, context=context)
-        self._validate_tensor_finite(
-            batch_on_device.get("final_target_drugs"),
-            name="final_target_drugs",
-            context=context,
-        )
-        self._validate_tensor_finite(
-            batch_on_device.get("target_drugs"),
-            name="target_drugs",
-            context=context,
-        )
-
-    def _validate_model_outputs_finite(
-        self,
-        outputs: Mapping[str, Any],
-        *,
-        context: str,
-    ) -> None:
-        for key in _OUTPUT_FINITE_CHECK_KEYS:
-            self._validate_tensor_finite(outputs.get(key), name=key, context=context)
-
-    def _clip_gradients(self) -> None:
-        if self.max_grad_norm is None:
-            return
-        if self.grad_scaler_enabled and self.scaler is not None:
-            self.scaler.unscale_(self.optimizer)
-        parameters = [parameter for parameter in self.model.parameters() if parameter.grad is not None]
-        if not parameters:
-            return
-        torch.nn.utils.clip_grad_norm_(parameters, self.max_grad_norm)
-
-    def _validate_model_parameters_finite(self, *, context: str) -> None:
-        for name, parameter in self.model.named_parameters():
-            self._validate_tensor_finite(parameter, name=f"parameter:{name}", context=context)
-
-    def _max_epoch_steps(self, dataloader: DataLoader) -> int | None:
-        if self.profile_steps is None:
+    def _resolve_validation_ddi_matrix(self, batch: Mapping[str, Any]) -> torch.Tensor | None:
+        ddi_matrix = batch.get("ddi_adj")
+        if ddi_matrix is None:
+            ddi_matrix = getattr(self.model, "ddi_matrix", None)
+        if ddi_matrix is None:
             return None
-        try:
-            return min(int(len(dataloader)), int(self.profile_steps))
-        except TypeError:
-            return int(self.profile_steps)
 
-    def _create_progress(
+        resolved = torch.as_tensor(ddi_matrix, dtype=torch.float32).detach().cpu()
+        if resolved.ndim != 2:
+            raise ValueError(f"Validation ddi_matrix must have shape (D, D), got {tuple(resolved.shape)}")
+        return resolved
+
+    def _resolve_validation_targets(
         self,
-        dataloader: DataLoader,
-        *,
-        phase: str,
-        training: bool,
-        max_steps: int | None,
-    ) -> Any | None:
-        _ = dataloader
-        _ = phase
-        _ = training
-        _ = max_steps
-        return None
-
-    def _close_progress(self, progress: Any | None) -> None:
-        _ = progress
-
-    def _update_progress(
-        self,
-        progress: Any | None,
-        *,
-        phase: str,
-        step_index: int,
-        total_examples: int,
-        totals: Mapping[str, float],
-        timing_totals: Mapping[str, float],
-    ) -> None:
-        _ = progress
-        _ = phase
-        _ = step_index
-        _ = total_examples
-        _ = totals
-        _ = timing_totals
-
-    def _forward_model(self, batch_on_device: Mapping[str, Any]) -> dict[str, Any]:
-        return self.model(
-            batch_on_device,
-            mode="core",
-            decoder_top_k=self.decoder_top_k,
-            compute_ddi_metrics=False,
-        )
-
-    def _compute_loss_outputs(
-        self,
-        *,
         outputs: Mapping[str, Any],
-        batch_on_device: Mapping[str, Any],
-    ) -> dict[str, Any]:
-        drug_logits = outputs.get("drug_logits")
-        drug_probs = outputs.get("drug_probs")
-        if drug_logits is None or drug_probs is None:
-            raise RuntimeError(
-                "Model did not return `drug_logits` and `drug_probs`. "
-                "Ensure a medication decoder is attached in core training."
-            )
-        loss_kwargs = {
-            "drug_logits": drug_logits,
-            "drug_probs": drug_probs,
-            "target_drugs": _resolve_target_tensor(batch_on_device),
-            "visit_mask": batch_on_device["visit_mask"],
-            "fusion_entropy_loss": outputs.get("fusion_entropy_loss"),
-            "fusion_balance_loss": outputs.get("fusion_balance_loss"),
-        }
-        if not self._loss_fn_accepts_var_kwargs and self._loss_fn_keyword_names is not None:
-            loss_kwargs = {
-                key: value
-                for key, value in loss_kwargs.items()
-                if key in self._loss_fn_keyword_names
-            }
-        return self.loss_fn(
-            **loss_kwargs,
-        )
+        batch: Mapping[str, Any],
+    ) -> torch.Tensor | None:
+        target_current = outputs.get("final_target_drugs")
+        if target_current is None:
+            target_current = outputs.get("target_current")
+        if target_current is None:
+            target_current = batch.get("target_drugs")
+            if isinstance(target_current, torch.Tensor) and target_current.ndim == 3:
+                visit_mask = batch.get("visit_mask")
+                if not isinstance(visit_mask, torch.Tensor):
+                    raise RuntimeError("visit_mask is required to resolve validation targets from [B, T, D].")
+                target_current = extract_last_valid_targets(target_current, visit_mask)
+        return None if target_current is None else torch.as_tensor(target_current)
 
-    def _optimizer_step(self, *, context: str) -> None:
-        self._clip_gradients()
-        if self.grad_scaler_enabled and self.scaler is not None:
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
-        else:
-            self.optimizer.step()
-        self._validate_model_parameters_finite(context=context)
-        self.optimizer.zero_grad(set_to_none=True)
-
-    def _timing_metric_payload(
-        self,
-        *,
-        phase: str,
-        timing_totals: Mapping[str, float],
-        total_examples: int,
-        step_count: int,
-    ) -> dict[str, float]:
-        if not self.timing_enabled or step_count <= 0:
-            return {}
-        total_loop_time = float(timing_totals["data_time"]) + float(timing_totals["step_time"])
-        samples_per_sec = 0.0 if total_loop_time <= 0.0 else float(total_examples) / total_loop_time
-        return {
-            f"{phase}_{key}": float(timing_totals[key]) / float(step_count)
-            for key in _TIMING_KEYS
-            if key != "samples_per_sec"
-        } | {f"{phase}_samples_per_sec": samples_per_sec}
-
-    def _prediction_payload_collector(self, *, training: bool) -> Any | None:
-        _ = training
-        return None
-
-    def _collect_prediction_payload_batch(
-        self,
-        *,
-        collector: Any,
-        outputs: Mapping[str, Any],
-        batch_on_device: Mapping[str, Any],
-    ) -> None:
-        _ = collector
-        _ = outputs
-        _ = batch_on_device
-
-    def _finalize_prediction_payload_collector(
-        self,
-        *,
-        collector: Any,
-        dataloader: DataLoader,
-        training: bool,
-    ) -> None:
-        _ = collector
-        _ = dataloader
-        _ = training
-        self._cached_validation_prediction_payload = None
-        self._cached_validation_payload_dataloader_id = None
-
-    def _cached_validation_prediction_payload_for(
-        self,
-        dataloader: DataLoader,
-    ) -> tuple[torch.Tensor, torch.Tensor] | None:
-        if self._cached_validation_payload_dataloader_id != id(dataloader):
-            return None
-        return self._cached_validation_prediction_payload
-
-    def _collect_runtime_timing(
-        self,
-        timing_totals: dict[str, float],
-        outputs: Mapping[str, Any],
-    ) -> None:
-        if not self.detailed_timing_enabled:
+    def _set_code_embeddings_trainable(self, *, trainable: bool, epoch: int) -> None:
+        if self._code_embeddings_are_frozen is not None and self._code_embeddings_are_frozen == (not trainable):
             return
-        runtime_timing = outputs.get("runtime_timing")
-        if not isinstance(runtime_timing, Mapping):
-            return
-        for key, value in runtime_timing.items():
-            try:
-                timing_totals[str(key)] = timing_totals.get(str(key), 0.0) + float(value)
-            except (TypeError, ValueError):
+        affected_branches: list[str] = []
+        for spec in _CODE_EMBEDDING_SPECS:
+            parameter = _get_named_parameter(self.model, str(spec["parameter_name"]))
+            if parameter is None:
                 continue
-
-    def _detailed_timing_metric_payload(
-        self,
-        *,
-        phase: str,
-        timing_totals: Mapping[str, float],
-        step_count: int,
-    ) -> dict[str, float]:
-        if not self.detailed_timing_enabled or step_count <= 0:
-            return {}
-        return {
-            f"{phase}_{key}": float(value) / float(step_count)
-            for key, value in timing_totals.items()
-        }
-
-    def _epoch_aux_timing_metrics(self) -> dict[str, float]:
-        if not self.detailed_timing_enabled:
-            return {}
-        return {
-            "checkpoint_write_time": float(self._last_checkpoint_write_time),
-        }
+            parameter.requires_grad_(trainable)
+            if not trainable:
+                parameter.grad = None
+            affected_branches.append(str(spec["label"]))
+        if not affected_branches:
+            return
+        self._code_embeddings_are_frozen = not trainable
+        state = "unfrozen" if trainable else "frozen"
+        _log_line(
+            f"Code embeddings {state} for epoch {epoch}: {', '.join(affected_branches)} "
+            f"(freeze_epochs={self.freeze_code_embedding_epochs})"
+        )
 
     def _run_one_epoch(
         self,
         dataloader: DataLoader,
         *,
         training: bool,
+        epoch: int,
     ) -> dict[str, float]:
         phase = "train" if training else "val"
         totals = {key: 0.0 for key in _LOSS_KEYS}
-        timing_totals = {
-            "data_time": 0.0,
-            "transfer_time": 0.0,
-            "forward_time": 0.0,
-            "loss_time": 0.0,
-            "backward_time": 0.0,
-            "optimizer_time": 0.0,
-            "step_time": 0.0,
-        }
-        detailed_timing_totals: dict[str, float] = {}
-        fusion_diagnostic_totals: dict[str, float] = {}
+        timing_totals = {key: 0.0 for key in _TIME_KEYS}
         total_examples = 0
-        step_count = 0
-        max_steps = self._max_epoch_steps(dataloader)
-        prediction_payload_collector = self._prediction_payload_collector(training=training)
+        total_batches = 0
+        collected_probs: list[torch.Tensor] = []
+        collected_targets: list[torch.Tensor] = []
+        validation_ddi_matrix: torch.Tensor | None = None
+        grad_totals = {key: 0.0 for key in _GRAD_KEYS}
+        grad_batches = 0
+        code_embedding_grad_norm_totals = {
+            str(spec["label"]): 0.0
+            for spec in _CODE_EMBEDDING_SPECS
+        }
+        code_embedding_sanitized_events = {
+            str(spec["label"]): 0.0
+            for spec in _CODE_EMBEDDING_SPECS
+        }
 
         self.model.train(mode=training)
         grad_context = torch.enable_grad if training else torch.no_grad
-        progress = self._create_progress(
-            dataloader,
-            phase=phase,
-            training=training,
-            max_steps=max_steps,
+        progress = tqdm(
+            range(len(dataloader)),
+            desc=f"{phase} batches",
+            unit="batch",
+            leave=False,
+            dynamic_ncols=True,
+            mininterval=2.0,
         )
-        iterable_source = dataloader if progress is None else progress
-        iterable = (
-            iterable_source
-            if max_steps is None
-            else itertools.islice(iterable_source, max_steps)
-        )
-        batches_since_step = 0
-        self.optimizer.zero_grad(set_to_none=True)
-        last_step_end = time.perf_counter()
 
-        try:
-            for step_index, batch in enumerate(iterable, start=1):
-                step_context = f"{phase} step {step_index}"
-                data_time = time.perf_counter() - last_step_end
+        dataloader_iter = iter(dataloader)
+        for step_index in progress:
+            max_batches = self.max_train_batches if training else self.max_val_batches
+            if max_batches is not None and total_batches >= max_batches:
+                break
+            data_start = time.perf_counter()
+            try:
+                batch = next(dataloader_iter)
+            except StopIteration:
+                break
+            data_time = time.perf_counter() - data_start
 
-                transfer_start = time.perf_counter()
-                batch_on_device = _move_batch_to_device(
-                    batch,
-                    self.device,
-                    non_blocking=self.non_blocking_transfer,
-                )
-                self._sync_timing()
-                transfer_time = time.perf_counter() - transfer_start
-
-                batch_size = int(batch_on_device["visit_mask"].shape[0])
-                if batch_size <= 0:
-                    last_step_end = time.perf_counter()
-                    continue
-                self._validate_batch_inputs_finite(
-                    batch_on_device,
-                    context=f"{step_context} before forward",
-                )
-
-                with grad_context():
-                    forward_start = time.perf_counter()
-                    with self._autocast_context():
-                        outputs = self._forward_model(batch_on_device)
-                    self._validate_model_outputs_finite(
-                        outputs,
-                        context=f"{step_context} after forward",
-                    )
-                    self._collect_runtime_timing(detailed_timing_totals, outputs)
-                    _accumulate_fusion_diagnostics(
-                        fusion_diagnostic_totals,
-                        outputs,
-                        batch_size=batch_size,
-                    )
-                    _accumulate_retrieval_diagnostics(
-                        fusion_diagnostic_totals,
-                        outputs,
-                        batch_size=batch_size,
-                    )
-                    if prediction_payload_collector is not None:
-                        self._collect_prediction_payload_batch(
-                            collector=prediction_payload_collector,
-                            outputs=outputs,
-                            batch_on_device=batch_on_device,
-                        )
-                    self._sync_timing()
-                    forward_time = time.perf_counter() - forward_start
-
-                    loss_start = time.perf_counter()
-                    with self._autocast_context():
-                        loss_outputs = self._compute_loss_outputs(
-                            outputs=outputs,
-                            batch_on_device=batch_on_device,
-                        )
-                    self._sync_timing()
-                    loss_time = time.perf_counter() - loss_start
-
-                    backward_time = 0.0
-                    optimizer_time = 0.0
-                    if training:
-                        backward_start = time.perf_counter()
-                        scaled_loss = loss_outputs["total_loss"] / float(self.grad_accum_steps)
-                        if self.grad_scaler_enabled and self.scaler is not None:
-                            self.scaler.scale(scaled_loss).backward()
-                        else:
-                            scaled_loss.backward()
-                        self._sync_timing()
-                        backward_time = time.perf_counter() - backward_start
-                        batches_since_step += 1
-
-                        if batches_since_step >= self.grad_accum_steps:
-                            optimizer_start = time.perf_counter()
-                            self._optimizer_step(
-                                context=f"{step_context} after optimizer step",
-                            )
-                            self._sync_timing()
-                            optimizer_time = time.perf_counter() - optimizer_start
-                            batches_since_step = 0
-
-                step_compute_time = transfer_time + forward_time + loss_time + backward_time + optimizer_time
-                total_examples += batch_size
-                step_count += 1
-                for key in _LOSS_KEYS:
-                    totals[key] += _to_float(loss_outputs[key]) * batch_size
-                timing_totals["data_time"] += data_time
-                timing_totals["transfer_time"] += transfer_time
-                timing_totals["forward_time"] += forward_time
-                timing_totals["loss_time"] += loss_time
-                timing_totals["backward_time"] += backward_time
-                timing_totals["optimizer_time"] += optimizer_time
-                timing_totals["step_time"] += step_compute_time
-
-                if step_index == 1 or step_index % self.log_interval == 0:
-                    self._update_progress(
-                        progress,
-                        phase=phase,
-                        step_index=step_index,
-                        total_examples=total_examples,
-                        totals=totals,
-                        timing_totals=timing_totals,
-                    )
-                last_step_end = time.perf_counter()
-        finally:
-            self._close_progress(progress)
-            self._finalize_prediction_payload_collector(
-                collector=prediction_payload_collector,
-                dataloader=dataloader,
-                training=training,
+            step_start = time.perf_counter()
+            batch_on_device = _move_batch_to_device(batch, self.device)
+            batch_on_device["_current_epoch"] = int(epoch)
+            step_number = total_batches + 1
+            debug_check_now = _resolve_debug_check_now(
+                enabled=self.debug_checks_enabled,
+                light_mode=self.debug_checks_light_mode,
+                check_every_n_steps=self.debug_check_every_n_steps,
+                step_index=step_number,
             )
+            batch_on_device["_debug_check_now"] = bool(debug_check_now)
+            if debug_check_now:
+                _assert_finite_tree(f"{phase}.batch", batch_on_device)
+            batch_size = int(batch_on_device["visit_mask"].shape[0])
+            if batch_size <= 0:
+                continue
 
-        if training and batches_since_step > 0:
-            optimizer_start = time.perf_counter()
-            self._optimizer_step(context=f"{phase} epoch-end optimizer flush")
-            self._sync_timing()
-            optimizer_flush_time = time.perf_counter() - optimizer_start
-            timing_totals["optimizer_time"] += optimizer_flush_time
-            timing_totals["step_time"] += optimizer_flush_time
+            if training:
+                self.optimizer.zero_grad(set_to_none=True)
+
+            with grad_context():
+                outputs = self.model(batch_on_device)
+                if debug_check_now:
+                    _assert_finite_tree(f"{phase}.outputs", outputs)
+                output_dtype = torch.float32
+                logits = outputs.get("drug_logits")
+                if isinstance(logits, torch.Tensor):
+                    output_dtype = logits.dtype
+                    assert_finite(f"{phase}.drug_logits", logits)
+                drug_probs_output = outputs.get("drug_probs")
+                if isinstance(drug_probs_output, torch.Tensor):
+                    assert_finite(f"{phase}.drug_probs", drug_probs_output)
+                total_loss = _resolve_loss_output(
+                    outputs,
+                    key="total_loss",
+                    device=self.device,
+                    dtype=output_dtype,
+                )
+                prediction_loss = _resolve_loss_output(
+                    outputs,
+                    key="prediction_loss",
+                    fallback_key="pred_bce_loss",
+                    device=self.device,
+                    dtype=output_dtype,
+                )
+                pred_bce_loss = _resolve_loss_output(
+                    outputs,
+                    key="pred_bce_loss",
+                    fallback_key="prediction_loss",
+                    device=self.device,
+                    dtype=output_dtype,
+                )
+                margin_loss = _resolve_loss_output(
+                    outputs,
+                    key="margin_loss",
+                    device=self.device,
+                    dtype=output_dtype,
+                )
+                weighted_margin_loss = _resolve_loss_output(
+                    outputs,
+                    key="weighted_margin_loss",
+                    device=self.device,
+                    dtype=output_dtype,
+                )
+                ddi_loss = _resolve_loss_output(
+                    outputs,
+                    key="ddi_loss",
+                    device=self.device,
+                    dtype=output_dtype,
+                )
+                weighted_ddi_loss = _resolve_loss_output(
+                    outputs,
+                    key="weighted_ddi_loss",
+                    device=self.device,
+                    dtype=output_dtype,
+                )
+                lambda_ddi_current = _resolve_loss_output(
+                    outputs,
+                    key="lambda_ddi_current",
+                    device=self.device,
+                    dtype=output_dtype,
+                )
+                if outputs.get("total_loss") is None:
+                    raise RuntimeError(
+                        "Model forward must return `total_loss`, `prediction_loss`, and `ddi_loss` "
+                        "for the new training pipeline."
+                    )
+                if not training:
+                    drug_probs = outputs.get("drug_probs")
+                    target_current = self._resolve_validation_targets(outputs, batch_on_device)
+                    if drug_probs is None or target_current is None:
+                        raise RuntimeError(
+                            "Model forward must return `drug_probs` and current-visit targets for validation metrics."
+                        )
+                    collected_probs.append(drug_probs.detach().cpu())
+                    collected_targets.append(target_current.detach().cpu())
+                    batch_ddi_matrix = self._resolve_validation_ddi_matrix(batch_on_device)
+                    if batch_ddi_matrix is None:
+                        raise RuntimeError("Validation metrics require an available ddi_matrix.")
+                    if validation_ddi_matrix is None:
+                        validation_ddi_matrix = batch_ddi_matrix
+                    elif not torch.equal(validation_ddi_matrix, batch_ddi_matrix):
+                        raise ValueError("Validation batches produced inconsistent ddi_matrix values.")
+
+                if training:
+                    total_loss.backward()
+                    code_embedding_grad_reports = {
+                        str(spec["label"]): {
+                            "had_nonfinite": False,
+                            "pre_clip_norm": 0.0,
+                            "post_clip_norm": 0.0,
+                            "valid_code_tokens": _count_valid_code_tokens(
+                                batch_on_device,
+                                batch_key=str(spec["batch_key"]),
+                                mask_key=str(spec["mask_key"]),
+                            ),
+                        }
+                        for spec in _CODE_EMBEDDING_SPECS
+                    }
+                    if self.sanitize_code_embedding_grads:
+                        code_embedding_grad_reports = _sanitize_code_embedding_gradients(
+                            self.model,
+                            batch=batch_on_device,
+                            max_norm=self.code_embedding_grad_max_norm,
+                            phase=phase,
+                            epoch=epoch,
+                            step=step_number,
+                        )
+                    if debug_check_now:
+                        _assert_finite_gradients(self.model)
+                    grad_norm = 0.0
+                    clipped_grad_norm = 0.0
+                    if self.max_grad_norm is not None:
+                        try:
+                            grad_norm_value = torch.nn.utils.clip_grad_norm_(
+                                self.model.parameters(),
+                                self.max_grad_norm,
+                                error_if_nonfinite=True,
+                            )
+                        except RuntimeError as exc:
+                            _assert_finite_gradients(self.model)
+                            raise RuntimeError(
+                                "clip_grad_norm_ detected non-finite gradients after sanitize."
+                            ) from exc
+                        grad_norm = _to_float(grad_norm_value)
+                        clipped_grad_norm = min(grad_norm, self.max_grad_norm)
+                    elif debug_check_now:
+                        grad_norm_value = _compute_global_grad_norm(self.model, finite_only=False)
+                        if grad_norm_value is None:
+                            _assert_finite_gradients(self.model)
+                            raise RuntimeError("Expected finite gradients before optimizer.step, but grad norm was undefined.")
+                        grad_norm = float(grad_norm_value)
+                        clipped_grad_norm = grad_norm
+                    grad_totals["grad_norm"] += float(grad_norm) * batch_size
+                    grad_totals["clipped_grad_norm"] += float(clipped_grad_norm) * batch_size
+                    for label, report in code_embedding_grad_reports.items():
+                        code_embedding_grad_norm_totals[label] += float(report["post_clip_norm"]) * batch_size
+                        code_embedding_sanitized_events[label] += float(bool(report["had_nonfinite"]))
+                    grad_batches += 1
+                    self.optimizer.step()
+            if self.sync_timing:
+                _synchronize_device(self.device)
+            step_time = time.perf_counter() - step_start
+
+            total_batches += 1
+            total_examples += batch_size
+            totals["total_loss"] += _to_float(total_loss) * batch_size
+            totals["prediction_loss"] += _to_float(prediction_loss) * batch_size
+            totals["pred_bce_loss"] += _to_float(pred_bce_loss) * batch_size
+            totals["margin_loss"] += _to_float(margin_loss) * batch_size
+            totals["weighted_margin_loss"] += _to_float(weighted_margin_loss) * batch_size
+            totals["ddi_loss"] += _to_float(ddi_loss) * batch_size
+            totals["weighted_ddi_loss"] += _to_float(weighted_ddi_loss) * batch_size
+            totals["lambda_ddi_current"] += _to_float(lambda_ddi_current) * batch_size
+            timing_totals["data_time"] += data_time
+            timing_totals["step_time"] += step_time
+            batch_count = max(total_batches, 1)
+            if hasattr(progress, "set_postfix") and (total_batches == 1 or total_batches % 20 == 0):
+                progress.set_postfix(
+                    total_loss=f"{totals['total_loss'] / float(total_examples):.4f}",
+                    pred_loss=f"{totals['pred_bce_loss'] / float(total_examples):.4f}",
+                    margin=f"{totals['margin_loss'] / float(total_examples):.4f}",
+                    ddi_loss=f"{totals['ddi_loss'] / float(total_examples):.4f}",
+                    lambda_ddi=f"{totals['lambda_ddi_current'] / float(total_examples):.4f}",
+                    grad_norm=(
+                        f"{grad_totals['grad_norm'] / float(total_examples):.4f}"
+                        if training and grad_batches > 0
+                        else "0.0000"
+                    ),
+                    data_time=f"{timing_totals['data_time'] / float(batch_count):.3f}s",
+                    step_time=f"{timing_totals['step_time'] / float(batch_count):.3f}s",
+                )
 
         if total_examples <= 0:
             raise ValueError(f"{phase} dataloader produced zero valid examples")
 
-        epoch_metrics = {
-            f"{phase}_{key}": totals[key] / float(total_examples)
-            for key in _LOSS_KEYS
-        }
-        epoch_metrics.update(
-            {
-                f"{phase}_{key}": value / float(total_examples)
-                for key, value in fusion_diagnostic_totals.items()
-            }
-        )
-        epoch_metrics.update(
-            self._timing_metric_payload(
-                phase=phase,
-                timing_totals=timing_totals,
-                total_examples=total_examples,
-                step_count=step_count,
+        metrics = {f"{phase}_{key}": totals[key] / float(total_examples) for key in _LOSS_KEYS}
+        average_batches = float(max(total_batches, 1))
+        metrics.update({f"{phase}_{key}": timing_totals[key] / average_batches for key in _TIME_KEYS})
+        if training and grad_batches > 0:
+            metrics.update(
+                {
+                    "train_grad_norm": grad_totals["grad_norm"] / float(total_examples),
+                    "train_clipped_grad_norm": grad_totals["clipped_grad_norm"] / float(total_examples),
+                    "train_code_embedding_sanitized_events": sum(code_embedding_sanitized_events.values()),
+                }
             )
-        )
-        epoch_metrics.update(
-            self._detailed_timing_metric_payload(
-                phase=phase,
-                timing_totals=detailed_timing_totals,
-                step_count=step_count,
+            for label in code_embedding_grad_norm_totals:
+                metrics[f"train_{label}_embedding_grad_norm"] = (
+                    code_embedding_grad_norm_totals[label] / float(total_examples)
+                )
+                metrics[f"train_{label}_embedding_sanitized_events"] = code_embedding_sanitized_events[label]
+        elif training:
+            metrics.update(
+                {
+                    "train_grad_norm": 0.0,
+                    "train_clipped_grad_norm": 0.0,
+                    "train_code_embedding_sanitized_events": 0.0,
+                }
             )
-        )
-        return epoch_metrics
+            for spec in _CODE_EMBEDDING_SPECS:
+                label = str(spec["label"])
+                metrics[f"train_{label}_embedding_grad_norm"] = 0.0
+                metrics[f"train_{label}_embedding_sanitized_events"] = 0.0
+        if not training:
+            if not collected_probs or not collected_targets or validation_ddi_matrix is None:
+                raise ValueError("Validation epoch did not produce metric inputs")
+            validation_metrics = compute_core_metrics(
+                y_true=torch.cat(collected_targets, dim=0),
+                y_score=torch.cat(collected_probs, dim=0),
+                threshold=self.validation_threshold,
+                ddi_matrix=validation_ddi_matrix,
+            )
+            metrics.update(
+                {
+                    "val_jaccard": float(validation_metrics["jaccard"]),
+                    "val_f1": float(validation_metrics["f1"]),
+                    "val_prauc": float(validation_metrics["prauc"]),
+                    "val_ddi_rate": float(validation_metrics["ddi_rate"]),
+                    "val_ddi": float(validation_metrics["ddi_rate"]),
+                    "val_avg_drugs": float(validation_metrics["avg_predicted_drugs"]),
+                    "val_avg_true_drugs": float(validation_metrics["avg_true_drugs"]),
+                }
+            )
+        return metrics
 
-    def train_one_epoch(self, dataloader: DataLoader) -> dict[str, float]:
-        return self._run_one_epoch(dataloader, training=True)
+    def train_one_epoch(self, dataloader: DataLoader, *, epoch: int) -> dict[str, float]:
+        return self._run_one_epoch(dataloader, training=True, epoch=epoch)
 
-    def validate_one_epoch(self, dataloader: DataLoader) -> dict[str, float]:
-        return self._run_one_epoch(dataloader, training=False)
-
-    def _current_monitor_value(self, epoch_metrics: Mapping[str, float]) -> float:
-        if self.monitor_metric not in epoch_metrics:
-            raise KeyError(f"Missing monitor metric `{self.monitor_metric}` in epoch metrics")
-        return float(epoch_metrics[self.monitor_metric])
-
-    def _step_scheduler(self, epoch_metrics: Mapping[str, float]) -> None:
-        if self.scheduler is None:
-            return
-        current_metric = self._current_monitor_value(epoch_metrics)
-        if isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-            self.scheduler.step(current_metric)
-            return
-        self.scheduler.step()
-
-    def _maybe_trigger_early_stopping(self) -> bool:
-        if self.early_stopping_patience is None:
-            return False
-        if self.epochs_without_improvement < self.early_stopping_patience:
-            return False
-        self.stopped_early = True
-        self.stop_reason = (
-            f"early_stopping_patience={self.early_stopping_patience} "
-            f"without improvement on {self.monitor_metric}"
-        )
-        return True
+    def validate_one_epoch(self, dataloader: DataLoader, *, epoch: int) -> dict[str, float]:
+        return self._run_one_epoch(dataloader, training=False, epoch=epoch)
 
     def save_best_checkpoint(
         self,
@@ -809,20 +746,20 @@ class Trainer:
         epoch_metrics: Mapping[str, float],
         extra_state: Mapping[str, Any] | None = None,
     ) -> Path | None:
-        checkpoint_start = time.perf_counter()
-        current_metric = self._current_monitor_value(epoch_metrics)
+        if self.monitor_metric not in epoch_metrics:
+            raise KeyError(f"Missing monitor metric `{self.monitor_metric}` in epoch metrics")
+
+        current_metric = float(epoch_metrics[self.monitor_metric])
         is_better = (
             current_metric < self.best_metric
             if self.monitor_mode == "min"
             else current_metric > self.best_metric
         )
         if not is_better:
-            self.epochs_without_improvement += 1
-            self._last_checkpoint_write_time = time.perf_counter() - checkpoint_start
             return None
 
         self.best_metric = current_metric
-        self.epochs_without_improvement = 0
+        self.best_epoch_metrics = {key: _to_float(value) for key, value in epoch_metrics.items()}
         checkpoint_payload: dict[str, Any] = {
             "epoch": int(epoch),
             "best_metric": current_metric,
@@ -834,88 +771,105 @@ class Trainer:
             checkpoint_payload["scheduler_state_dict"] = self.scheduler.state_dict()
         if extra_state:
             checkpoint_payload.update(dict(extra_state))
-        if self.run_context:
-            for key, value in self.run_context.items():
-                checkpoint_payload.setdefault(str(key), copy.deepcopy(value))
 
         torch.save(checkpoint_payload, self.best_checkpoint_path)
-        self._last_checkpoint_write_time = time.perf_counter() - checkpoint_start
+        write_payload = {
+            "epoch": int(epoch),
+            "monitor_metric": self.monitor_metric,
+            "best_metric": current_metric,
+            "use_self_history": self.use_self_history,
+            "use_ddi": self.use_ddi,
+            "use_retrieval": self.use_retrieval,
+            "history_mode": self.history_mode,
+            **self.best_epoch_metrics,
+        }
+        with self.best_metrics_path.open("w", encoding="utf-8") as handle:
+            json.dump(write_payload, handle, ensure_ascii=True, indent=2, sort_keys=True)
         return self.best_checkpoint_path
 
-    def log_metrics(self, *, epoch: int, metrics: Mapping[str, Any]) -> float:
-        log_write_start = time.perf_counter()
-        ddi_context = dict(self.run_context.get("ddi_context", {}))
-        ddi_status = ddi_context.get("status", "active" if ddi_context.get("active") else "inactive")
-        ddi_reason = ddi_context.get("reason", "")
-        source_metadata = dict(ddi_context.get("source_metadata") or {})
-        ddi_kind = source_metadata.get("kind", "")
-        ddi_research_grade = source_metadata.get("research_grade")
-        ddi_purpose = source_metadata.get("purpose", "")
-        effective_ddi_lambda = self.run_context.get("effective_ddi_lambda", 0.0)
-        pipeline_level = self.run_context.get("pipeline_level")
-        history_active = self.run_context.get("history_active")
-        retrieval_active = self.run_context.get("retrieval_active")
-        fusion_strategy = self.run_context.get("fusion_strategy")
+    def log_metrics(self, *, epoch: int, metrics: Mapping[str, Any]) -> None:
+        bottleneck = (
+            "data_loader"
+            if float(metrics["train_data_time"]) > float(metrics["train_step_time"])
+            else "model_step"
+        )
         summary = (
             f"Epoch {epoch}: "
             f"train_total_loss={float(metrics['train_total_loss']):.6f} "
-            f"train_prediction_loss={float(metrics['train_prediction_loss']):.6f} "
+            f"train_pred_bce_loss={float(metrics['train_pred_bce_loss']):.6f} "
+            f"train_margin_loss={float(metrics['train_margin_loss']):.6f} "
             f"train_ddi_loss={float(metrics['train_ddi_loss']):.6f} "
+            f"train_lambda_ddi_current={float(metrics['train_lambda_ddi_current']):.6f} "
+            f"train_grad_norm={float(metrics.get('train_grad_norm', 0.0)):.6f} "
+            f"train_clipped_grad_norm={float(metrics.get('train_clipped_grad_norm', 0.0)):.6f} "
+            f"train_diagnosis_embedding_grad_norm="
+            f"{float(metrics.get('train_diagnosis_embedding_grad_norm', 0.0)):.6f} "
+            f"train_procedure_embedding_grad_norm="
+            f"{float(metrics.get('train_procedure_embedding_grad_norm', 0.0)):.6f} "
+            f"train_medication_history_embedding_grad_norm="
+            f"{float(metrics.get('train_medication_history_embedding_grad_norm', 0.0)):.6f} "
+            f"train_code_embedding_sanitized_events="
+            f"{float(metrics.get('train_code_embedding_sanitized_events', 0.0)):.0f} "
+            f"train_data_time={float(metrics['train_data_time']):.3f}s "
+            f"train_step_time={float(metrics['train_step_time']):.3f}s "
             f"val_total_loss={float(metrics['val_total_loss']):.6f} "
-            f"val_prediction_loss={float(metrics['val_prediction_loss']):.6f} "
+            f"val_pred_bce_loss={float(metrics['val_pred_bce_loss']):.6f} "
+            f"val_margin_loss={float(metrics['val_margin_loss']):.6f} "
             f"val_ddi_loss={float(metrics['val_ddi_loss']):.6f} "
-            f"ddi_status={ddi_status} "
-            f"effective_ddi_lambda={float(effective_ddi_lambda):.6f}"
+            f"val_lambda_ddi_current={float(metrics['val_lambda_ddi_current']):.6f} "
+            f"val_jaccard={float(metrics['val_jaccard']):.6f} "
+            f"val_f1={float(metrics['val_f1']):.6f} "
+            f"val_prauc={float(metrics['val_prauc']):.6f} "
+            f"val_ddi_rate={float(metrics['val_ddi_rate']):.6f} "
+            f"val_avg_drugs={float(metrics['val_avg_drugs']):.6f} "
+            f"val_data_time={float(metrics['val_data_time']):.3f}s "
+            f"val_step_time={float(metrics['val_step_time']):.3f}s "
+            f"history_mode={self.history_mode} "
+            f"use_retrieval={self.use_retrieval} "
+            f"bottleneck={bottleneck}"
         )
-        if "train_step_time" in metrics and "train_samples_per_sec" in metrics:
-            summary = (
-                f"{summary} "
-                f"train_step_time={float(metrics['train_step_time']):.4f} "
-                f"train_sps={float(metrics['train_samples_per_sec']):.2f}"
-            )
-        if "val_step_time" in metrics and "val_samples_per_sec" in metrics:
-            summary = (
-                f"{summary} "
-                f"val_step_time={float(metrics['val_step_time']):.4f} "
-                f"val_sps={float(metrics['val_samples_per_sec']):.2f}"
-            )
-        if ddi_reason:
-            summary = f"{summary} ddi_reason={ddi_reason}"
-        if ddi_kind:
-            summary = f"{summary} ddi_kind={ddi_kind}"
-        if ddi_research_grade is not None:
-            summary = f"{summary} ddi_research_grade={bool(ddi_research_grade)}"
-        if ddi_purpose:
-            summary = f"{summary} ddi_purpose={str(ddi_purpose)}"
-        if pipeline_level:
-            summary = f"{summary} pipeline_level={str(pipeline_level)}"
-        if history_active is not None:
-            summary = f"{summary} history_active={bool(history_active)}"
-        if retrieval_active is not None:
-            summary = f"{summary} retrieval_active={bool(retrieval_active)}"
-        if fusion_strategy:
-            summary = f"{summary} fusion_strategy={str(fusion_strategy)}"
-        print(summary)
-
-        log_payload = {"epoch": int(epoch), **{key: _to_float(value) for key, value in metrics.items()}}
-        if self.run_context:
-            log_payload["run_context"] = copy.deepcopy(self.run_context)
+        _log_line(summary)
+        log_payload = {
+            "epoch": int(epoch),
+            "use_self_history": self.use_self_history,
+            "use_ddi": self.use_ddi,
+            "use_retrieval": self.use_retrieval,
+            "history_mode": self.history_mode,
+            "train_loss": _to_float(metrics["train_total_loss"]),
+            "val_loss": _to_float(metrics["val_total_loss"]),
+            **{key: _to_float(value) for key, value in metrics.items()},
+        }
         with self.metrics_log_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(log_payload, ensure_ascii=True, sort_keys=True))
             handle.write("\n")
-        self._last_metrics_log_write_time = time.perf_counter() - log_write_start
-        if self.detailed_timing_enabled:
-            print(
-                "Detailed timing: "
-                f"checkpoint_write_time={self._last_checkpoint_write_time:.4f} "
-                f"metrics_log_write_time={self._last_metrics_log_write_time:.4f}"
-            )
-        return self._last_metrics_log_write_time
 
-    def _set_dataloader_epoch(self, dataloader: DataLoader, *, epoch: int) -> None:
-        batch_sampler = getattr(dataloader, "batch_sampler", None)
-        if batch_sampler is not None and hasattr(batch_sampler, "set_epoch"):
-            batch_sampler.set_epoch(epoch)
+    def _write_history_artifacts(self, history: list[dict[str, float]]) -> None:
+        normalized_history = [
+            {
+                "epoch": int(record["epoch"]),
+                "use_self_history": self.use_self_history,
+                "use_ddi": self.use_ddi,
+                "use_retrieval": self.use_retrieval,
+                "history_mode": self.history_mode,
+                "train_loss": float(record["train_total_loss"]),
+                "val_loss": float(record["val_total_loss"]),
+                **{key: float(value) for key, value in record.items() if key != "epoch"},
+            }
+            for record in history
+        ]
+        with self.metrics_per_epoch_json_path.open("w", encoding="utf-8") as handle:
+            json.dump(normalized_history, handle, ensure_ascii=True, indent=2, sort_keys=True)
+
+        fieldnames: list[str] = []
+        for row in normalized_history:
+            for key in row.keys():
+                if key not in fieldnames:
+                    fieldnames.append(key)
+        with self.metrics_per_epoch_csv_path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in normalized_history:
+                writer.writerow(row)
 
     def fit(
         self,
@@ -931,13 +885,60 @@ class Trainer:
         history: list[dict[str, float]] = []
         best_checkpoint_path: Path | None = None
 
-        for epoch in range(1, int(epochs) + 1):
-            self._set_dataloader_epoch(train_dataloader, epoch=epoch)
-            train_metrics = self.train_one_epoch(train_dataloader)
-            val_metrics = self.validate_one_epoch(val_dataloader)
+        epoch_progress = tqdm(
+            range(1, int(epochs) + 1),
+            desc="Training epochs",
+            unit="epoch",
+            dynamic_ncols=True,
+            mininterval=1.0,
+        )
+        for epoch in epoch_progress:
+            code_embeddings_trainable = epoch > self.freeze_code_embedding_epochs
+            self._set_code_embeddings_trainable(
+                trainable=code_embeddings_trainable,
+                epoch=epoch,
+            )
+            if self.use_retrieval and hasattr(self.model, "refresh_retrieval_memory_bank"):
+                retrieval_bank = self.model.refresh_retrieval_memory_bank(
+                    train_dataloader,
+                    split_name="train",
+                    device=self.device,
+                    progress_desc=f"Refreshing retrieval bank (train, epoch {epoch})",
+                )
+                if retrieval_bank is not None:
+                    _log_line(
+                        f"Refreshed retrieval memory bank for epoch {epoch} "
+                        f"(visits={retrieval_bank.num_visits}, history_mode={self.history_mode})"
+                    )
+                    if not self._retrieval_policy_logged and hasattr(self.model, "get_retrieval_policy"):
+                        retrieval_policy = self.model.get_retrieval_policy()
+                        _log_line(
+                            "Retrieval policy: "
+                            f"absolute_time={bool(retrieval_policy.get('has_absolute_time', False))} "
+                            f"same_patient_future_blocked={bool(retrieval_policy.get('same_patient_future_blocked', False))} "
+                            f"cross_patient_absolute_temporal_filter="
+                            f"{bool(retrieval_policy.get('cross_patient_absolute_temporal_filter', False))}"
+                        )
+                        _log_line(str(retrieval_policy.get("notes", "")))
+                        self._retrieval_policy_logged = True
+            train_metrics = self.train_one_epoch(train_dataloader, epoch=epoch)
+            if self.use_retrieval and hasattr(self.model, "refresh_retrieval_memory_bank"):
+                retrieval_bank = self.model.refresh_retrieval_memory_bank(
+                    train_dataloader,
+                    split_name="train",
+                    device=self.device,
+                    progress_desc=f"Refreshing retrieval bank (val, epoch {epoch})",
+                )
+                if retrieval_bank is not None:
+                    _log_line(
+                        f"Refreshed retrieval memory bank for validation of epoch {epoch} "
+                        f"(visits={retrieval_bank.num_visits}, history_mode={self.history_mode})"
+                    )
+            val_metrics = self.validate_one_epoch(val_dataloader, epoch=epoch)
             epoch_metrics = {**train_metrics, **val_metrics}
 
-            self._step_scheduler(epoch_metrics)
+            if self.scheduler is not None:
+                self.scheduler.step()
 
             maybe_best = self.save_best_checkpoint(
                 epoch=epoch,
@@ -947,40 +948,28 @@ class Trainer:
             if maybe_best is not None:
                 best_checkpoint_path = maybe_best
 
-            epoch_metrics = {**epoch_metrics, **self._epoch_aux_timing_metrics()}
-            metrics_log_write_time = self.log_metrics(epoch=epoch, metrics=epoch_metrics)
-            history.append(
-                {
-                    "epoch": float(epoch),
-                    **epoch_metrics,
-                    **(
-                        {"metrics_log_write_time": float(metrics_log_write_time)}
-                        if self.detailed_timing_enabled
-                        else {}
-                    ),
-                }
-            )
-            if self._maybe_trigger_early_stopping():
-                print(f"Early stopping triggered at epoch {epoch}: {self.stop_reason}")
-                break
+            if hasattr(epoch_progress, "set_postfix"):
+                epoch_progress.set_postfix(
+                    train_total=f"{float(epoch_metrics['train_total_loss']):.4f}",
+                    val_total=f"{float(epoch_metrics['val_total_loss']):.4f}",
+                    val_jac=f"{float(epoch_metrics['val_jaccard']):.4f}",
+                    val_ddi=f"{float(epoch_metrics['val_ddi_rate']):.4f}",
+                    data=f"{float(epoch_metrics['train_data_time']):.3f}s",
+                    step=f"{float(epoch_metrics['train_step_time']):.3f}s",
+                )
+            self.log_metrics(epoch=epoch, metrics=epoch_metrics)
+            history.append({"epoch": float(epoch), **epoch_metrics})
 
+        self._write_history_artifacts(history)
         return {
             "history": history,
             "best_metric": self.best_metric,
             "best_checkpoint_path": None if best_checkpoint_path is None else str(best_checkpoint_path),
             "monitor_metric": self.monitor_metric,
-            "epochs_completed": len(history),
-            "stopped_early": self.stopped_early,
-            "stop_reason": self.stop_reason,
+            "metrics_per_epoch_json": str(self.metrics_per_epoch_json_path),
+            "metrics_per_epoch_csv": str(self.metrics_per_epoch_csv_path),
+            "best_metrics_json": str(self.best_metrics_path),
         }
 
 
-__all__ = [
-    "PrecisionPolicy",
-    "Trainer",
-    "_LOSS_KEYS",
-    "_move_batch_to_device",
-    "_resolve_target_tensor",
-    "_to_float",
-    "resolve_precision_policy",
-]
+__all__ = ["Trainer", "_LOSS_KEYS", "_move_batch_to_device", "_to_float"]

@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Iterator, Mapping
 
-from src.utils.io import load_yaml_config, parse_datetime, resolve_path
+from src.utils.io import _set_max_csv_field_size, load_yaml_config, parse_datetime, resolve_path
 
 
 TABLE_PATHS = {
@@ -104,6 +104,7 @@ def iter_csv_rows(
 ) -> Iterator[dict[str, str]]:
     selected = list(fields) if fields else None
     with open_csv(path) as handle:
+        _set_max_csv_field_size()
         reader = csv.DictReader(handle)
         for row in reader:
             if selected is None:

@@ -1,380 +1,439 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from datetime import timedelta
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping
 
 import torch
-import torch.nn.functional as F
-
-from src.utils.io import ensure_dir, load_pt, parse_datetime, resolve_path, save_pt
 
 
-def _coerce_long_tensor(values: Sequence[int] | torch.Tensor) -> torch.Tensor:
-    return torch.as_tensor(values, dtype=torch.long).flatten().cpu()
+@dataclass(frozen=True)
+class VisitMemoryRecord:
+    patient_id: int
+    visit_index: int
+    visit_time: float
+    has_absolute_time: bool
+    visit_embedding: torch.Tensor
+    medication_evidence: torch.Tensor
+    metadata: dict[str, Any]
 
 
-def _coerce_float_tensor(values: Sequence[float] | torch.Tensor) -> torch.Tensor:
-    return torch.as_tensor(values, dtype=torch.float32).flatten().cpu()
-
-
-def _coerce_2d_float_tensor(values: Sequence[Sequence[float]] | torch.Tensor) -> torch.Tensor:
-    tensor = torch.as_tensor(values, dtype=torch.float32).cpu()
-    if tensor.ndim != 2:
-        raise ValueError(f"Expected a 2D float tensor, got shape {tuple(tensor.shape)}")
+def _as_tensor_1d(name: str, value: Any, *, dtype: torch.dtype) -> torch.Tensor:
+    tensor = torch.as_tensor(value, dtype=dtype)
+    if tensor.ndim != 1:
+        raise ValueError(f"{name} must have shape (N,), got {tuple(tensor.shape)}")
     return tensor
 
 
-def _coerce_tuple_list(values: Sequence[Sequence[int]] | None) -> list[tuple[int, ...]]:
-    if values is None:
-        return []
-    return [tuple(int(item) for item in row) for row in values]
+def _infer_visit_times(
+    *,
+    visit_mask: torch.Tensor,
+    time_delta_hours: torch.Tensor | None,
+    visit_time_absolute_hours: torch.Tensor | None,
+    visit_time_absolute_mask: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    batch_size, time_steps = visit_mask.shape
+    if visit_time_absolute_hours is not None:
+        time_tensor = torch.as_tensor(visit_time_absolute_hours, dtype=torch.float32)
+        if tuple(time_tensor.shape) != (batch_size, time_steps):
+            raise ValueError(
+                "visit_time_absolute_hours must align with visit_mask: "
+                f"got {tuple(time_tensor.shape)} and {tuple(visit_mask.shape)}"
+            )
+        if visit_time_absolute_mask is None:
+            absolute_mask = visit_mask.clone()
+        else:
+            absolute_mask = torch.as_tensor(visit_time_absolute_mask, dtype=torch.bool)
+            if tuple(absolute_mask.shape) != (batch_size, time_steps):
+                raise ValueError(
+                    "visit_time_absolute_mask must align with visit_mask: "
+                    f"got {tuple(absolute_mask.shape)} and {tuple(visit_mask.shape)}"
+                )
+        return time_tensor, absolute_mask
+    if time_delta_hours is not None:
+        time_tensor = torch.as_tensor(time_delta_hours, dtype=torch.float32)
+        if tuple(time_tensor.shape) != (batch_size, time_steps):
+            raise ValueError(
+                "time_delta_hours must align with visit_mask: "
+                f"got {tuple(time_tensor.shape)} and {tuple(visit_mask.shape)}"
+            )
+        return torch.cumsum(time_tensor, dim=1), torch.zeros_like(visit_mask, dtype=torch.bool)
+    return (
+        torch.arange(time_steps, dtype=torch.float32).unsqueeze(0).expand(batch_size, -1),
+        torch.zeros_like(visit_mask, dtype=torch.bool),
+    )
 
 
-def _visit_timestamp(record: Mapping[str, Any], step_index: int) -> str:
-    base = parse_datetime(record.get("intime"))
-    if base is None:
-        return str(record.get("outtime", ""))
-    cumulative_hours = 0.0
-    for local_index in range(step_index + 1):
-        cumulative_hours += float(record["steps"][local_index].get("delta_hours", 0.0))
-    return (base + timedelta(hours=cumulative_hours)).strftime("%Y-%m-%d %H:%M:%S")
+class VisitMemoryBank:
+    """Visit-level retrieval bank with explicit temporal-leakage metadata.
 
+    Exact same visits are always identifiable by `(patient_id, visit_index)`.
+    Same-patient future visits can always be blocked by visit order.
+    Cross-patient future filtering is only claimed when absolute visit time is
+    available for both query and candidate visits.
+    """
 
-def _feature_set_from_mask(values: Sequence[int | bool] | None) -> tuple[int, ...]:
-    if not values:
-        return ()
-    return tuple(index for index, flag in enumerate(values) if int(flag) != 0)
-
-
-@dataclass
-class MemoryBank:
-    visit_states: torch.Tensor
-    visit_repr: torch.Tensor
-    subject_ids: torch.Tensor
-    hadm_ids: torch.Tensor
-    stay_ids: torch.Tensor
-    visit_index: torch.Tensor
-    visit_time_days: torch.Tensor
-    visit_time_text: list[str]
-    target_drugs: list[tuple[int, ...]]
-    num_steps: torch.Tensor
-    diag_code_sets: list[tuple[int, ...]]
-    proc_code_sets: list[tuple[int, ...]]
-    lab_feature_sets: list[tuple[int, ...]]
-    vital_feature_sets: list[tuple[int, ...]]
-    split: str
-    _rows_by_stay_cache: list[torch.Tensor] | None = field(init=False, default=None, repr=False)
-    _stay_group_ids_cache: torch.Tensor | None = field(init=False, default=None, repr=False)
-    _unique_stay_ids_cache: torch.Tensor | None = field(init=False, default=None, repr=False)
-    _stay_to_position_cache: dict[int, int] | None = field(init=False, default=None, repr=False)
-    _normalized_visit_states_cache: torch.Tensor | None = field(init=False, default=None, repr=False)
-
-    def __post_init__(self) -> None:
-        self.visit_states = _coerce_2d_float_tensor(self.visit_states)
-        self.visit_repr = _coerce_2d_float_tensor(self.visit_repr)
-        self.subject_ids = _coerce_long_tensor(self.subject_ids)
-        self.hadm_ids = _coerce_long_tensor(self.hadm_ids)
-        self.stay_ids = _coerce_long_tensor(self.stay_ids)
-        self.visit_index = _coerce_long_tensor(self.visit_index)
-        self.visit_time_days = _coerce_float_tensor(self.visit_time_days)
-        self.num_steps = _coerce_long_tensor(self.num_steps)
-        self.visit_time_text = [str(value) for value in self.visit_time_text]
-        self.target_drugs = _coerce_tuple_list(self.target_drugs)
-        self.diag_code_sets = _coerce_tuple_list(self.diag_code_sets)
-        self.proc_code_sets = _coerce_tuple_list(self.proc_code_sets)
-        self.lab_feature_sets = _coerce_tuple_list(self.lab_feature_sets)
-        self.vital_feature_sets = _coerce_tuple_list(self.vital_feature_sets)
-
-        size = self.visit_states.shape[0]
-        if self.visit_repr.shape[0] != size:
-            raise ValueError("visit_repr length must match visit_states length")
-        for name, value in (
-            ("subject_ids", self.subject_ids),
-            ("hadm_ids", self.hadm_ids),
-            ("stay_ids", self.stay_ids),
-            ("visit_index", self.visit_index),
-            ("visit_time_days", self.visit_time_days),
-            ("num_steps", self.num_steps),
-        ):
-            if value.shape[0] != size:
-                raise ValueError(f"{name} length {value.shape[0]} does not match visit_states length {size}")
-        for name, value in (
-            ("visit_time_text", self.visit_time_text),
-            ("target_drugs", self.target_drugs),
-            ("diag_code_sets", self.diag_code_sets),
-            ("proc_code_sets", self.proc_code_sets),
-            ("lab_feature_sets", self.lab_feature_sets),
-            ("vital_feature_sets", self.vital_feature_sets),
-        ):
-            if len(value) != size:
-                raise ValueError(f"{name} length {len(value)} does not match visit_states length {size}")
+    def __init__(
+        self,
+        *,
+        split_name: str | None = None,
+        time_is_absolute: bool = False,
+    ) -> None:
+        self.split_name = None if split_name is None else str(split_name)
+        self.time_is_absolute = bool(time_is_absolute)
+        self.embedding_dim: int | None = None
+        self.medication_dim: int | None = None
+        self._records: list[VisitMemoryRecord] = []
+        self._record_keys: dict[tuple[int, int], int] = {}
+        self._absolute_time_records = 0
 
     def __len__(self) -> int:
-        return int(self.visit_states.shape[0])
-
-    def _build_stay_cache(self) -> None:
-        if self._rows_by_stay_cache is not None:
-            return
-
-        rows_by_stay: dict[int, list[int]] = {}
-        stay_order: list[int] = []
-        for row_index, stay_id in enumerate(self.stay_ids.tolist()):
-            resolved_stay_id = int(stay_id)
-            if resolved_stay_id not in rows_by_stay:
-                rows_by_stay[resolved_stay_id] = []
-                stay_order.append(resolved_stay_id)
-            rows_by_stay[resolved_stay_id].append(int(row_index))
-
-        self._rows_by_stay_cache = [
-            torch.tensor(rows_by_stay[stay_id], dtype=torch.long)
-            for stay_id in stay_order
-        ]
-        self._unique_stay_ids_cache = torch.tensor(stay_order, dtype=torch.long)
-        self._stay_to_position_cache = {
-            int(stay_id): int(position)
-            for position, stay_id in enumerate(stay_order)
-        }
-        self._stay_group_ids_cache = torch.empty(len(self), dtype=torch.long)
-        for stay_position, row_indices in enumerate(self._rows_by_stay_cache):
-            self._stay_group_ids_cache[row_indices] = int(stay_position)
+        return len(self._records)
 
     @property
-    def rows_by_stay(self) -> list[torch.Tensor]:
-        self._build_stay_cache()
-        if self._rows_by_stay_cache is None:
-            raise RuntimeError("rows_by_stay cache was not initialized")
-        return self._rows_by_stay_cache
+    def num_visits(self) -> int:
+        return len(self)
 
     @property
-    def stay_group_ids(self) -> torch.Tensor:
-        self._build_stay_cache()
-        if self._stay_group_ids_cache is None:
-            raise RuntimeError("stay_group_ids cache was not initialized")
-        return self._stay_group_ids_cache
+    def has_absolute_time(self) -> bool:
+        return self._absolute_time_records > 0
 
     @property
-    def unique_stay_ids(self) -> torch.Tensor:
-        self._build_stay_cache()
-        if self._unique_stay_ids_cache is None:
-            raise RuntimeError("unique_stay_ids cache was not initialized")
-        return self._unique_stay_ids_cache
+    def all_visits_have_absolute_time(self) -> bool:
+        return bool(self._records) and self._absolute_time_records == len(self._records)
 
-    def stay_position(self, stay_id: int) -> int | None:
-        self._build_stay_cache()
-        if self._stay_to_position_cache is None:
-            raise RuntimeError("stay_to_position cache was not initialized")
-        return self._stay_to_position_cache.get(int(stay_id))
-
-    @property
-    def normalized_visit_states(self) -> torch.Tensor:
-        if self._normalized_visit_states_cache is None:
-            self._normalized_visit_states_cache = F.normalize(
-                self.visit_states.to(dtype=torch.float32),
-                p=2,
-                dim=-1,
-                eps=1.0e-12,
-            )
-        return self._normalized_visit_states_cache
-
-    @classmethod
-    def build_from_batch(
-        cls,
-        records: Sequence[Mapping[str, Any]],
-        encoder_outputs: Mapping[str, torch.Tensor],
+    def describe_temporal_policy(
+        self,
         *,
-        split: str,
-    ) -> "MemoryBank":
-        state_sequence = torch.as_tensor(encoder_outputs["state_sequence"], dtype=torch.float32).cpu()
-        visit_repr = torch.as_tensor(encoder_outputs["visit_repr"], dtype=torch.float32).cpu()
-        visit_mask = torch.as_tensor(encoder_outputs["visit_mask"], dtype=torch.bool).cpu()
-        if state_sequence.ndim != 3 or visit_repr.ndim != 3 or visit_mask.ndim != 2:
-            raise ValueError("encoder_outputs must contain visit-level tensors with shapes (B,T,H), (B,T,H), (B,T)")
-        if state_sequence.shape[:2] != visit_mask.shape or visit_repr.shape[:2] != visit_mask.shape:
-            raise ValueError("state_sequence, visit_repr, and visit_mask must align on batch and time dimensions")
-        if len(records) != int(state_sequence.shape[0]):
-            raise ValueError("Record count must match encoder output batch size")
-
-        state_rows: list[torch.Tensor] = []
-        repr_rows: list[torch.Tensor] = []
-        payload: dict[str, list[Any]] = {
-            "subject_ids": [],
-            "hadm_ids": [],
-            "stay_ids": [],
-            "visit_index": [],
-            "visit_time_days": [],
-            "visit_time_text": [],
-            "target_drugs": [],
-            "num_steps": [],
-            "diag_code_sets": [],
-            "proc_code_sets": [],
-            "lab_feature_sets": [],
-            "vital_feature_sets": [],
+        exact_match_blocked: bool = True,
+        same_patient_future_blocked: bool = True,
+        cross_patient_absolute_temporal_filter: bool = False,
+        require_absolute_time_for_cross_patient_temporal_filter: bool = False,
+    ) -> dict[str, Any]:
+        if self.all_visits_have_absolute_time:
+            notes = (
+                "Absolute visit times are available for all records, so retrieval can "
+                "block future visits across patients as well as within patients."
+            )
+        elif self.has_absolute_time:
+            notes = (
+                "Absolute visit times are only partially available in the memory bank. "
+                "Same-patient future filtering remains safe by visit index, but "
+                "cross-patient temporal filtering is only partially enforceable."
+            )
+        else:
+            notes = (
+                "Absolute visit times are unavailable. Retrieval remains exact-match "
+                "safe and same-patient future-safe by visit index; cross-patient "
+                "chronology is guaranteed only by the retrieval-pool split boundary."
+            )
+        if require_absolute_time_for_cross_patient_temporal_filter:
+            notes += " Cross-patient candidates without absolute time are excluded."
+        return {
+            "memory_bank_split": self.split_name,
+            "has_absolute_time": bool(self.has_absolute_time),
+            "all_visits_have_absolute_time": bool(self.all_visits_have_absolute_time),
+            "exact_match_blocked": bool(exact_match_blocked),
+            "same_patient_future_blocked": bool(same_patient_future_blocked),
+            "cross_patient_absolute_temporal_filter": bool(cross_patient_absolute_temporal_filter),
+            "num_visits": int(self.num_visits),
+            "notes": notes,
         }
-        for batch_index, record in enumerate(records):
-            for step_index, step in enumerate(record["steps"]):
+
+    def validate(self) -> None:
+        if not self._records:
+            return
+        if self.embedding_dim is None or self.medication_dim is None:
+            raise ValueError("Memory bank dimension metadata is missing.")
+        for record in self._records:
+            if record.visit_embedding.ndim != 1 or record.visit_embedding.shape[0] != self.embedding_dim:
+                raise ValueError("Inconsistent visit embedding shape in memory bank.")
+            if record.medication_evidence.ndim != 1 or record.medication_evidence.shape[0] != self.medication_dim:
+                raise ValueError("Inconsistent medication evidence shape in memory bank.")
+
+    def _validate_row_tensors(
+        self,
+        *,
+        visit_embedding: torch.Tensor,
+        medication_evidence: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        embedding = torch.as_tensor(visit_embedding, dtype=torch.float32).detach().cpu().reshape(-1)
+        medication = torch.as_tensor(medication_evidence, dtype=torch.float32).detach().cpu().reshape(-1)
+        if self.embedding_dim is None:
+            self.embedding_dim = int(embedding.shape[0])
+        if self.medication_dim is None:
+            self.medication_dim = int(medication.shape[0])
+        if int(embedding.shape[0]) != self.embedding_dim:
+            raise ValueError(
+                f"visit_embedding width must stay constant at {self.embedding_dim}, got {int(embedding.shape[0])}"
+            )
+        if int(medication.shape[0]) != self.medication_dim:
+            raise ValueError(
+                f"medication_evidence width must stay constant at {self.medication_dim}, got {int(medication.shape[0])}"
+            )
+        return embedding, medication
+
+    def add(
+        self,
+        *,
+        patient_id: int,
+        visit_index: int,
+        visit_time: float,
+        has_absolute_time: bool = False,
+        visit_embedding: torch.Tensor,
+        medication_evidence: torch.Tensor,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> None:
+        embedding, medication = self._validate_row_tensors(
+            visit_embedding=visit_embedding,
+            medication_evidence=medication_evidence,
+        )
+        resolved_metadata = dict(metadata or {})
+        record = VisitMemoryRecord(
+            patient_id=int(patient_id),
+            visit_index=int(visit_index),
+            visit_time=float(visit_time),
+            has_absolute_time=bool(has_absolute_time),
+            visit_embedding=embedding,
+            medication_evidence=medication,
+            metadata=resolved_metadata,
+        )
+        record_key = (record.patient_id, record.visit_index)
+        existing_index = self._record_keys.get(record_key)
+        if existing_index is None:
+            self._record_keys[record_key] = len(self._records)
+            self._records.append(record)
+            if record.has_absolute_time:
+                self._absolute_time_records += 1
+            return
+        previous_record = self._records[existing_index]
+        if previous_record.has_absolute_time and not record.has_absolute_time:
+            self._absolute_time_records -= 1
+        elif not previous_record.has_absolute_time and record.has_absolute_time:
+            self._absolute_time_records += 1
+        self._records[existing_index] = record
+
+    def add_batch(
+        self,
+        *,
+        patient_ids: torch.Tensor | list[int],
+        visit_embeddings: torch.Tensor,
+        medication_evidence: torch.Tensor,
+        visit_mask: torch.Tensor,
+        time_delta_hours: torch.Tensor | None = None,
+        visit_time_absolute_hours: torch.Tensor | None = None,
+        visit_time_absolute_mask: torch.Tensor | None = None,
+        batch_metadata: Mapping[str, Any] | None = None,
+    ) -> None:
+        visit_embeddings = torch.as_tensor(visit_embeddings, dtype=torch.float32)
+        medication_evidence = torch.as_tensor(medication_evidence, dtype=torch.float32)
+        visit_mask = torch.as_tensor(visit_mask, dtype=torch.bool)
+        if visit_embeddings.ndim != 3:
+            raise ValueError(f"visit_embeddings must have shape (B, T, H), got {tuple(visit_embeddings.shape)}")
+        if medication_evidence.ndim != 3:
+            raise ValueError(
+                f"medication_evidence must have shape (B, T, D), got {tuple(medication_evidence.shape)}"
+            )
+        if visit_mask.ndim != 2:
+            raise ValueError(f"visit_mask must have shape (B, T), got {tuple(visit_mask.shape)}")
+        if tuple(visit_embeddings.shape[:2]) != tuple(visit_mask.shape):
+            raise ValueError(
+                "visit_embeddings and visit_mask must align on batch/time dimensions: "
+                f"got {tuple(visit_embeddings.shape[:2])} and {tuple(visit_mask.shape)}"
+            )
+        if tuple(medication_evidence.shape[:2]) != tuple(visit_mask.shape):
+            raise ValueError(
+                "medication_evidence and visit_mask must align on batch/time dimensions: "
+                f"got {tuple(medication_evidence.shape[:2])} and {tuple(visit_mask.shape)}"
+            )
+
+        patient_id_tensor = _as_tensor_1d("patient_ids", patient_ids, dtype=torch.long)
+        if patient_id_tensor.shape[0] != visit_embeddings.shape[0]:
+            raise ValueError(
+                f"patient_ids length must equal batch size {visit_embeddings.shape[0]}, got {patient_id_tensor.shape[0]}"
+            )
+        visit_times, absolute_time_mask = _infer_visit_times(
+            visit_mask=visit_mask,
+            time_delta_hours=time_delta_hours,
+            visit_time_absolute_hours=visit_time_absolute_hours,
+            visit_time_absolute_mask=visit_time_absolute_mask,
+        )
+        self.time_is_absolute = bool(self.time_is_absolute or bool(absolute_time_mask.any().item()))
+        metadata_payload = dict(batch_metadata or {})
+        for batch_index in range(visit_embeddings.shape[0]):
+            per_row_metadata = {
+                key: value[batch_index] if isinstance(value, (list, tuple)) and len(value) == visit_embeddings.shape[0] else value
+                for key, value in metadata_payload.items()
+            }
+            for step_index in range(visit_embeddings.shape[1]):
                 if not bool(visit_mask[batch_index, step_index].item()):
                     continue
-                state_rows.append(state_sequence[batch_index, step_index])
-                repr_rows.append(visit_repr[batch_index, step_index])
-                payload["subject_ids"].append(int(record["subject_id"]))
-                payload["hadm_ids"].append(int(record["hadm_id"]))
-                payload["stay_ids"].append(int(record["stay_id"]))
-                payload["visit_index"].append(int(step_index))
-                payload["visit_time_text"].append(_visit_timestamp(record, step_index))
-                dt = parse_datetime(payload["visit_time_text"][-1])
-                payload["visit_time_days"].append(
-                    0.0 if dt is None else float(dt.toordinal()) + (dt.hour / 24.0) + (dt.minute / 1440.0) + (dt.second / 86400.0)
+                self.add(
+                    patient_id=int(patient_id_tensor[batch_index].item()),
+                    visit_index=int(step_index),
+                    visit_time=float(visit_times[batch_index, step_index].item()),
+                    has_absolute_time=bool(absolute_time_mask[batch_index, step_index].item()),
+                    visit_embedding=visit_embeddings[batch_index, step_index],
+                    medication_evidence=medication_evidence[batch_index, step_index],
+                    metadata={
+                        **per_row_metadata,
+                        "step_index": int(step_index),
+                        "split_name": self.split_name,
+                    },
                 )
-                payload["target_drugs"].append(tuple(int(drug_id) for drug_id in step.get("target_drugs", [])))
-                payload["num_steps"].append(int(record.get("num_steps", 0)))
-                payload["diag_code_sets"].append(tuple(int(code_id) for code_id in step.get("diagnosis_ids", [])))
-                payload["proc_code_sets"].append(tuple(int(code_id) for code_id in step.get("procedure_ids", [])))
-                payload["lab_feature_sets"].append(_feature_set_from_mask(step.get("lab_mask")))
-                payload["vital_feature_sets"].append(_feature_set_from_mask(step.get("vital_mask")))
 
-        hidden_dim = int(state_sequence.shape[-1])
-        return cls(
-            visit_states=(
-                torch.stack(state_rows, dim=0)
-                if state_rows
-                else torch.empty((0, hidden_dim), dtype=torch.float32)
-            ),
-            visit_repr=(
-                torch.stack(repr_rows, dim=0)
-                if repr_rows
-                else torch.empty((0, hidden_dim), dtype=torch.float32)
-            ),
-            split=split,
-            **payload,
-        )
+    def build(self, *, records: list[VisitMemoryRecord]) -> "VisitMemoryBank":
+        self._records = []
+        self._record_keys = {}
+        self.embedding_dim = None
+        self.medication_dim = None
+        self._absolute_time_records = 0
+        for record in records:
+            self.add(
+                patient_id=record.patient_id,
+                visit_index=record.visit_index,
+                visit_time=record.visit_time,
+                has_absolute_time=record.has_absolute_time,
+                visit_embedding=record.visit_embedding,
+                medication_evidence=record.medication_evidence,
+                metadata=record.metadata,
+            )
+        return self
 
-    def to_payload(self) -> dict[str, Any]:
+    def export_embeddings(self) -> torch.Tensor:
+        if not self._records:
+            embedding_dim = int(self.embedding_dim or 0)
+            return torch.empty(0, embedding_dim, dtype=torch.float32)
+        return torch.stack([record.visit_embedding for record in self._records], dim=0)
+
+    def export_medication_evidence(self) -> torch.Tensor:
+        if not self._records:
+            medication_dim = int(self.medication_dim or 0)
+            return torch.empty(0, medication_dim, dtype=torch.float32)
+        return torch.stack([record.medication_evidence for record in self._records], dim=0)
+
+    def export_metadata(self) -> dict[str, Any]:
         return {
-            "visit_states": self.visit_states,
-            "visit_repr": self.visit_repr,
-            "subject_ids": self.subject_ids,
-            "hadm_ids": self.hadm_ids,
-            "stay_ids": self.stay_ids,
-            "visit_index": self.visit_index,
-            "visit_time_days": self.visit_time_days,
-            "visit_time_text": list(self.visit_time_text),
-            "target_drugs": list(self.target_drugs),
-            "num_steps": self.num_steps,
-            "diag_code_sets": list(self.diag_code_sets),
-            "proc_code_sets": list(self.proc_code_sets),
-            "lab_feature_sets": list(self.lab_feature_sets),
-            "vital_feature_sets": list(self.vital_feature_sets),
-            "split": self.split,
+            "patient_ids": torch.tensor([record.patient_id for record in self._records], dtype=torch.long),
+            "visit_indices": torch.tensor([record.visit_index for record in self._records], dtype=torch.long),
+            "visit_times": torch.tensor([record.visit_time for record in self._records], dtype=torch.float32),
+            "has_absolute_time": torch.tensor([record.has_absolute_time for record in self._records], dtype=torch.bool),
+            "metadata": [dict(record.metadata) for record in self._records],
+            "time_is_absolute": self.time_is_absolute,
+            "split_name": self.split_name,
         }
 
-    @classmethod
-    def from_payload(cls, payload: Mapping[str, Any]) -> "MemoryBank":
-        return cls(
-            visit_states=payload["visit_states"],
-            visit_repr=payload["visit_repr"],
-            subject_ids=payload["subject_ids"],
-            hadm_ids=payload["hadm_ids"],
-            stay_ids=payload["stay_ids"],
-            visit_index=payload["visit_index"],
-            visit_time_days=payload["visit_time_days"],
-            visit_time_text=payload["visit_time_text"],
-            target_drugs=payload["target_drugs"],
-            num_steps=payload["num_steps"],
-            diag_code_sets=payload["diag_code_sets"],
-            proc_code_sets=payload["proc_code_sets"],
-            lab_feature_sets=payload["lab_feature_sets"],
-            vital_feature_sets=payload["vital_feature_sets"],
-            split=str(payload["split"]),
-        )
+    def get_candidate_pool(
+        self,
+        *,
+        patient_id: int | None,
+        visit_index: int | None,
+        visit_time: float | None,
+        query_has_absolute_time: bool = False,
+        allow_same_patient: bool,
+        exclude_future: bool,
+        exclude_exact_match: bool,
+        exclude_future_all_patients_if_absolute_time: bool = True,
+        require_absolute_time_for_cross_patient_temporal_filter: bool = False,
+    ) -> dict[str, Any]:
+        if not self._records:
+            return {
+                "indices": torch.empty(0, dtype=torch.long),
+                "patient_ids": torch.empty(0, dtype=torch.long),
+                "visit_indices": torch.empty(0, dtype=torch.long),
+                "visit_times": torch.empty(0, dtype=torch.float32),
+                "has_absolute_time": torch.empty(0, dtype=torch.bool),
+                "visit_embeddings": self.export_embeddings(),
+                "medication_evidence": self.export_medication_evidence(),
+                "metadata": [],
+            }
 
-    @staticmethod
-    def artifact_path(project_root: str | Path, split: str) -> Path:
-        return ensure_dir(resolve_path(project_root, "data/artifacts/memory_bank")) / f"{split}.pt"
+        metadata = self.export_metadata()
+        mask = torch.ones(len(self._records), dtype=torch.bool)
+        patient_tensor = metadata["patient_ids"]
+        visit_index_tensor = metadata["visit_indices"]
+        visit_time_tensor = metadata["visit_times"]
+        absolute_time_tensor = metadata["has_absolute_time"]
 
-    def save(self, project_root: str | Path, *, split: str | None = None) -> Path:
-        target_split = split or self.split
-        payload = self.to_payload()
-        payload["split"] = target_split
-        return save_pt(self.artifact_path(project_root, target_split), payload)
+        if patient_id is not None and not allow_same_patient:
+            mask &= patient_tensor != int(patient_id)
+        if patient_id is not None and visit_index is not None and exclude_exact_match:
+            mask &= ~(
+                (patient_tensor == int(patient_id))
+                & (visit_index_tensor == int(visit_index))
+            )
+        if exclude_future:
+            if patient_id is not None and visit_index is not None:
+                same_patient_mask = patient_tensor == int(patient_id)
+                mask &= ~(same_patient_mask & (visit_index_tensor > int(visit_index)))
+            if (
+                query_has_absolute_time
+                and exclude_future_all_patients_if_absolute_time
+                and visit_time is not None
+            ):
+                mask &= (~absolute_time_tensor) | (visit_time_tensor <= float(visit_time))
+                if require_absolute_time_for_cross_patient_temporal_filter and patient_id is not None:
+                    cross_patient_mask = patient_tensor != int(patient_id)
+                    mask &= ~(cross_patient_mask & ~absolute_time_tensor)
 
-    @classmethod
-    def load(cls, project_root: str | Path, split: str) -> "MemoryBank":
-        return cls.from_payload(load_pt(cls.artifact_path(project_root, split)))
-
-    def slice_metadata(self, indices: torch.Tensor | Sequence[int]) -> dict[str, Any]:
-        idx = _coerce_long_tensor(indices)
+        candidate_indices = torch.nonzero(mask, as_tuple=False).flatten()
         return {
-            "subject_ids": self.subject_ids[idx],
-            "hadm_ids": self.hadm_ids[idx],
-            "stay_ids": self.stay_ids[idx],
-            "visit_index": self.visit_index[idx],
-            "visit_time_days": self.visit_time_days[idx],
-            "visit_time_text": [self.visit_time_text[int(i)] for i in idx.tolist()],
-            "target_drugs": [self.target_drugs[int(i)] for i in idx.tolist()],
-            "diag_code_sets": [self.diag_code_sets[int(i)] for i in idx.tolist()],
-            "proc_code_sets": [self.proc_code_sets[int(i)] for i in idx.tolist()],
-            "lab_feature_sets": [self.lab_feature_sets[int(i)] for i in idx.tolist()],
-            "vital_feature_sets": [self.vital_feature_sets[int(i)] for i in idx.tolist()],
-            "num_steps": self.num_steps[idx],
-            "split": self.split,
+            "indices": candidate_indices,
+            "patient_ids": patient_tensor[candidate_indices],
+            "visit_indices": visit_index_tensor[candidate_indices],
+            "visit_times": visit_time_tensor[candidate_indices],
+            "has_absolute_time": absolute_time_tensor[candidate_indices],
+            "visit_embeddings": self.export_embeddings()[candidate_indices],
+            "medication_evidence": self.export_medication_evidence()[candidate_indices],
+            "metadata": [metadata["metadata"][int(index)] for index in candidate_indices.tolist()],
         }
 
+    def save(self, path: str | Path) -> Path:
+        destination = Path(path)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "split_name": self.split_name,
+            "time_is_absolute": self.time_is_absolute,
+            "embedding_dim": self.embedding_dim,
+            "medication_dim": self.medication_dim,
+            "absolute_time_records": self._absolute_time_records,
+            "records": [
+                {
+                    "patient_id": record.patient_id,
+                    "visit_index": record.visit_index,
+                    "visit_time": record.visit_time,
+                    "has_absolute_time": record.has_absolute_time,
+                    "visit_embedding": record.visit_embedding,
+                    "medication_evidence": record.medication_evidence,
+                    "metadata": record.metadata,
+                }
+                for record in self._records
+            ],
+        }
+        torch.save(payload, destination)
+        return destination
 
-def build_last_visit_queries(
-    records: Sequence[Mapping[str, Any]],
-    encoder_outputs: Mapping[str, torch.Tensor],
-    *,
-    split: str | None = None,
-) -> tuple[torch.Tensor, dict[str, Any]]:
-    state_sequence = torch.as_tensor(encoder_outputs["state_sequence"], dtype=torch.float32).cpu()
-    visit_mask = torch.as_tensor(encoder_outputs["visit_mask"], dtype=torch.bool).cpu()
-    if len(records) != int(state_sequence.shape[0]):
-        raise ValueError("Record count must match encoder output batch size")
-
-    query_states: list[torch.Tensor] = []
-    metadata: dict[str, list[Any]] = {
-        "stay_ids": [],
-        "subject_ids": [],
-        "hadm_ids": [],
-        "visit_indices": [],
-        "visit_times": [],
-        "visit_time_days": [],
-        "diag_code_sets": [],
-        "proc_code_sets": [],
-        "lab_feature_sets": [],
-        "vital_feature_sets": [],
-        "split": [],
-    }
-    for batch_index, record in enumerate(records):
-        valid_steps = int(visit_mask[batch_index].sum().item())
-        if valid_steps <= 0:
-            raise ValueError("Each query record must contain at least one valid visit")
-        visit_index = valid_steps - 1
-        step = record["steps"][visit_index]
-        visit_time_text = _visit_timestamp(record, visit_index)
-        dt = parse_datetime(visit_time_text)
-        query_states.append(state_sequence[batch_index, visit_index])
-        metadata["stay_ids"].append(int(record["stay_id"]))
-        metadata["subject_ids"].append(int(record["subject_id"]))
-        metadata["hadm_ids"].append(int(record["hadm_id"]))
-        metadata["visit_indices"].append(int(visit_index))
-        metadata["visit_times"].append(visit_time_text)
-        metadata["visit_time_days"].append(
-            0.0 if dt is None else float(dt.toordinal()) + (dt.hour / 24.0) + (dt.minute / 1440.0) + (dt.second / 86400.0)
+    @classmethod
+    def load(cls, path: str | Path) -> "VisitMemoryBank":
+        payload = torch.load(Path(path), map_location="cpu", weights_only=False)
+        bank = cls(
+            split_name=payload.get("split_name"),
+            time_is_absolute=bool(payload.get("time_is_absolute", False)),
         )
-        metadata["diag_code_sets"].append(tuple(int(code_id) for code_id in step.get("diagnosis_ids", [])))
-        metadata["proc_code_sets"].append(tuple(int(code_id) for code_id in step.get("procedure_ids", [])))
-        metadata["lab_feature_sets"].append(_feature_set_from_mask(step.get("lab_mask")))
-        metadata["vital_feature_sets"].append(_feature_set_from_mask(step.get("vital_mask")))
-        record_split = record.get("split")
-        resolved_split = split if split is not None else record_split
-        metadata["split"].append(None if resolved_split is None else str(resolved_split))
-    hidden_dim = int(state_sequence.shape[-1])
-    query_state_tensor = (
-        torch.stack(query_states, dim=0)
-        if query_states
-        else torch.empty((0, hidden_dim), dtype=torch.float32)
-    )
-    return query_state_tensor, metadata
+        bank.embedding_dim = payload.get("embedding_dim")
+        bank.medication_dim = payload.get("medication_dim")
+        bank._absolute_time_records = 0
+        for item in payload.get("records", []):
+            bank.add(
+                patient_id=int(item["patient_id"]),
+                visit_index=int(item["visit_index"]),
+                visit_time=float(item["visit_time"]),
+                has_absolute_time=bool(item.get("has_absolute_time", payload.get("time_is_absolute", False))),
+                visit_embedding=torch.as_tensor(item["visit_embedding"], dtype=torch.float32),
+                medication_evidence=torch.as_tensor(item["medication_evidence"], dtype=torch.float32),
+                metadata=dict(item.get("metadata", {})),
+            )
+        return bank
+
+
+__all__ = ["VisitMemoryBank", "VisitMemoryRecord"]

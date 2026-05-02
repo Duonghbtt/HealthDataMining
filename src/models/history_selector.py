@@ -1,825 +1,427 @@
 from __future__ import annotations
 
+import math
 from typing import Any, Mapping
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 
-from src.retrieval.memory_bank import MemoryBank
-
-
-ATTRIBUTE_ORDER = ("diagnosis", "procedure", "lab", "vital", "medication")
-ATTRIBUTE_METADATA_FIELDS = {
-    "diagnosis": "diag_code_sets",
-    "procedure": "proc_code_sets",
-    "lab": "lab_feature_sets",
-    "vital": "vital_feature_sets",
-    "medication": "target_drugs",
+_VALID_SELECTION_MODES = {"none", "visit_only", "visit_attribute"}
+_VALID_ATTENTION_TYPES = {"softmax", "softmax_topk", "sparse_simple"}
+_ATTRIBUTE_ALIASES = {
+    "diagnosis": ("diagnosis", "diag", "diag_history_states", "diagnosis_history_states"),
+    "procedure": ("procedure", "proc", "proc_history_states", "procedure_history_states"),
+    "lab_vital": ("lab_vital", "lab_vital_history_states"),
+    "medication_history": ("medication_history", "med_history", "med_history_states", "medication_history_states"),
 }
 
 
-def _masked_softmax_dim(scores: torch.Tensor, mask: torch.Tensor, *, dim: int) -> torch.Tensor:
-    if scores.shape != mask.shape:
-        raise ValueError(f"Score shape {tuple(scores.shape)} must match mask shape {tuple(mask.shape)}")
-    masked_scores = scores.masked_fill(~mask, float("-inf"))
-    weights = torch.softmax(masked_scores, dim=dim)
-    weights = torch.where(mask, weights, torch.zeros_like(weights))
-    normalizer = weights.sum(dim=dim, keepdim=True)
-    safe_normalizer = torch.where(normalizer > 0, normalizer, torch.ones_like(normalizer))
-    return weights / safe_normalizer
+def _validate_shapes(
+    current_state: torch.Tensor,
+    history_states: torch.Tensor,
+    history_mask: torch.Tensor,
+    hidden_dim: int,
+) -> None:
+    if current_state.ndim != 2:
+        raise ValueError(f"current_state must have shape (B, H), got {tuple(current_state.shape)}")
+    if history_states.ndim != 3:
+        raise ValueError(f"history_states must have shape (B, T, H), got {tuple(history_states.shape)}")
+    if history_mask.ndim != 2:
+        raise ValueError(f"history_mask must have shape (B, T), got {tuple(history_mask.shape)}")
+    if tuple(history_states.shape[:2]) != tuple(history_mask.shape):
+        raise ValueError(
+            "history_states and history_mask must align on batch/time dimensions: "
+            f"got {tuple(history_states.shape[:2])} and {tuple(history_mask.shape)}"
+        )
+    if current_state.shape[0] != history_states.shape[0]:
+        raise ValueError(
+            "current_state and history_states must align on batch dimension: "
+            f"got {tuple(current_state.shape)} and {tuple(history_states.shape)}"
+        )
+    if current_state.shape[1] != hidden_dim:
+        raise ValueError(f"Expected hidden dimension {hidden_dim}, got {int(current_state.shape[1])}")
 
 
-def _masked_softmax(scores: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    if scores.ndim != 2:
-        raise ValueError(f"Expected (B, N) scores, got shape {tuple(scores.shape)}")
-    return _masked_softmax_dim(scores, mask, dim=-1)
+def _normalize_mode(selection_mode: str) -> str:
+    normalized = str(selection_mode).strip().lower()
+    if normalized not in _VALID_SELECTION_MODES:
+        raise ValueError(f"selection_mode must be one of {_VALID_SELECTION_MODES}, got {selection_mode!r}")
+    return normalized
 
 
-def _gather_bank_states(
-    memory_bank: MemoryBank,
-    indices: torch.Tensor,
-    *,
-    device: torch.device,
-) -> torch.Tensor:
-    if indices.ndim != 2:
-        raise ValueError(f"Expected neighbor indices with shape (B, K), got {tuple(indices.shape)}")
-    flat = indices.clamp(min=0).flatten().cpu()
-    gathered = memory_bank.visit_states.index_select(0, flat).to(device=device, dtype=torch.float32)
-    hidden_dim = int(memory_bank.visit_states.shape[1])
-    return gathered.view(indices.shape[0], indices.shape[1], hidden_dim)
+def _normalize_attention_type(attention_type: str) -> str:
+    normalized = str(attention_type).strip().lower()
+    if normalized not in _VALID_ATTENTION_TYPES:
+        raise ValueError(f"attention_type must be one of {_VALID_ATTENTION_TYPES}, got {attention_type!r}")
+    return normalized
 
 
-def _masked_weighted_sum(values: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
-    return (values * weights.unsqueeze(-1)).sum(dim=1)
+def _infer_history_mask(visit_mask: torch.Tensor) -> torch.Tensor:
+    resolved_mask = visit_mask.to(dtype=torch.bool)
+    valid_counts = resolved_mask.sum(dim=1)
+    if bool((valid_counts <= 0).any().item()):
+        raise ValueError("Each sample must contain at least one valid visit")
+    batch_size, time_steps = resolved_mask.shape
+    visit_indices = torch.arange(time_steps, device=resolved_mask.device).unsqueeze(0).expand(batch_size, -1)
+    last_valid_index = valid_counts.to(dtype=torch.long) - 1
+    return resolved_mask & (visit_indices < last_valid_index.unsqueeze(-1))
 
 
-def _sparsify_weights(
-    weights: torch.Tensor,
-    mask: torch.Tensor,
+def _selected_indices_to_mask(selected_visit_indices: torch.Tensor, history_mask: torch.Tensor) -> torch.Tensor:
+    if selected_visit_indices.ndim != 2:
+        raise ValueError(f"selected_visit_indices must have shape (B, K), got {tuple(selected_visit_indices.shape)}")
+    selected_mask = torch.zeros_like(history_mask, dtype=torch.bool)
+    valid_selected = selected_visit_indices >= 0
+    if bool(valid_selected.any().item()):
+        selected_mask.scatter_(1, selected_visit_indices.masked_fill(~valid_selected, 0), valid_selected)
+    return selected_mask & history_mask
+
+
+def _extract_selected_visit_indices(
+    attention_weights: torch.Tensor,
+    history_mask: torch.Tensor,
     *,
     top_k: int | None,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> torch.Tensor:
+    batch_size, time_steps = attention_weights.shape
     if top_k is None:
-        selected_mask = mask.clone()
-        sparse_weights = torch.where(mask, weights, torch.zeros_like(weights))
-        return sparse_weights, selected_mask
-    if top_k <= 0:
-        raise ValueError("top_k must be positive when provided")
-    sparse_rows: list[torch.Tensor] = []
-    selected_rows: list[torch.Tensor] = []
-    for row_index in range(weights.shape[0]):
-        row_mask = mask[row_index]
-        valid_count = int(row_mask.sum().item())
-        row_selected = torch.zeros_like(row_mask, dtype=torch.bool)
-        row_sparse = torch.zeros_like(weights[row_index])
-        if valid_count <= 0:
-            selected_rows.append(row_selected)
-            sparse_rows.append(row_sparse)
-            continue
-        keep = min(int(top_k), valid_count)
-        row_values = weights[row_index].masked_fill(~row_mask, float("-inf"))
-        top_positions = torch.topk(row_values, k=keep, dim=-1).indices
-        row_selected = row_selected.scatter(
-            0,
-            top_positions,
-            torch.ones_like(top_positions, dtype=torch.bool),
-        )
-        row_sparse = torch.where(row_selected, weights[row_index], row_sparse)
-        denom = row_sparse.sum().clamp(min=torch.finfo(row_sparse.dtype).eps)
-        row_sparse = row_sparse / denom
-        selected_rows.append(row_selected)
-        sparse_rows.append(row_sparse)
-    sparse_weights = torch.stack(sparse_rows, dim=0)
-    selected_mask = torch.stack(selected_rows, dim=0)
-    return sparse_weights, selected_mask
+        selection_width = time_steps
+    else:
+        if int(top_k) <= 0:
+            raise ValueError("top_k must be positive when provided")
+        selection_width = min(int(top_k), time_steps)
+    if selection_width == 0:
+        return torch.empty(batch_size, 0, dtype=torch.long, device=attention_weights.device)
+
+    masked_weights = attention_weights.masked_fill(~history_mask, -1.0)
+    ordered_indices = torch.argsort(masked_weights, dim=-1, descending=True)
+    selected_indices = ordered_indices[:, :selection_width].to(dtype=torch.long)
+    selected_mask = history_mask.gather(1, selected_indices)
+    return torch.where(selected_mask, selected_indices, torch.full_like(selected_indices, -1))
 
 
-def _empty_attribute_tensor(
-    batch_size: int,
-    candidate_count: int,
-    hidden_dim: int,
-    *,
-    device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    weight_tensor = torch.zeros(
-        batch_size,
-        candidate_count,
-        len(ATTRIBUTE_ORDER),
-        dtype=torch.float32,
-        device=device,
-    )
-    value_tensor = torch.zeros(
-        batch_size,
-        candidate_count,
-        len(ATTRIBUTE_ORDER),
-        hidden_dim,
-        dtype=torch.float32,
-        device=device,
-    )
-    return weight_tensor, value_tensor
+def _renormalize_rows(weights: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
+    resolved_weights = torch.where(valid_mask, weights, torch.zeros_like(weights))
+    denom = resolved_weights.sum(dim=-1, keepdim=True)
+    return resolved_weights / torch.where(denom > 0, denom, torch.ones_like(denom))
 
 
-class HistorySelector(nn.Module):
-    def __init__(
-        self,
-        hidden_dim: int,
-        *,
-        dropout: float = 0.1,
-        score_bias_weight: float = 0.5,
-        self_top_k: int | None = 3,
-        neighbor_top_k: int | None = 3,
-        use_retrieval_bias: bool = True,
-        use_attribute_gate: bool = True,
-        use_group_reweight: bool = True,
-        group_reweight_weight: float = 0.35,
-    ) -> None:
+def _masked_uniform(valid_mask: torch.Tensor, *, dtype: torch.dtype) -> torch.Tensor:
+    weights = valid_mask.to(dtype=dtype)
+    denom = weights.sum(dim=-1, keepdim=True)
+    return weights / torch.where(denom > 0, denom, torch.ones_like(denom))
+
+
+class _AttentionPool(nn.Module):
+    def __init__(self, hidden_dim: int, *, dropout: float = 0.0) -> None:
         super().__init__()
-        self.hidden_dim = hidden_dim
-        self.score_bias_weight = float(score_bias_weight)
-        self.self_top_k = self_top_k
-        self.neighbor_top_k = neighbor_top_k
-        self.use_retrieval_bias = bool(use_retrieval_bias)
-        self.use_attribute_gate = bool(use_attribute_gate)
-        self.use_group_reweight = bool(use_group_reweight)
-        self.group_reweight_weight = float(group_reweight_weight)
+        self.hidden_dim = int(hidden_dim)
+        self.query_proj = nn.Linear(self.hidden_dim, self.hidden_dim)
+        self.key_proj = nn.LazyLinear(self.hidden_dim)
+        self.value_proj = nn.LazyLinear(self.hidden_dim)
+        self.dropout = nn.Dropout(float(dropout))
 
-        self.self_query = nn.Linear(hidden_dim, hidden_dim)
-        self.self_key = nn.Linear(hidden_dim, hidden_dim)
-        self.self_value = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-        )
-
-        self.neighbor_query = nn.Linear(hidden_dim, hidden_dim)
-        self.neighbor_key = nn.Linear(hidden_dim, hidden_dim)
-        self.neighbor_value = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-        )
-
-        self.attribute_query = nn.ModuleDict(
-            {
-                branch_name: nn.Linear(hidden_dim, hidden_dim)
-                for branch_name in ("self", "neighbor")
-            }
-        )
-        self.attribute_key = nn.ModuleDict(
-            {
-                branch_name: nn.ModuleDict(
-                    {attribute_name: nn.Linear(hidden_dim, hidden_dim) for attribute_name in ATTRIBUTE_ORDER}
-                )
-                for branch_name in ("self", "neighbor")
-            }
-        )
-        self.attribute_value = nn.ModuleDict(
-            {
-                branch_name: nn.ModuleDict(
-                    {
-                        attribute_name: nn.Sequential(
-                            nn.Linear(hidden_dim, hidden_dim),
-                            nn.ReLU(),
-                            nn.Dropout(dropout),
-                        )
-                        for attribute_name in ATTRIBUTE_ORDER
-                    }
-                )
-                for branch_name in ("self", "neighbor")
-            }
-        )
-        self.attribute_fallback = nn.ModuleDict(
-            {
-                branch_name: nn.ModuleDict(
-                    {
-                        attribute_name: nn.Sequential(
-                            nn.Linear(hidden_dim, hidden_dim),
-                            nn.ReLU(),
-                            nn.Dropout(dropout),
-                        )
-                        for attribute_name in ATTRIBUTE_ORDER
-                    }
-                )
-                for branch_name in ("self", "neighbor")
-            }
-        )
-        self.group_reweight_head = nn.ModuleDict(
-            {
-                branch_name: nn.Sequential(
-                    nn.Linear(hidden_dim * 2, hidden_dim),
-                    nn.Tanh(),
-                    nn.Dropout(dropout),
-                    nn.Linear(hidden_dim, 1),
-                )
-                for branch_name in ("self", "neighbor")
-            }
-        )
-
-    def _branch_attribute_payload(
+    def _apply_attention(
         self,
-        attribute_payload: Mapping[str, Any] | None,
+        scores: torch.Tensor,
+        valid_mask: torch.Tensor,
         *,
-        branch_name: str,
-    ) -> Mapping[str, Any] | None:
-        if attribute_payload is None:
-            return None
-        branch_payload = attribute_payload.get(branch_name)
-        if isinstance(branch_payload, Mapping):
-            return branch_payload
-        if any(attribute_name in attribute_payload for attribute_name in ATTRIBUTE_ORDER):
-            return attribute_payload
-        return None
+        attention_type: str,
+        prior_weights: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if attention_type == "sparse_simple":
+            positive_scores = torch.relu(torch.where(valid_mask, scores, torch.zeros_like(scores)))
+            if prior_weights is not None:
+                positive_scores = positive_scores * torch.where(valid_mask, prior_weights, torch.zeros_like(positive_scores))
+            denom = positive_scores.sum(dim=-1, keepdim=True)
+            uniform = _masked_uniform(valid_mask, dtype=scores.dtype)
+            return torch.where(denom > 0, positive_scores / denom, uniform)
 
-    def _attribute_mask_from_payload(
-        self,
-        branch_payload: Mapping[str, Any] | None,
-        *,
-        attribute_name: str,
-        expected_shape: tuple[int, int],
-        device: torch.device,
-    ) -> torch.Tensor | None:
-        if branch_payload is None:
-            return None
-        mask_payload = branch_payload.get("masks") or branch_payload.get("mask")
-        raw_mask = None
-        if isinstance(mask_payload, Mapping):
-            raw_mask = mask_payload.get(attribute_name)
-        if raw_mask is None:
-            raw_mask = branch_payload.get(f"{attribute_name}_mask")
-        if raw_mask is None:
-            return None
-        mask = torch.as_tensor(raw_mask, dtype=torch.bool, device=device)
-        if tuple(mask.shape) != expected_shape:
-            raise ValueError(
-                f"Attribute mask for {attribute_name} must have shape {expected_shape}, got {tuple(mask.shape)}"
-            )
-        return mask
-
-    def _attribute_representation_from_payload(
-        self,
-        branch_payload: Mapping[str, Any] | None,
-        *,
-        attribute_name: str,
-        expected_shape: tuple[int, int, int],
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> torch.Tensor | None:
-        if branch_payload is None:
-            return None
-        representation_payload = branch_payload.get("representations", branch_payload)
-        raw_repr = None
-        if isinstance(representation_payload, Mapping):
-            raw_repr = representation_payload.get(attribute_name)
-        if raw_repr is None:
-            raw_repr = branch_payload.get(f"{attribute_name}_repr")
-        if raw_repr is None:
-            return None
-        tensor = torch.as_tensor(raw_repr, dtype=dtype, device=device)
-        if tuple(tensor.shape) != expected_shape:
-            raise ValueError(
-                f"Attribute representation for {attribute_name} must have shape {expected_shape}, got {tuple(tensor.shape)}"
-            )
-        return tensor
-
-    def _neighbor_attribute_masks(
-        self,
-        memory_bank: MemoryBank,
-        neighbor_indices: torch.Tensor,
-        neighbor_mask: torch.Tensor,
-    ) -> dict[str, torch.Tensor]:
-        masks = {
-            attribute_name: torch.zeros_like(neighbor_mask, dtype=torch.bool)
-            for attribute_name in ATTRIBUTE_ORDER
-        }
-        for row_index in range(neighbor_indices.shape[0]):
-            for col_index in range(neighbor_indices.shape[1]):
-                if not bool(neighbor_mask[row_index, col_index].item()):
-                    continue
-                bank_index = int(neighbor_indices[row_index, col_index].item())
-                for attribute_name, field_name in ATTRIBUTE_METADATA_FIELDS.items():
-                    masks[attribute_name][row_index, col_index] = len(getattr(memory_bank, field_name)[bank_index]) > 0
-        return masks
-
-    def _compute_attribute_evidence(
-        self,
-        *,
-        branch_name: str,
-        current_state: torch.Tensor,
-        candidate_states: torch.Tensor,
-        candidate_mask: torch.Tensor,
-        branch_attribute_payload: Mapping[str, Any] | None,
-        metadata_attribute_masks: Mapping[str, torch.Tensor] | None,
-    ) -> dict[str, torch.Tensor | list[str]]:
-        batch_size, candidate_count, hidden_dim = candidate_states.shape
-        device = candidate_states.device
-        if hidden_dim != self.hidden_dim:
-            raise ValueError(f"Expected candidate hidden dim {self.hidden_dim}, got {hidden_dim}")
-        if candidate_count == 0:
-            empty_scores, empty_values = _empty_attribute_tensor(
-                batch_size,
-                candidate_count,
-                hidden_dim,
-                device=device,
-            )
-            empty_mask = torch.zeros_like(empty_scores, dtype=torch.bool)
-            empty_candidate_mask = torch.zeros(batch_size, candidate_count, dtype=torch.bool, device=device)
-            return {
-                "candidate_evidence": torch.zeros_like(candidate_states),
-                "attribute_scores": empty_scores,
-                "attribute_weights": empty_scores,
-                "attribute_values": empty_values,
-                "attribute_mask": empty_mask,
-                "attribute_available_mask": empty_candidate_mask,
-                "attribute_fallback_mask": empty_candidate_mask,
-                "attribute_sources": ["fallback"] * len(ATTRIBUTE_ORDER),
-            }
-
-        query = self.attribute_query[branch_name](current_state)
-        attribute_scores = []
-        attribute_values = []
-        attribute_masks = []
-        attribute_sources = []
-        expected_shape = (batch_size, candidate_count, hidden_dim)
-        expected_mask_shape = (batch_size, candidate_count)
-
-        for attribute_name in ATTRIBUTE_ORDER:
-            provided_repr = self._attribute_representation_from_payload(
-                branch_payload=branch_attribute_payload,
-                attribute_name=attribute_name,
-                expected_shape=expected_shape,
-                device=device,
-                dtype=candidate_states.dtype,
-            )
-            if provided_repr is None:
-                attribute_repr = self.attribute_fallback[branch_name][attribute_name](candidate_states)
-                attribute_sources.append("fallback")
-            else:
-                attribute_repr = provided_repr
-                attribute_sources.append("provided")
-
-            attribute_mask = candidate_mask.clone()
-            payload_mask = self._attribute_mask_from_payload(
-                branch_payload=branch_attribute_payload,
-                attribute_name=attribute_name,
-                expected_shape=expected_mask_shape,
-                device=device,
-            )
-            if payload_mask is not None:
-                attribute_mask = attribute_mask & payload_mask
-            elif metadata_attribute_masks is not None and attribute_name in metadata_attribute_masks:
-                attribute_mask = attribute_mask & metadata_attribute_masks[attribute_name].to(device=device, dtype=torch.bool)
-
-            attribute_key = self.attribute_key[branch_name][attribute_name](attribute_repr)
-            raw_score = torch.einsum("bnh,bh->bn", attribute_key, query) / (self.hidden_dim ** 0.5)
-            attribute_scores.append(raw_score.unsqueeze(-1))
-            attribute_values.append(self.attribute_value[branch_name][attribute_name](attribute_repr).unsqueeze(2))
-            attribute_masks.append(attribute_mask.unsqueeze(-1))
-
-        attribute_scores_tensor = torch.cat(attribute_scores, dim=-1)
-        attribute_values_tensor = torch.cat(attribute_values, dim=2)
-        attribute_mask_tensor = torch.cat(attribute_masks, dim=-1)
-        score_basis = attribute_scores_tensor if self.use_attribute_gate else torch.zeros_like(attribute_scores_tensor)
-        attribute_weights = _masked_softmax_dim(score_basis, attribute_mask_tensor, dim=-1)
-        candidate_evidence = (attribute_values_tensor * attribute_weights.unsqueeze(-1)).sum(dim=2)
-        attribute_available_mask = attribute_mask_tensor.any(dim=-1)
-        attribute_fallback_mask = candidate_mask & ~attribute_available_mask
-        candidate_evidence = torch.where(attribute_available_mask.unsqueeze(-1), candidate_evidence, candidate_states)
-        candidate_evidence = torch.where(
-            candidate_mask.unsqueeze(-1),
-            candidate_evidence,
-            torch.zeros_like(candidate_evidence),
-        )
-        return {
-            "candidate_evidence": candidate_evidence,
-            "attribute_scores": torch.where(attribute_mask_tensor, attribute_scores_tensor, torch.zeros_like(attribute_scores_tensor)),
-            "attribute_weights": attribute_weights,
-            "attribute_values": attribute_values_tensor,
-            "attribute_mask": attribute_mask_tensor,
-            "attribute_available_mask": attribute_available_mask,
-            "attribute_fallback_mask": attribute_fallback_mask,
-            "attribute_sources": attribute_sources,
-        }
-
-    def _apply_group_reweight(
-        self,
-        *,
-        branch_name: str,
-        candidate_evidence: torch.Tensor,
-        candidate_mask: torch.Tensor,
-        base_scores: torch.Tensor,
-        group_context: torch.Tensor | None,
-        group_available_mask: torch.Tensor | None,
-    ) -> dict[str, torch.Tensor | bool]:
-        batch_size, candidate_count, _ = candidate_evidence.shape
-        device = candidate_evidence.device
-        zero = torch.zeros(batch_size, candidate_count, dtype=candidate_evidence.dtype, device=device)
-        zero_mask = torch.zeros(batch_size, candidate_count, dtype=torch.bool, device=device)
-        if (
-            not self.use_group_reweight
-            or group_context is None
-            or group_available_mask is None
-            or candidate_count == 0
-        ):
-            return {
-                "scores": base_scores,
-                "group_reweight_scores": zero,
-                "group_influence": zero,
-                "group_cosine_scores": zero,
-                "group_used_mask": zero_mask,
-                "group_used": False,
-            }
-        resolved_group_mask = group_available_mask.to(device=device, dtype=torch.bool)
-        expanded_group = group_context.unsqueeze(1).expand(-1, candidate_count, -1)
-        cosine_scores = F.cosine_similarity(candidate_evidence, expanded_group, dim=-1, eps=1.0e-8)
-        learned_scores = self.group_reweight_head[branch_name](
-            torch.cat([candidate_evidence, expanded_group], dim=-1)
-        ).squeeze(-1)
-        group_reweight_scores = 0.5 * (cosine_scores + learned_scores)
-        group_used_mask = candidate_mask & resolved_group_mask.unsqueeze(-1)
-        group_reweight_scores = torch.where(group_used_mask, group_reweight_scores, torch.zeros_like(group_reweight_scores))
-        group_influence = self.group_reweight_weight * group_reweight_scores
-        return {
-            "scores": base_scores + group_influence,
-            "group_reweight_scores": group_reweight_scores,
-            "group_influence": group_influence,
-            "group_cosine_scores": torch.where(group_used_mask, cosine_scores, torch.zeros_like(cosine_scores)),
-            "group_used_mask": group_used_mask,
-            "group_used": bool(group_used_mask.any().item()),
-        }
-
-    def _select_self_history(
-        self,
-        current_state: torch.Tensor,
-        state_sequence: torch.Tensor,
-        visit_mask: torch.Tensor,
-        *,
-        branch_attribute_payload: Mapping[str, Any] | None,
-        group_context: torch.Tensor | None,
-        group_available_mask: torch.Tensor | None,
-    ) -> dict[str, torch.Tensor | list[str] | bool]:
-        batch_size, time_steps, hidden_dim = state_sequence.shape
-        if hidden_dim != self.hidden_dim:
-            raise ValueError(
-                f"Expected state_sequence hidden dim {self.hidden_dim}, got {hidden_dim}"
-            )
-
-        visit_indices = torch.arange(time_steps, device=state_sequence.device).unsqueeze(0).expand(batch_size, -1)
-        current_visit_index = visit_mask.sum(dim=-1).to(dtype=torch.long) - 1
-        self_mask = visit_mask & (visit_indices < current_visit_index.unsqueeze(-1))
-
-        attribute_outputs = self._compute_attribute_evidence(
-            branch_name="self",
-            current_state=current_state,
-            candidate_states=state_sequence,
-            candidate_mask=self_mask,
-            branch_attribute_payload=branch_attribute_payload,
-            metadata_attribute_masks=None,
-        )
-        candidate_evidence = attribute_outputs["candidate_evidence"]
-        query = self.self_query(current_state).unsqueeze(1)
-        keys = self.self_key(candidate_evidence)
-        content_scores = torch.einsum("bth,bqh->bt", keys, query) / (self.hidden_dim ** 0.5)
-        group_outputs = self._apply_group_reweight(
-            branch_name="self",
-            candidate_evidence=candidate_evidence,
-            candidate_mask=self_mask,
-            base_scores=content_scores,
-            group_context=group_context,
-            group_available_mask=group_available_mask,
-        )
-        scores = group_outputs["scores"]
-        dense_weights = _masked_softmax(scores, self_mask)
-        weights, selected_mask = _sparsify_weights(dense_weights, self_mask, top_k=self.self_top_k)
-        values = self.self_value(candidate_evidence)
-        context = _masked_weighted_sum(values, weights)
-        available_mask = self_mask.any(dim=-1)
-        top_positions = weights.argmax(dim=-1)
-        top_indices = torch.where(
-            available_mask,
-            visit_indices.gather(1, top_positions.unsqueeze(-1)).squeeze(-1),
-            torch.full_like(top_positions, -1),
-        )
-        return {
-            "context": context,
-            "available_mask": available_mask,
-            "weights": weights,
-            "dense_weights": dense_weights,
-            "content_scores": torch.where(self_mask, content_scores, torch.zeros_like(content_scores)),
-            "scores": torch.where(self_mask, scores, torch.zeros_like(scores)),
-            "indices": visit_indices,
-            "mask": self_mask,
-            "selected_mask": selected_mask,
-            "selected_count": selected_mask.sum(dim=-1),
-            "top_index": top_indices,
-            "current_visit_index": current_visit_index,
-            "attribute_scores": attribute_outputs["attribute_scores"],
-            "attribute_weights": attribute_outputs["attribute_weights"],
-            "attribute_mask": attribute_outputs["attribute_mask"],
-            "attribute_available_mask": attribute_outputs["attribute_available_mask"],
-            "attribute_fallback_mask": attribute_outputs["attribute_fallback_mask"],
-            "attribute_sources": attribute_outputs["attribute_sources"],
-            "group_reweight_scores": group_outputs["group_reweight_scores"],
-            "group_influence": group_outputs["group_influence"],
-            "group_cosine_scores": group_outputs["group_cosine_scores"],
-            "group_used_mask": group_outputs["group_used_mask"],
-            "group_used": group_outputs["group_used"],
-        }
-
-    def _select_neighbor_history(
-        self,
-        current_state: torch.Tensor,
-        retrieval_payload: Mapping[str, Any] | None,
-        memory_bank: MemoryBank | None,
-        *,
-        branch_attribute_payload: Mapping[str, Any] | None,
-        group_context: torch.Tensor | None,
-        group_available_mask: torch.Tensor | None,
-    ) -> dict[str, torch.Tensor | list[str] | bool]:
-        batch_size = current_state.shape[0]
-        device = current_state.device
-        if retrieval_payload is None or memory_bank is None:
-            empty = torch.zeros(batch_size, 0, dtype=torch.float32, device=device)
-            empty_long = torch.zeros(batch_size, 0, dtype=torch.long, device=device)
-            empty_bool = torch.zeros(batch_size, 0, dtype=torch.bool, device=device)
-            empty_attr = torch.zeros(batch_size, 0, len(ATTRIBUTE_ORDER), dtype=torch.float32, device=device)
-            return {
-                "context": torch.zeros_like(current_state),
-                "available_mask": torch.zeros(batch_size, dtype=torch.bool, device=device),
-                "weights": empty,
-                "dense_weights": empty,
-                "content_scores": empty,
-                "scores": empty,
-                "indices": empty_long,
-                "mask": empty_bool,
-                "selected_mask": empty_bool,
-                "selected_count": torch.zeros(batch_size, dtype=torch.long, device=device),
-                "top_index": torch.full((batch_size,), -1, dtype=torch.long, device=device),
-                "matched_visit_indices": empty_long,
-                "retrieval_scores": empty,
-                "retrieval_bias": empty,
-                "neighbor_stay_ids": empty_long,
-                "attribute_scores": empty_attr,
-                "attribute_weights": empty_attr,
-                "attribute_mask": torch.zeros_like(empty_attr, dtype=torch.bool),
-                "attribute_available_mask": empty_bool,
-                "attribute_fallback_mask": empty_bool,
-                "attribute_sources": ["fallback"] * len(ATTRIBUTE_ORDER),
-                "group_reweight_scores": empty,
-                "group_influence": empty,
-                "group_cosine_scores": empty,
-                "group_used_mask": empty_bool,
-                "group_used": False,
-            }
-
-        neighbor_indices = torch.as_tensor(retrieval_payload["neighbor_indices"], dtype=torch.long, device=device)
-        if neighbor_indices.shape[1] == 0:
-            empty = torch.zeros(batch_size, 0, dtype=torch.float32, device=device)
-            empty_long = torch.zeros(batch_size, 0, dtype=torch.long, device=device)
-            empty_bool = torch.zeros(batch_size, 0, dtype=torch.bool, device=device)
-            empty_attr = torch.zeros(batch_size, 0, len(ATTRIBUTE_ORDER), dtype=torch.float32, device=device)
-            return {
-                "context": torch.zeros_like(current_state),
-                "available_mask": torch.zeros(batch_size, dtype=torch.bool, device=device),
-                "weights": empty,
-                "dense_weights": empty,
-                "content_scores": empty,
-                "scores": empty,
-                "indices": empty_long,
-                "mask": empty_bool,
-                "selected_mask": empty_bool,
-                "selected_count": torch.zeros(batch_size, dtype=torch.long, device=device),
-                "top_index": torch.full((batch_size,), -1, dtype=torch.long, device=device),
-                "matched_visit_indices": empty_long,
-                "retrieval_scores": empty,
-                "retrieval_bias": empty,
-                "neighbor_stay_ids": empty_long,
-                "attribute_scores": empty_attr,
-                "attribute_weights": empty_attr,
-                "attribute_mask": torch.zeros_like(empty_attr, dtype=torch.bool),
-                "attribute_available_mask": empty_bool,
-                "attribute_fallback_mask": empty_bool,
-                "attribute_sources": ["fallback"] * len(ATTRIBUTE_ORDER),
-                "group_reweight_scores": empty,
-                "group_influence": empty,
-                "group_cosine_scores": empty,
-                "group_used_mask": empty_bool,
-                "group_used": False,
-            }
-        neighbor_mask = neighbor_indices >= 0
-        neighbor_states = _gather_bank_states(memory_bank, neighbor_indices, device=device)
-        retrieval_scores = torch.as_tensor(
-            retrieval_payload["neighbor_scores"],
-            dtype=torch.float32,
-            device=device,
-        )
-        retrieval_scores = torch.where(neighbor_mask, retrieval_scores, torch.zeros_like(retrieval_scores))
-        if self.use_retrieval_bias:
-            retrieval_bias = self.score_bias_weight * torch.tanh(retrieval_scores)
-        else:
-            retrieval_bias = torch.zeros_like(retrieval_scores)
-
-        attribute_outputs = self._compute_attribute_evidence(
-            branch_name="neighbor",
-            current_state=current_state,
-            candidate_states=neighbor_states,
-            candidate_mask=neighbor_mask,
-            branch_attribute_payload=branch_attribute_payload,
-            metadata_attribute_masks=self._neighbor_attribute_masks(memory_bank, neighbor_indices, neighbor_mask),
-        )
-        candidate_evidence = attribute_outputs["candidate_evidence"]
-        query = self.neighbor_query(current_state).unsqueeze(1)
-        keys = self.neighbor_key(candidate_evidence)
-        content_scores = torch.einsum("bkh,bqh->bk", keys, query) / (self.hidden_dim ** 0.5)
-        group_outputs = self._apply_group_reweight(
-            branch_name="neighbor",
-            candidate_evidence=candidate_evidence,
-            candidate_mask=neighbor_mask,
-            base_scores=content_scores + retrieval_bias,
-            group_context=group_context,
-            group_available_mask=group_available_mask,
-        )
-        scores = group_outputs["scores"]
-        dense_weights = _masked_softmax(scores, neighbor_mask)
-        weights, selected_mask = _sparsify_weights(dense_weights, neighbor_mask, top_k=self.neighbor_top_k)
-        values = self.neighbor_value(candidate_evidence)
-        context = _masked_weighted_sum(values, weights)
-        available_mask = neighbor_mask.any(dim=-1)
-        top_positions = weights.argmax(dim=-1)
-        top_indices = torch.where(
-            available_mask,
-            neighbor_indices.gather(1, top_positions.unsqueeze(-1)).squeeze(-1),
-            torch.full_like(top_positions, -1),
-        )
-        matched_visit_indices = torch.as_tensor(
-            retrieval_payload.get("matched_visit_indices", torch.full_like(neighbor_indices, -1)),
-            dtype=torch.long,
-            device=device,
-        )
-        neighbor_stay_ids = torch.as_tensor(
-            retrieval_payload.get("neighbor_stay_ids", torch.full_like(neighbor_indices, -1)),
-            dtype=torch.long,
-            device=device,
-        )
-        return {
-            "context": context,
-            "available_mask": available_mask,
-            "weights": weights,
-            "dense_weights": dense_weights,
-            "content_scores": torch.where(neighbor_mask, content_scores, torch.zeros_like(content_scores)),
-            "scores": torch.where(neighbor_mask, scores, torch.zeros_like(scores)),
-            "indices": neighbor_indices,
-            "mask": neighbor_mask,
-            "selected_mask": selected_mask,
-            "selected_count": selected_mask.sum(dim=-1),
-            "top_index": top_indices,
-            "matched_visit_indices": matched_visit_indices,
-            "retrieval_scores": retrieval_scores,
-            "retrieval_bias": retrieval_bias,
-            "neighbor_stay_ids": neighbor_stay_ids,
-            "attribute_scores": attribute_outputs["attribute_scores"],
-            "attribute_weights": attribute_outputs["attribute_weights"],
-            "attribute_mask": attribute_outputs["attribute_mask"],
-            "attribute_available_mask": attribute_outputs["attribute_available_mask"],
-            "attribute_fallback_mask": attribute_outputs["attribute_fallback_mask"],
-            "attribute_sources": attribute_outputs["attribute_sources"],
-            "group_reweight_scores": group_outputs["group_reweight_scores"],
-            "group_influence": group_outputs["group_influence"],
-            "group_cosine_scores": group_outputs["group_cosine_scores"],
-            "group_used_mask": group_outputs["group_used_mask"],
-            "group_used": group_outputs["group_used"],
-        }
+        masked_scores = scores.masked_fill(~valid_mask, -1.0e9)
+        weights = torch.softmax(masked_scores, dim=-1)
+        if prior_weights is not None:
+            weights = weights * torch.where(valid_mask, prior_weights, torch.zeros_like(weights))
+        return _renormalize_rows(weights, valid_mask)
 
     def forward(
         self,
         *,
         current_state: torch.Tensor,
-        state_sequence: torch.Tensor,
-        visit_mask: torch.Tensor,
-        retrieval_payload: Mapping[str, Any] | None = None,
-        memory_bank: MemoryBank | None = None,
-        group_context: torch.Tensor | None = None,
-        group_available_mask: torch.Tensor | None = None,
-        attribute_payload: Mapping[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        device = current_state.device
-        if group_context is None:
-            resolved_group_context = None
-            resolved_group_available_mask = torch.zeros(current_state.shape[0], dtype=torch.bool, device=device)
-        else:
-            resolved_group_context = torch.as_tensor(group_context, dtype=current_state.dtype, device=device)
-            if tuple(resolved_group_context.shape) != tuple(current_state.shape):
+        history_states: torch.Tensor,
+        history_mask: torch.Tensor,
+        attention_type: str,
+        top_k: int | None,
+        prior_weights: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        query = self.query_proj(current_state)                                    # [B, H]
+        keys = self.key_proj(history_states)                                      # [B, T, H]
+        values = self.dropout(torch.tanh(self.value_proj(history_states)))        # [B, T, H]
+        scores = torch.einsum("bth,bh->bt", keys, query) / math.sqrt(float(self.hidden_dim))
+
+        valid_mask = history_mask
+        if top_k is not None and int(top_k) > 0:
+            top_k = min(int(top_k), int(history_mask.shape[1]))
+            topk_scores = scores.masked_fill(~history_mask, -1.0e9)
+            topk_indices = torch.topk(topk_scores, k=top_k, dim=-1).indices
+            topk_mask = torch.zeros_like(history_mask, dtype=torch.bool)
+            topk_mask.scatter_(1, topk_indices, True)
+            valid_mask = history_mask & topk_mask
+
+        weights = self._apply_attention(
+            scores,
+            valid_mask,
+            attention_type=attention_type,
+            prior_weights=prior_weights,
+        )
+        context = (values * weights.unsqueeze(-1)).sum(dim=1)
+        has_history = history_mask.any(dim=1, keepdim=True)
+        context = torch.where(has_history, context, torch.zeros_like(context))
+        selected_visit_indices = _extract_selected_visit_indices(weights, history_mask, top_k=top_k)
+        return context, weights, selected_visit_indices
+
+
+class _ContextFusion(nn.Module):
+    def __init__(self, hidden_dim: int, *, dropout: float = 0.0) -> None:
+        super().__init__()
+        self.hidden_dim = int(hidden_dim)
+        self.gate = nn.Linear(self.hidden_dim, 1)
+        self.norm = nn.LayerNorm(self.hidden_dim)
+        self.dropout = nn.Dropout(float(dropout))
+
+    def forward(self, contexts: Mapping[str, torch.Tensor]) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        if not contexts:
+            raise ValueError("contexts must not be empty")
+        names = list(contexts.keys())
+        reference = contexts[names[0]]
+        for name in names[1:]:
+            if tuple(contexts[name].shape) != tuple(reference.shape):
                 raise ValueError(
-                    f"group_context must have shape {tuple(current_state.shape)}, got {tuple(resolved_group_context.shape)}"
+                    f"All contexts must share the same shape, got {tuple(reference.shape)} and {tuple(contexts[name].shape)}"
                 )
-            if group_available_mask is None:
-                resolved_group_available_mask = torch.ones(current_state.shape[0], dtype=torch.bool, device=device)
-            else:
-                resolved_group_available_mask = group_available_mask.to(device=device, dtype=torch.bool)
-
-        self_history = self._select_self_history(
-            current_state,
-            state_sequence,
-            visit_mask,
-            branch_attribute_payload=self._branch_attribute_payload(attribute_payload, branch_name="self"),
-            group_context=resolved_group_context,
-            group_available_mask=resolved_group_available_mask,
-        )
-        neighbor_history = self._select_neighbor_history(
-            current_state,
-            retrieval_payload,
-            memory_bank,
-            branch_attribute_payload=self._branch_attribute_payload(attribute_payload, branch_name="neighbor"),
-            group_context=resolved_group_context,
-            group_available_mask=resolved_group_available_mask,
-        )
-
-        evidence_metadata: dict[str, Any] = {
-            "attribute_order": list(ATTRIBUTE_ORDER),
-            "current_visit_index": self_history["current_visit_index"],
-            "self_history_indices": self_history["indices"],
-            "self_history_mask": self_history["mask"],
-            "self_history_content_scores": self_history["content_scores"],
-            "self_history_scores": self_history["scores"],
-            "self_history_weights": self_history["weights"],
-            "self_history_dense_weights": self_history["dense_weights"],
-            "self_history_top_index": self_history["top_index"],
-            "self_history_selected_mask": self_history["selected_mask"],
-            "self_history_selected_count": self_history["selected_count"],
-            "self_history_available_mask": self_history["available_mask"],
-            "neighbor_indices": neighbor_history["indices"],
-            "neighbor_mask": neighbor_history["mask"],
-            "neighbor_content_scores": neighbor_history["content_scores"],
-            "neighbor_scores": neighbor_history["scores"],
-            "neighbor_weights": neighbor_history["weights"],
-            "neighbor_dense_weights": neighbor_history["dense_weights"],
-            "neighbor_top_index": neighbor_history["top_index"],
-            "neighbor_selected_mask": neighbor_history["selected_mask"],
-            "neighbor_selected_count": neighbor_history["selected_count"],
-            "neighbor_matched_visit_indices": neighbor_history["matched_visit_indices"],
-            "neighbor_retrieval_scores": neighbor_history["retrieval_scores"],
-            "neighbor_retrieval_bias": neighbor_history["retrieval_bias"],
-            "neighbor_score_gain_from_bias": neighbor_history["retrieval_bias"],
-            "neighbor_stay_ids": neighbor_history["neighbor_stay_ids"],
-            "neighbor_available_mask": neighbor_history["available_mask"],
-            "attribute_scores": {
-                "self": self_history["attribute_scores"],
-                "neighbor": neighbor_history["attribute_scores"],
-            },
-            "attribute_weights": {
-                "self": self_history["attribute_weights"],
-                "neighbor": neighbor_history["attribute_weights"],
-            },
-            "self_attribute_scores": self_history["attribute_scores"],
-            "self_attribute_weights": self_history["attribute_weights"],
-            "self_attribute_mask": self_history["attribute_mask"],
-            "self_attribute_available_mask": self_history["attribute_available_mask"],
-            "self_attribute_fallback_mask": self_history["attribute_fallback_mask"],
-            "self_attribute_sources": list(self_history["attribute_sources"]),
-            "neighbor_attribute_scores": neighbor_history["attribute_scores"],
-            "neighbor_attribute_weights": neighbor_history["attribute_weights"],
-            "neighbor_attribute_mask": neighbor_history["attribute_mask"],
-            "neighbor_attribute_available_mask": neighbor_history["attribute_available_mask"],
-            "neighbor_attribute_fallback_mask": neighbor_history["attribute_fallback_mask"],
-            "neighbor_attribute_sources": list(neighbor_history["attribute_sources"]),
-            "group_influence": {
-                "self": self_history["group_influence"],
-                "neighbor": neighbor_history["group_influence"],
-            },
-            "group_reweight_scores": {
-                "self": self_history["group_reweight_scores"],
-                "neighbor": neighbor_history["group_reweight_scores"],
-            },
-            "self_group_influence": self_history["group_influence"],
-            "self_group_reweight_scores": self_history["group_reweight_scores"],
-            "self_group_cosine_scores": self_history["group_cosine_scores"],
-            "self_group_used_mask": self_history["group_used_mask"],
-            "neighbor_group_influence": neighbor_history["group_influence"],
-            "neighbor_group_reweight_scores": neighbor_history["group_reweight_scores"],
-            "neighbor_group_cosine_scores": neighbor_history["group_cosine_scores"],
-            "neighbor_group_used_mask": neighbor_history["group_used_mask"],
-            "group_aware_selection_used": bool(self_history["group_used"] or neighbor_history["group_used"]),
-            "group_aware_selection_mask": resolved_group_available_mask
-            & (self_history["available_mask"] | neighbor_history["available_mask"]),
-            "group_available_mask": resolved_group_available_mask,
-            "selection_config": {
-                "self_top_k": self.self_top_k,
-                "neighbor_top_k": self.neighbor_top_k,
-                "use_retrieval_bias": self.use_retrieval_bias,
-                "use_attribute_gate": self.use_attribute_gate,
-                "use_group_reweight": self.use_group_reweight,
-                "group_reweight_weight": self.group_reweight_weight,
-                "attribute_order": list(ATTRIBUTE_ORDER),
-            },
+        stacked = torch.stack([contexts[name] for name in names], dim=1)
+        weights = torch.softmax(self.gate(stacked).squeeze(-1), dim=1)
+        fused = (weights.unsqueeze(-1) * stacked).sum(dim=1)
+        return self.norm(self.dropout(fused)), {
+            name: weights[:, index]
+            for index, name in enumerate(names)
         }
-        if retrieval_payload is not None:
-            for field_name in ("aux_personal_history_indices", "aux_personal_history_scores"):
-                if field_name in retrieval_payload:
-                    evidence_metadata[field_name] = torch.as_tensor(retrieval_payload[field_name], device=device)
+
+
+class SelfHistorySelector(nn.Module):
+    """Relevant-history selector with visit-level and optional attribute-level attention."""
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        *,
+        dropout: float = 0.1,
+        max_selected_visits: int | None = None,
+        self_top_k: int | None = None,
+        selection_mode: str = "visit_only",
+        top_k: int | None = None,
+        attention_type: str = "softmax_topk",
+        return_attention_weights: bool = True,
+        save_selected_indices: bool = True,
+        **_: Any,
+    ) -> None:
+        super().__init__()
+        self.hidden_dim = int(hidden_dim)
+        self.selection_mode = _normalize_mode(selection_mode)
+        self.attention_type = _normalize_attention_type(attention_type)
+        self.return_attention_weights = bool(return_attention_weights)
+        self.save_selected_indices = bool(save_selected_indices)
+        self.top_k = (
+            top_k
+            if top_k is not None
+            else (self_top_k if self_top_k is not None else max_selected_visits)
+        )
+        if self.top_k is not None and int(self.top_k) <= 0:
+            raise ValueError("top_k must be positive when provided")
+
+        self.visit_attention = _AttentionPool(self.hidden_dim, dropout=float(dropout))
+        self.attribute_attention = nn.ModuleDict(
+            {
+                "diagnosis": _AttentionPool(self.hidden_dim, dropout=float(dropout)),
+                "procedure": _AttentionPool(self.hidden_dim, dropout=float(dropout)),
+                "lab_vital": _AttentionPool(self.hidden_dim, dropout=float(dropout)),
+                "medication_history": _AttentionPool(self.hidden_dim, dropout=float(dropout)),
+            }
+        )
+        self.attribute_fusion = _ContextFusion(self.hidden_dim, dropout=float(dropout))
+
+    def _resolve_history_inputs(
+        self,
+        *,
+        current_state: torch.Tensor,
+        state_sequence: torch.Tensor | None,
+        history_states: torch.Tensor | None,
+        visit_mask: torch.Tensor | None,
+        history_mask: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        resolved_states = history_states if history_states is not None else state_sequence
+        if not isinstance(resolved_states, torch.Tensor):
+            raise KeyError("History selector requires `history_states` or `state_sequence`.")
+
+        if history_mask is None:
+            if visit_mask is None:
+                raise KeyError("History selector requires `history_mask` or `visit_mask`.")
+            resolved_history_mask = _infer_history_mask(torch.as_tensor(visit_mask, dtype=torch.bool, device=resolved_states.device))
+        else:
+            resolved_history_mask = torch.as_tensor(history_mask, dtype=torch.bool, device=resolved_states.device)
+            if visit_mask is not None:
+                resolved_history_mask = resolved_history_mask & _infer_history_mask(
+                    torch.as_tensor(visit_mask, dtype=torch.bool, device=resolved_states.device)
+                )
+        _validate_shapes(current_state, resolved_states, resolved_history_mask, self.hidden_dim)
+        return resolved_states, resolved_history_mask
+
+    def _resolve_modality_history_states(
+        self,
+        *,
+        history_states: torch.Tensor,
+        modality_history_states: Mapping[str, torch.Tensor] | None,
+        extras: Mapping[str, Any],
+    ) -> dict[str, torch.Tensor]:
+        resolved: dict[str, torch.Tensor] = {}
+        source_mapping = dict(modality_history_states or {})
+        for canonical_name, aliases in _ATTRIBUTE_ALIASES.items():
+            candidate: torch.Tensor | None = None
+            for alias in aliases:
+                if alias in source_mapping:
+                    candidate = source_mapping[alias]
+                    break
+                extra_value = extras.get(alias)
+                if isinstance(extra_value, torch.Tensor):
+                    candidate = extra_value
+                    break
+            if candidate is None:
+                continue
+            if candidate.ndim != 3 or tuple(candidate.shape[:2]) != tuple(history_states.shape[:2]):
+                raise ValueError(
+                    f"{canonical_name} history states must align with history_states on batch/time dimensions: "
+                    f"got {tuple(candidate.shape)} and {tuple(history_states.shape)}"
+                )
+            resolved[canonical_name] = candidate
+        return resolved
+
+    def forward(
+        self,
+        current_state: torch.Tensor,
+        state_sequence: torch.Tensor | None = None,
+        visit_mask: torch.Tensor | None = None,
+        *,
+        history_states: torch.Tensor | None = None,
+        history_mask: torch.Tensor | None = None,
+        modality_history_states: Mapping[str, torch.Tensor] | None = None,
+        **extras: Any,
+    ) -> dict[str, Any]:
+        if current_state.ndim != 2:
+            raise ValueError(f"current_state must have shape (B, H), got {tuple(current_state.shape)}")
+
+        resolved_history_states, resolved_history_mask = self._resolve_history_inputs(
+            current_state=current_state,
+            state_sequence=state_sequence,
+            history_states=history_states,
+            visit_mask=visit_mask,
+            history_mask=history_mask,
+        )
+        batch_size, time_steps, _ = resolved_history_states.shape
+
+        zero_context = torch.zeros(batch_size, self.hidden_dim, device=current_state.device, dtype=current_state.dtype)
+        zero_attention = torch.zeros(batch_size, time_steps, device=current_state.device, dtype=current_state.dtype)
+        empty_indices = torch.empty(batch_size, 0, device=current_state.device, dtype=torch.long)
+
+        if self.selection_mode == "none":
+            return {
+                "selection_mode": self.selection_mode,
+                "selected_history_context": zero_context,
+                "history_context": zero_context,
+                "visit_context": zero_context,
+                "self_history_summary": zero_context,
+                "medication_history_context": zero_context,
+                "visit_attention_weights": zero_attention,
+                "self_attention_weights": zero_attention,
+                "attribute_contexts": {},
+                "attribute_attention_weights": {},
+                "selected_visit_indices": empty_indices,
+                "selected_visit_mask": torch.zeros_like(resolved_history_mask, dtype=torch.bool),
+            }
+
+        visit_context, visit_attention_weights, selected_visit_indices = self.visit_attention(
+            current_state=current_state,
+            history_states=resolved_history_states,
+            history_mask=resolved_history_mask,
+            attention_type=self.attention_type,
+            top_k=self.top_k if self.selection_mode in {"visit_only", "visit_attribute"} else None,
+        )
+        selected_visit_mask = (
+            resolved_history_mask
+            if self.top_k is None
+            else _selected_indices_to_mask(selected_visit_indices, resolved_history_mask)
+        )
+
+        attribute_contexts: dict[str, torch.Tensor] = {}
+        attribute_attention_weights: dict[str, torch.Tensor] = {}
+        attribute_fusion_weights: dict[str, torch.Tensor] = {}
+        medication_history_context = zero_context
+        has_medication_history_context = False
+
+        if self.selection_mode == "visit_attribute":
+            modality_states = self._resolve_modality_history_states(
+                history_states=resolved_history_states,
+                modality_history_states=modality_history_states,
+                extras=extras,
+            )
+            for name, modality_states_tensor in modality_states.items():
+                context, weights, _ = self.attribute_attention[name](
+                    current_state=current_state,
+                    history_states=modality_states_tensor,
+                    history_mask=selected_visit_mask if bool(selected_visit_mask.any().item()) else resolved_history_mask,
+                    attention_type=self.attention_type,
+                    top_k=None,
+                    prior_weights=visit_attention_weights,
+                )
+                if name == "diagnosis":
+                    attribute_contexts["diag_context"] = context
+                elif name == "procedure":
+                    attribute_contexts["proc_context"] = context
+                elif name == "lab_vital":
+                    attribute_contexts["lab_vital_context"] = context
+                elif name == "medication_history":
+                    attribute_contexts["med_context"] = context
+                    medication_history_context = context
+                    has_medication_history_context = True
+                attribute_attention_weights[name] = weights
+
+            if attribute_contexts:
+                fusion_contexts = {"visit_context": visit_context, **attribute_contexts}
+                selected_history_context, attribute_fusion_weights = self.attribute_fusion(fusion_contexts)
+            else:
+                selected_history_context = visit_context
+        else:
+            selected_history_context = visit_context
+
+        if not has_medication_history_context and "med_context" in attribute_contexts:
+            medication_history_context = attribute_contexts["med_context"]
 
         return {
-            "self_history_context": self_history["context"],
-            "neighbor_history_context": neighbor_history["context"],
-            "group_context": resolved_group_context,
-            "evidence_metadata": evidence_metadata,
+            "selection_mode": self.selection_mode,
+            "selected_history_context": selected_history_context,
+            "history_context": selected_history_context,
+            "visit_context": visit_context,
+            "self_history_summary": selected_history_context,
+            "medication_history_context": medication_history_context,
+            "visit_attention_weights": visit_attention_weights if self.return_attention_weights else zero_attention,
+            "self_attention_weights": visit_attention_weights if self.return_attention_weights else zero_attention,
+            "attribute_contexts": attribute_contexts,
+            "attribute_attention_weights": attribute_attention_weights if self.return_attention_weights else {},
+            "attribute_fusion_weights": attribute_fusion_weights,
+            "selected_visit_indices": selected_visit_indices if self.save_selected_indices else empty_indices,
+            "selected_visit_mask": selected_visit_mask,
         }
+
+
+HistorySelector = SelfHistorySelector
+
+__all__ = ["HistorySelector", "SelfHistorySelector"]
+

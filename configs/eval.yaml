@@ -4,38 +4,115 @@ config_refs:
   train: configs/train.yaml
 
 paths:
-  processed_root: data/processed
-  vocab_root: data/interim/vocab
   ddi_matrix_path: data/processed/ddi/drug_ddi.pt
   checkpoint_dir: outputs/checkpoints
+  log_dir: outputs/logs
   report_dir: outputs/reports
   prediction_dir: outputs/predictions
 
 runtime:
-  # The shipped evaluators are core-only and intentionally disable retrieval.
   mode: core
   device: cuda
   batch_size: 32
 
+loss:
+  lambda_ddi: 0.05
+
 prediction:
-  mode: threshold
-  top_k: 10
-  top_k_strategy: fixed
-  decoder_top_k: 10
-  # Fallback only. Evaluators prefer CLI --threshold, then checkpoint threshold metadata.
-  threshold: 0.5
-  calibration:
-    enabled: false
-    split: val
-    metric: f1
-    tie_breaker: jaccard
-    candidates: [0.5]
+  threshold: null
+
+run:
+  smoke_test: false
+  max_eval_batches: null
 
 evaluation:
   split: test
   save_predictions: true
   save_reports: true
+  compare_retrieval_modes: false
+  retrieval_modes:
+    - self_only
+    - retrieval_only
+  safety_report: true
+  save_curve_data: true
+  subgroup_analysis: true
+
+threshold_search:
+  enabled: true
+  selection_metric: jaccard
+  methods:
+    - global
+    - topk
+    - percentile
+  global_thresholds:
+    - 0.20
+    - 0.25
+    - 0.30
+    - 0.35
+    - 0.40
+    - 0.45
+    - 0.50
+    - 0.55
+  topk_values:
+    - 5
+    - 10
+    - 15
+    - 20
+  percentile_values:
+    - 85
+    - 90
+    - 95
+    - 97
+  prefer_lower_ddi_as_tiebreaker: true
+
+report:
+  save_threshold_comparison: true
+  save_tradeoff_curve_data: true
+
+safety_decoding:
+  enabled: true
+  mode: soft_constrained_rerank
+  threshold: 0.30
+  top_m: 20
+  min_drugs: 1
+  max_drugs: null
+  target_avg_drugs: null
+  alpha_utility: 1.0
+  beta_ddi: 0.35
+  gamma_size: 0.10
+  search_thresholds:
+    - 0.25
+    - 0.30
+    - 0.35
+    - 0.40
+  search_topk_values:
+    - 5
+    - 10
+    - 15
+  search_beta_values:
+    - 0.20
+    - 0.35
+    - 0.50
+    - 0.75
+  selection_metric: jaccard
+  selection_strategy: maximize_metric_under_ddi_constraint
+  max_ddi_rate: null
+  utility_floor_relative_to_baseline: 0.98
+
+calibration:
+  enabled: false
 
 core:
+  mode: core
   use_retrieval: false
   use_group_encoder: false
+
+extended:
+  mode: extended
+  use_retrieval: false
+  use_group_encoder: true
+  retrieval_top_k: 5
+  temporal_decay_alpha: 0.05
+  retrieval_backend: bruteforce
+  use_faiss_if_available: true
+  allow_cross_split: false

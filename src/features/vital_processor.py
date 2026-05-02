@@ -1,7 +1,11 @@
 from __future__ import annotations
 
-from src.features.lab_processor import NumericFeatureProcessor
+from src.features.lab_processor import NumericFeatureEncoder, NumericFeatureProcessor
 
 
 class VitalProcessor(NumericFeatureProcessor):
     pass
+
+
+class VitalFeatureEncoder(NumericFeatureEncoder):
+    """Numeric vital-sign branch that returns visit-level vital embeddings."""

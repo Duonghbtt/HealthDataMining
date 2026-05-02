@@ -3,144 +3,92 @@ config_refs:
   model: configs/model.yaml
 
 paths:
-  processed_root: data/processed
-  vocab_root: data/interim/vocab
   ddi_matrix_path: data/processed/ddi/drug_ddi.pt
   checkpoint_dir: outputs/checkpoints
   log_dir: outputs/logs
+  report_dir: outputs/reports
 
 runtime:
-  # train_core.py requires runtime.mode=core.
   mode: core
-  profile: balanced
   device: cuda
-  batch_size: 16
+  batch_size: 32
   num_workers: 4
   pin_memory: true
-  amp: true
-  grad_accum_steps: 2
-  non_blocking_transfer: true
-  persistent_workers: true
-  prefetch_factor: 2
-  detailed_timing: false
-  log_interval: 100
-  profile_steps: null
-  train_decoder_top_k: 0
-  matmul_precision: high
-  length_bucket_window: 256
-  train_budget_label: null
-
-initialization:
-  warm_start_checkpoint: null
-  warm_start_mode: disabled
-  strict: true
 
 optimization:
-  epochs: 10
-  learning_rate: 1.0e-3
+  epochs: 14
+  learning_rate: 3.0e-4
+  max_grad_norm: 0.5
+  sanitize_code_embedding_grads: true
+  code_embedding_grad_max_norm: 0.25
+  freeze_code_embedding_epochs: 2
   optimizer: adam
   scheduler: none
-  scheduler_factor: 0.5
-  scheduler_patience: 1
-  scheduler_min_lr: 1.0e-6
-  early_stopping_patience: null
-  max_grad_norm: 1.0
+
+debug_checks:
+  enabled: true
+  light_mode: true
+  check_every_n_steps: 100
+  sync_timing: false
 
 loss:
-  ddi_lambda: 0.05
-  objective: bce
-  focal_gamma: 1.5
-  pos_weight_mode: log_balanced
-  pos_weight_clip: 12.0
-  fusion_entropy_lambda: 0.0
-  fusion_balance_lambda: 0.0
-  ranking_lambda: 0.0
-  ranking_objective: bpr
-  ranking_margin: 1.0
-  ranking_num_negatives: 32
-  ranking_hard_negative_fraction: 0.5
-  contrastive_lambda: 0.0
-  contrastive_temperature: 0.07
-  ddi_lambda_candidates: [0.0, 0.05, 0.01]
+  use_bce: true
+  use_margin_loss: false
+  margin_weight: 0.0
+  use_ddi: true
+  lambda_ddi: 0.05
+  stage_training: true
+  ddi_schedule:
+    enabled: true
+    type: linear
+    start_epoch: 9
+    end_epoch: 14
+    start_value: 0.005
+    end_value: 0.05
 
-threshold_tuning:
-  enabled: true
-  metric: f1
-  tie_breaker: jaccard
-  split: val
-  candidates: [0.18, 0.20, 0.22, 0.24, 0.25, 0.26, 0.28, 0.30, 0.32, 0.35, 0.40, 0.45, 0.50]
+decoder:
+  mode: legacy
+  type: residual_mlp
+  hidden_multiplier: 2
+  dropout: 0.1
+  layer_norm: true
+  activation: relu
+  gate_type: scalar
+  use_history_copy: true
+  use_retrieval_copy: true
+  use_memory_copy: false
+  copy_projection: none
+  gate_hidden_dim: 128
+
+training:
+  stage1_epochs: 8
+  stage2_epochs: 6
+  selection_metric: jaccard
+
+logging:
+  save_loss_components: true
+
+run:
+  smoke_test: false
+  max_train_batches: null
+  max_val_batches: null
+  max_eval_batches: null
 
 prediction:
   top_k: 10
   threshold: 0.5
 
 core:
+  mode: core
   use_retrieval: false
   use_group_encoder: false
 
-# Experimental only. Use with `python -m src.training.train_extended`.
-# These fields do not change the verified core train/eval path.
 extended:
   mode: extended
-  use_retrieval: true
+  use_retrieval: false
   use_group_encoder: true
   retrieval_top_k: 5
   temporal_decay_alpha: 0.05
   retrieval_backend: bruteforce
   use_faiss_if_available: true
   allow_cross_split: false
-  retrieval_scoring_mode: temporal_relevance
-  cross_split_policy: train_bank_only
-  validation_memory_bank_policy: train_only
-  monitor_metric: val_prauc_tuned
-  monitor_mode: max
-
-profiles:
-  safe:
-    runtime:
-      batch_size: 8
-      num_workers: 2
-      pin_memory: true
-      amp: true
-      grad_accum_steps: 2
-      non_blocking_transfer: true
-      persistent_workers: true
-      prefetch_factor: 2
-      detailed_timing: false
-      log_interval: 50
-      profile_steps: null
-      train_decoder_top_k: 0
-      matmul_precision: high
-      length_bucket_window: 128
-  balanced:
-    runtime:
-      batch_size: 16
-      num_workers: 4
-      pin_memory: true
-      amp: true
-      grad_accum_steps: 2
-      non_blocking_transfer: true
-      persistent_workers: true
-      prefetch_factor: 2
-      detailed_timing: false
-      log_interval: 100
-      profile_steps: null
-      train_decoder_top_k: 0
-      matmul_precision: high
-      length_bucket_window: 256
-  fast:
-    runtime:
-      batch_size: 32
-      num_workers: 4
-      pin_memory: true
-      amp: true
-      grad_accum_steps: 1
-      non_blocking_transfer: true
-      persistent_workers: true
-      prefetch_factor: 2
-      detailed_timing: false
-      log_interval: 100
-      profile_steps: 100
-      train_decoder_top_k: 0
-      matmul_precision: high
-      length_bucket_window: 256

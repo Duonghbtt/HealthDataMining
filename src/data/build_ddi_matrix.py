@@ -1,24 +1,28 @@
 from __future__ import annotations
 
 import argparse
-import csv
-import gzip
-import math
-import os
-import warnings
+import logging
+import sys
 from collections import Counter
-from contextlib import contextmanager, nullcontext
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
 
-from src.data.build_vocab import load_vocab_bundle
-from src.data.load_mimic import open_csv
-from src.features.medication_history import canonicalize_medication_text
+if __package__ in {None, ""}:
+    sys.path.append(str(Path(__file__).resolve().parents[2]))
+
+from src.data.ddinter_utils import (
+    DEFAULT_DDINTER_GLOB,
+    LEVEL_SEVERITY_PRIORITY,
+    load_ddinter_dataset,
+    match_names_to_ddinter_ids,
+    normalize_ddinter_text,
+    project_ddinter_pairs_to_vocab,
+)
+from src.data.drugbank_vocab_utils import load_drugbank_vocabulary_index
+from src.data.rxnorm_utils import build_minimal_rxnorm_index, normalize_rxcui
 from src.utils.io import (
     ensure_dir,
     load_yaml_config,
-    parse_float,
-    parse_int,
     read_json,
     resolve_path,
     save_pt,
@@ -26,1093 +30,667 @@ from src.utils.io import (
 )
 
 
-PAIR_COLUMNS_A = ("drug_a", "drug1", "drug_1", "med_a", "left_drug", "source_drug")
-PAIR_COLUMNS_B = ("drug_b", "drug2", "drug_2", "med_b", "right_drug", "target_drug")
-CANONICAL_TOKEN_COLUMNS_A = ("drug_1_token", "drug_a_token", "left_token", "source_drug_token")
-CANONICAL_TOKEN_COLUMNS_B = ("drug_2_token", "drug_b_token", "right_token", "target_drug_token")
-_FALLBACK_SOURCE = "fallback_zero"
-_MANUAL_SMOKE_SOURCE_FORMAT = "manual_smoke_csv"
-_TWOSIDES_SOURCE_FORMAT = "twosides_csv"
-_CANONICAL_PAIR_SOURCE_FORMAT = "canonical_pair_csv"
-_SUPPORTED_SOURCE_FORMATS = {
-    _MANUAL_SMOKE_SOURCE_FORMAT,
-    _TWOSIDES_SOURCE_FORMAT,
-    _CANONICAL_PAIR_SOURCE_FORMAT,
+LOGGER = logging.getLogger(__name__)
+
+SPECIAL_VOCAB_TOKENS = {"PAD", "UNK"}
+CANONICAL_DDI_REPRESENTATION = "med_vocab_main"
+CURRENT_REPRESENTATION_ALIASES = {
+    "",
+    CANONICAL_DDI_REPRESENTATION,
+    "rxnorm_canonical_medication",
+    "rxnorm_ingredient",
 }
-_TWOSIDES_RXNORM_A_COLUMNS = ("drug_1_rxnorm_id", "drug_1_rxnorn_id")
-_TWOSIDES_RXNORM_B_COLUMNS = ("drug_2_rxnorm_id", "drug_2_rxnorn_id")
-_PROGRESS_LOG_EVERY_ROWS = 1_000_000
-_UNMATCHED_COUNTER_PRUNE_EVERY_ROWS = 1_000_000
-_UNMATCHED_COUNTER_PRUNE_LIMIT = 1_000
-_UNMATCHED_COUNTER_REPORT_LIMIT = 200
-_CANONICAL_PAIR_FIELDS = (
-    "source_format",
-    "source_path",
-    "drug_1_rxnorm_id",
-    "drug_1_concept_name",
-    "drug_1_token",
-    "drug_1_vocab_idx",
-    "drug_2_rxnorm_id",
-    "drug_2_concept_name",
-    "drug_2_token",
-    "drug_2_vocab_idx",
-    "condition_meddra_id",
-    "condition_concept_name",
-    "A",
-    "PRR",
-    "PRR_error",
-    "mean_reporting_frequency",
-    "passes_statistical_filter",
-    "both_drugs_matched_vocab",
-)
 
 
-def _ddi_output_paths(config: Mapping[str, Any]) -> tuple[Path, Path, Path]:
-    processed_root = resolve_path(config["_project_root"], config["paths"]["processed_root"])
-    ddi_dir = ensure_dir(processed_root / "ddi")
-    ddi_cfg = dict(config.get("ddi", {}))
-    canonical_pairs_path = ddi_cfg.get("canonical_pairs_path", "data/processed/ddi/drug_ddi_pairs.csv.gz")
-    canonical_pairs_path = resolve_path(config["_project_root"], canonical_pairs_path).resolve()
-    return (
-        ddi_dir / "drug_ddi.pt",
-        ddi_dir / "drug_ddi_report.json",
-        canonical_pairs_path,
+def _configure_logging() -> None:
+    if logging.getLogger().handlers:
+        return
+    logging.basicConfig(
+        level=logging.INFO,
+        format="[%(name)s] %(levelname)s: %(message)s",
     )
 
 
-def _part_path(path: Path) -> Path:
-    return path.with_name(f"{path.name}.part")
+def _ddi_output_paths(config: Mapping[str, Any]) -> tuple[Path, Path]:
+    paths_cfg = dict(config.get("paths", {}))
+    ddi_root = paths_cfg.get("ddi_root")
+    if ddi_root:
+        ddi_dir = ensure_dir(resolve_path(config["_project_root"], ddi_root))
+    else:
+        processed_root = resolve_path(config["_project_root"], paths_cfg["processed_root"])
+        ddi_dir = ensure_dir(Path(processed_root) / "ddi")
+    return ddi_dir / "drug_ddi.pt", ddi_dir / "drug_ddi_report.json"
 
 
-def _prepare_part_path(path: Path) -> Path:
-    ensure_dir(path.parent)
-    part_path = _part_path(path)
-    if part_path.exists():
-        part_path.unlink()
-    return part_path
+def _vocab_dir_from_config(config: Mapping[str, Any]) -> Path:
+    paths_cfg = dict(config.get("paths", {}))
+    vocab_root = paths_cfg.get("vocab_root")
+    if vocab_root:
+        return Path(resolve_path(config["_project_root"], vocab_root))
+    interim_root = resolve_path(config["_project_root"], paths_cfg["interim_root"])
+    return Path(interim_root) / "vocab"
 
 
-def _atomic_replace(temp_path: Path, final_path: Path) -> Path:
-    ensure_dir(final_path.parent)
-    if not temp_path.exists():
-        if final_path.exists():
-            return final_path
-        raise FileNotFoundError(f"Atomic replace source is missing: {temp_path}")
-    os.replace(temp_path, final_path)
-    return final_path
-
-
-def _current_rss_mb() -> float | None:
-    status_path = Path("/proc/self/status")
-    if not status_path.exists():
-        return None
-    try:
-        for line in status_path.read_text(encoding="utf-8").splitlines():
-            if not line.startswith("VmRSS:"):
-                continue
-            parts = line.split()
-            if len(parts) < 2:
-                return None
-            return float(parts[1]) / 1024.0
-    except OSError:
-        return None
-    return None
-
-
-def _find_pair_columns(fieldnames: list[str]) -> tuple[str, str] | None:
-    lowered = {name.lower(): name for name in fieldnames}
-    col_a = next((lowered[name] for name in PAIR_COLUMNS_A if name in lowered), None)
-    col_b = next((lowered[name] for name in PAIR_COLUMNS_B if name in lowered), None)
-    if col_a and col_b:
-        return col_a, col_b
-    if len(fieldnames) >= 2:
-        return fieldnames[0], fieldnames[1]
-    return None
-
-
-def _find_canonical_token_columns(fieldnames: list[str]) -> tuple[str, str] | None:
-    lowered = {name.lower(): name for name in fieldnames}
-    col_a = next((lowered[name] for name in CANONICAL_TOKEN_COLUMNS_A if name in lowered), None)
-    col_b = next((lowered[name] for name in CANONICAL_TOKEN_COLUMNS_B if name in lowered), None)
-    if col_a and col_b:
-        return col_a, col_b
-    return None
-
-
-def _source_metadata_sidecar_path(source_path: Path) -> Path:
-    return source_path.with_name(f"{source_path.stem}.metadata.json")
-
-
-def _coerce_bool(value: Any, *, default: bool = False) -> bool:
-    if value is None:
-        return default
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        normalized = value.strip().lower()
-        if normalized in {"1", "true", "yes", "y"}:
-            return True
-        if normalized in {"0", "false", "no", "n"}:
-            return False
-    return bool(value)
-
-
-def _normalize_source_metadata(
-    payload: Mapping[str, Any] | None,
+def _resolve_required_source_path(
+    config: Mapping[str, Any],
     *,
-    default_kind: str,
-    default_display_name: str,
-    default_purpose: str,
-    default_pair_schema: str,
-    default_research_grade: bool,
-) -> dict[str, Any]:
-    raw = dict(payload or {})
-    return {
-        "kind": str(raw.get("kind") or default_kind),
-        "purpose": str(raw.get("purpose") or default_purpose),
-        "research_grade": _coerce_bool(raw.get("research_grade"), default=default_research_grade),
-        "pair_schema": str(raw.get("pair_schema") or default_pair_schema),
-        "display_name": str(raw.get("display_name") or default_display_name),
+    key: str,
+    description: str,
+    defaults: Iterable[str] = (),
+) -> Path:
+    paths_cfg = dict(config.get("paths", {}))
+    candidate_paths: list[Path] = []
+
+    configured = paths_cfg.get(key)
+    if configured:
+        candidate_paths.append(Path(resolve_path(config["_project_root"], configured)))
+    for default in defaults:
+        candidate_paths.append(Path(resolve_path(config["_project_root"], default)))
+
+    seen: set[Path] = set()
+    deduped_candidates: list[Path] = []
+    for candidate in candidate_paths:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        deduped_candidates.append(candidate)
+
+    for candidate in deduped_candidates:
+        if candidate.exists():
+            return candidate
+
+    checked = [str(path) for path in deduped_candidates]
+    raise FileNotFoundError(f"Unable to locate {description}. Checked: {checked}")
+
+
+def _resolve_ddi_representation(config: Mapping[str, Any], warnings: list[str]) -> str:
+    raw_value = str(config.get("ddi_representation", "")).strip().lower()
+    if raw_value in CURRENT_REPRESENTATION_ALIASES:
+        return CANONICAL_DDI_REPRESENTATION
+    warning = (
+        "Ignoring ddi_representation="
+        f"{raw_value!r}; build_ddi_matrix always projects DDInter to med_vocab_main."
+    )
+    LOGGER.warning(warning)
+    warnings.append(warning)
+    return CANONICAL_DDI_REPRESENTATION
+
+
+def _load_med_vocab_main(
+    config: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, dict[str, Any]], dict[str, str]]:
+    vocab_dir = _vocab_dir_from_config(config)
+    med_vocab_path = vocab_dir / "med_vocab_main.json"
+    med_vocab_metadata_path = vocab_dir / "med_vocab_main_metadata.json"
+
+    if not med_vocab_path.exists():
+        raise FileNotFoundError(
+            "Missing med_vocab_main artifact. Expected "
+            f"{med_vocab_path}. Run build_vocab.py first."
+        )
+
+    med_vocab = read_json(med_vocab_path)
+    med_vocab_metadata = (
+        read_json(med_vocab_metadata_path) if med_vocab_metadata_path.exists() else {}
+    )
+    if "idx_to_token" not in med_vocab:
+        raise ValueError(
+            f"Invalid med_vocab_main artifact at {med_vocab_path}: missing `idx_to_token`."
+        )
+    if "pad_idx" not in med_vocab or "unk_idx" not in med_vocab:
+        raise ValueError(
+            f"Invalid med_vocab_main artifact at {med_vocab_path}: missing PAD/UNK indexes."
+        )
+
+    return med_vocab, med_vocab_metadata, {
+        "med_vocab_main_path": str(med_vocab_path),
+        "med_vocab_main_metadata_path": str(med_vocab_metadata_path),
     }
 
 
-def _default_source_metadata(source_path: Path | None, *, source_format: str) -> dict[str, Any]:
-    display_name = "" if source_path is None else source_path.name
-    if source_format == _MANUAL_SMOKE_SOURCE_FORMAT:
-        return _normalize_source_metadata(
-            None,
-            default_kind="manual_smoke",
-            default_display_name=display_name or "Manual Smoke DDI",
-            default_purpose="local wiring only",
-            default_pair_schema="canonicalized_drug_token_pairs",
-            default_research_grade=False,
-        )
-    if source_format == _TWOSIDES_SOURCE_FORMAT:
-        return _normalize_source_metadata(
-            None,
-            default_kind="twosides_real_condition_aggregated",
-            default_display_name=display_name or "TWOSIDES.csv",
-            default_purpose="TwoSIDES condition-aggregated real DDI source",
-            default_pair_schema="twosides_condition_rows",
-            default_research_grade=False,
-        )
-    if source_format == _CANONICAL_PAIR_SOURCE_FORMAT:
-        return _normalize_source_metadata(
-            None,
-            default_kind="canonical_pair_csv",
-            default_display_name=display_name or "Canonical Pair CSV",
-            default_purpose="canonical normalized pair source",
-            default_pair_schema="canonical_pair_rows",
-            default_research_grade=False,
-        )
-    return _normalize_source_metadata(
-        None,
-        default_kind="unclassified_external",
-        default_display_name=display_name or "External DDI Source",
-        default_purpose="source metadata missing; artifact is runnable but not research-grade by default",
-        default_pair_schema="canonicalized_drug_token_pairs",
-        default_research_grade=False,
-    )
+def _dedupe_preserve_order(values: Iterable[str]) -> list[str]:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for value in values:
+        text = str(value).strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        ordered.append(text)
+    return ordered
 
 
-def _read_source_metadata(source_path: Path | None, *, source_format: str) -> dict[str, Any]:
-    if source_path is None:
-        return _default_source_metadata(None, source_format=source_format)
-    sidecar_path = _source_metadata_sidecar_path(source_path)
-    if sidecar_path.exists():
-        payload = read_json(sidecar_path)
-        if isinstance(payload, Mapping):
-            defaults = _default_source_metadata(source_path, source_format=source_format)
-            return _normalize_source_metadata(
-                payload,
-                default_kind=str(defaults["kind"]),
-                default_display_name=str(defaults["display_name"]),
-                default_purpose=str(defaults["purpose"]),
-                default_pair_schema=str(defaults["pair_schema"]),
-                default_research_grade=bool(defaults["research_grade"]),
-            )
-    return _default_source_metadata(source_path, source_format=source_format)
+def _medication_token_body(token: str) -> str:
+    return str(token).split(":", 1)[1] if ":" in str(token) else str(token)
 
 
-def _resolve_optional_path(project_root: Path, raw_value: Any) -> Path | None:
-    text = str(raw_value or "").strip()
+def _resolve_canonical_rxcui(token: str, metadata_row: Mapping[str, Any]) -> str | None:
+    metadata_rxcui = normalize_rxcui(str(metadata_row.get("canonical_rxcui", "")))
+    if metadata_rxcui:
+        return metadata_rxcui
+
+    token_text = str(token).strip()
+    if token_text.startswith("MEDRX:"):
+        return normalize_rxcui(_medication_token_body(token_text))
+    return None
+
+
+def _candidate_name_from_raw_token(raw_token: str | None) -> str | None:
+    text = str(raw_token or "").strip()
     if not text:
         return None
-    candidate = Path(text)
-    if not candidate.is_absolute():
-        candidate = project_root / candidate
-    return candidate.resolve()
+
+    prefix = ""
+    body = text
+    if ":" in text:
+        prefix, body = text.split(":", 1)
+        if str(prefix).strip().upper() != "NAME":
+            return None
+
+    candidate = body.replace("_", " ").strip()
+    if not candidate or not any(character.isalpha() for character in candidate):
+        return None
+    return candidate
 
 
-def _resolve_ddi_settings(config: Mapping[str, Any]) -> dict[str, Any]:
-    project_root = Path(config["_project_root"]).resolve()
-    ddi_cfg = dict(config.get("ddi", {}))
-    legacy_source = config.get("ddi_source_path") or config.get("paths", {}).get("ddi_source_path")
-
-    source_path = _resolve_optional_path(project_root, ddi_cfg.get("source_path"))
-    if source_path is None:
-        source_path = _resolve_optional_path(project_root, legacy_source)
-
-    raw_format = str(ddi_cfg.get("source_format") or "").strip().lower()
-    source_format = raw_format or _MANUAL_SMOKE_SOURCE_FORMAT
-    if source_format not in _SUPPORTED_SOURCE_FORMATS:
-        raise ValueError(f"Unsupported DDI source_format `{source_format}`. Expected one of {sorted(_SUPPORTED_SOURCE_FORMATS)}")
-
-    fallback_source_path = _resolve_optional_path(project_root, ddi_cfg.get("fallback_source_path"))
-    fallback_source_format = str(ddi_cfg.get("fallback_source_format") or _MANUAL_SMOKE_SOURCE_FORMAT).strip().lower()
-    if fallback_source_format not in _SUPPORTED_SOURCE_FORMATS:
-        raise ValueError(
-            f"Unsupported fallback DDI source_format `{fallback_source_format}`. Expected one of {sorted(_SUPPORTED_SOURCE_FORMATS)}"
-        )
-
-    return {
-        "source_path": source_path,
-        "source_format": source_format,
-        "fallback_source_path": fallback_source_path,
-        "fallback_source_format": fallback_source_format,
-        "min_support_a": int(ddi_cfg.get("min_support_a", 5)),
-        "min_prr_ci_lower_bound": float(ddi_cfg.get("min_prr_ci_lower_bound", 1.0)),
-        "canonical_pairs_configured": "canonical_pairs_path" in ddi_cfg,
-    }
-
-
-def _empty_effective_report(*, drug_count: int) -> dict[str, Any]:
-    source_metadata = _normalize_source_metadata(
-        None,
-        default_kind="fallback_zero",
-        default_display_name="Fallback Zero DDI",
-        default_purpose="no DDI source configured; inactive artifact for explicit fallback",
-        default_pair_schema="none",
-        default_research_grade=False,
-    )
-    return {
-        "active": False,
-        "reason": "missing_ddi_source_path",
-        "source": _FALLBACK_SOURCE,
-        "requested_source": "",
-        "requested_source_format": "",
-        "effective_source": _FALLBACK_SOURCE,
-        "effective_source_format": "fallback_zero",
-        "source_format": "fallback_zero",
-        "ddi_type": "fallback_zero",
-        "ddi_source": _FALLBACK_SOURCE,
-        "ddi_research_grade": False,
-        "matched_pairs": 0,
-        "nonzero_pairs": 0,
-        "rows_scanned": 0,
-        "rows_mapped": 0,
-        "rows_retained": 0,
-        "header_rows_skipped": 0,
-        "invalid_numeric_rows": 0,
-        "self_pair_rows_skipped": 0,
-        "vocab_size": int(drug_count),
-        "fallback_reason": "missing_ddi_source_path",
-        "source_metadata": source_metadata,
-        "unmatched_drugs_topk": [],
-        "unmatched_drugs": [],
-        "canonical_rows_written": 0,
-    }
-
-
-def _init_parse_stats(
+def _build_vocab_candidate_index(
+    med_vocab: Mapping[str, Any],
+    med_vocab_metadata: Mapping[str, Mapping[str, Any]],
     *,
-    source_path: Path,
-    source_format: str,
-    source_metadata: Mapping[str, Any],
-) -> dict[str, Any]:
-    return {
-        "source_path": str(source_path.resolve()),
-        "source_format": source_format,
-        "source_metadata": dict(source_metadata),
-        "rows_scanned": 0,
-        "rows_mapped": 0,
-        "rows_retained": 0,
-        "header_rows_skipped": 0,
-        "invalid_numeric_rows": 0,
-        "self_pair_rows_skipped": 0,
-        "candidate_pairs": set(),
-        "retained_pairs": set(),
-        "unmatched_counter": Counter(),
-        "canonical_rows_written": 0,
-        "progress_output_path": "",
-        "reason": "unknown",
-    }
+    rxnorm_index: Any,
+) -> tuple[dict[int, tuple[str, ...]], dict[int, dict[str, Any]], dict[str, Any]]:
+    vocab_item_to_candidate_names: dict[int, tuple[str, ...]] = {}
+    candidate_profiles: dict[int, dict[str, Any]] = {}
 
+    num_real_vocab_items = 0
+    num_items_with_canonical_rxcui = 0
+    num_items_with_metadata_name = 0
+    num_items_with_rxnorm_name = 0
+    num_items_with_rxnorm_synonyms = 0
+    num_items_with_raw_name_candidates = 0
 
-def _prune_unmatched_counter(unmatched_counter: Counter[str], *, keep_limit: int = _UNMATCHED_COUNTER_PRUNE_LIMIT) -> None:
-    if len(unmatched_counter) <= int(keep_limit):
-        return
-    retained_items = dict(unmatched_counter.most_common(int(keep_limit)))
-    unmatched_counter.clear()
-    unmatched_counter.update(retained_items)
+    for item_index, token in enumerate(med_vocab["idx_to_token"]):
+        token_text = str(token).strip()
+        if token_text in SPECIAL_VOCAB_TOKENS:
+            continue
 
+        num_real_vocab_items += 1
+        metadata_row = dict(med_vocab_metadata.get(token_text, {}))
+        canonical_rxcui = _resolve_canonical_rxcui(token_text, metadata_row)
+        if canonical_rxcui:
+            num_items_with_canonical_rxcui += 1
 
-def _maybe_prune_unmatched_counter(stats: dict[str, Any]) -> None:
-    if int(stats["rows_scanned"]) <= 0:
-        return
-    if int(stats["rows_scanned"]) % int(_UNMATCHED_COUNTER_PRUNE_EVERY_ROWS) != 0:
-        return
-    _prune_unmatched_counter(stats["unmatched_counter"])
+        candidate_names: list[str] = []
+        canonical_name = str(metadata_row.get("canonical_name", "")).strip()
+        if canonical_name:
+            candidate_names.append(canonical_name)
+            num_items_with_metadata_name += 1
 
+        if canonical_rxcui:
+            name_record = rxnorm_index.name_index.rxcui_to_names.get(canonical_rxcui)
+            if name_record is not None:
+                preferred_name = str(name_record.preferred_name).strip()
+                if preferred_name:
+                    candidate_names.append(preferred_name)
+                    num_items_with_rxnorm_name += 1
+                if name_record.synonyms:
+                    candidate_names.extend(
+                        str(name).strip()
+                        for name in name_record.synonyms
+                        if str(name).strip()
+                    )
+                    num_items_with_rxnorm_synonyms += 1
 
-def _log_parse_progress(stats: Mapping[str, Any]) -> None:
-    rss_mb = _current_rss_mb()
-    rss_text = "" if rss_mb is None else f" rss_mb={rss_mb:.1f}"
-    print(
-        "DDI parse progress: "
-        f"source_format={stats['source_format']} "
-        f"rows_scanned={int(stats['rows_scanned'])} "
-        f"rows_mapped={int(stats['rows_mapped'])} "
-        f"rows_retained={int(stats['rows_retained'])} "
-        f"header_rows_skipped={int(stats['header_rows_skipped'])} "
-        f"invalid_numeric_rows={int(stats['invalid_numeric_rows'])} "
-        f"self_pair_rows_skipped={int(stats['self_pair_rows_skipped'])} "
-        f"candidate_pairs={len(stats['candidate_pairs'])} "
-        f"retained_pairs={len(stats['retained_pairs'])} "
-        f"canonical_rows_written={int(stats['canonical_rows_written'])} "
-        f"output_temp={stats.get('progress_output_path', '')}"
-        f"{rss_text}",
-        flush=True,
-    )
+            ingredient_name = str(
+                rxnorm_index.ingredient_index.ingredient_rxcui_to_name.get(canonical_rxcui, "")
+            ).strip()
+            if ingredient_name:
+                candidate_names.append(ingredient_name)
 
-
-def _maybe_log_parse_progress(stats: Mapping[str, Any]) -> None:
-    if int(stats["rows_scanned"]) <= 0:
-        return
-    if int(stats["rows_scanned"]) % int(_PROGRESS_LOG_EVERY_ROWS) != 0:
-        return
-    _log_parse_progress(stats)
-
-
-def _record_unmatched(unmatched_counter: Counter[str], *, token_a: str | None, token_b: str | None, matched_a: bool, matched_b: bool) -> None:
-    if token_a and not matched_a:
-        unmatched_counter[token_a] += 1
-    if token_b and not matched_b:
-        unmatched_counter[token_b] += 1
-
-
-def _pair_key(idx_a: int, idx_b: int, *, stride: int) -> int:
-    left = int(idx_a)
-    right = int(idx_b)
-    if left > right:
-        left, right = right, left
-    return (left * int(stride)) + right
-
-
-def _decode_pair_key(pair_key: int, *, stride: int) -> tuple[int, int]:
-    return divmod(int(pair_key), int(stride))
-
-
-def _base_canonical_row(*, source_format: str, source_path: Path) -> dict[str, Any]:
-    return {
-        "source_format": source_format,
-        "source_path": str(source_path.resolve()),
-        "drug_1_rxnorm_id": "",
-        "drug_1_concept_name": "",
-        "drug_1_token": "",
-        "drug_1_vocab_idx": "",
-        "drug_2_rxnorm_id": "",
-        "drug_2_concept_name": "",
-        "drug_2_token": "",
-        "drug_2_vocab_idx": "",
-        "condition_meddra_id": "",
-        "condition_concept_name": "",
-        "A": "",
-        "PRR": "",
-        "PRR_error": "",
-        "mean_reporting_frequency": "",
-        "passes_statistical_filter": "",
-        "both_drugs_matched_vocab": "",
-    }
-
-
-@contextmanager
-def _canonical_pair_writer(path: Path):
-    part_path = _prepare_part_path(path)
-    with gzip.open(part_path, "wt", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=_CANONICAL_PAIR_FIELDS)
-        writer.writeheader()
-
-        def emit(row: Mapping[str, Any]) -> None:
-            writer.writerow({field: row.get(field, "") for field in _CANONICAL_PAIR_FIELDS})
-
-        try:
-            yield emit
-        except Exception:
-            raise
-    _atomic_replace(part_path, path)
-
-
-def _emit_canonical_row(
-    stats: dict[str, Any],
-    canonical_row: Mapping[str, Any],
-    *,
-    canonical_row_writer: Any | None = None,
-) -> None:
-    if canonical_row_writer is not None:
-        canonical_row_writer(canonical_row)
-        stats["canonical_rows_written"] += 1
-
-
-def _parse_manual_smoke_source(
-    *,
-    source_path: Path,
-    drug_vocab: Mapping[str, Any],
-    source_metadata: Mapping[str, Any],
-    canonical_row_writer: Any | None = None,
-    pair_stride: int,
-    progress_output_path: str = "",
-) -> dict[str, Any]:
-    stats = _init_parse_stats(source_path=source_path, source_format=_MANUAL_SMOKE_SOURCE_FORMAT, source_metadata=source_metadata)
-    stats["progress_output_path"] = progress_output_path
-    with open_csv(source_path) as handle:
-        reader = csv.DictReader(handle)
-        if not reader.fieldnames:
-            stats["reason"] = "missing_header"
-            return stats
-        pair_columns = _find_pair_columns(list(reader.fieldnames))
-        if pair_columns is None:
-            raise ValueError(f"Unable to determine DDI pair columns from {source_path}")
-        col_a, col_b = pair_columns
-        token_to_idx = drug_vocab["token_to_idx"]
-        for row in reader:
-            stats["rows_scanned"] += 1
-            token_a = canonicalize_medication_text(row.get(col_a, ""))
-            token_b = canonicalize_medication_text(row.get(col_b, ""))
-            if token_a and token_b and token_a == token_b:
-                stats["self_pair_rows_skipped"] += 1
-                _maybe_prune_unmatched_counter(stats)
-                _maybe_log_parse_progress(stats)
-                continue
-            if not token_a or not token_b:
-                _maybe_prune_unmatched_counter(stats)
-                _maybe_log_parse_progress(stats)
-                continue
-            idx_a = token_to_idx.get(token_a)
-            idx_b = token_to_idx.get(token_b)
-            matched_a = idx_a is not None
-            matched_b = idx_b is not None
-            if matched_a and matched_b:
-                pair = _pair_key(int(idx_a), int(idx_b), stride=pair_stride)
-                stats["candidate_pairs"].add(pair)
-                stats["retained_pairs"].add(pair)
-                stats["rows_mapped"] += 1
-                stats["rows_retained"] += 1
-            else:
-                _record_unmatched(
-                    stats["unmatched_counter"],
-                    token_a=token_a,
-                    token_b=token_b,
-                    matched_a=matched_a,
-                    matched_b=matched_b,
-                )
-            canonical_row = _base_canonical_row(source_format=_MANUAL_SMOKE_SOURCE_FORMAT, source_path=source_path)
-            canonical_row.update(
-                {
-                    "drug_1_concept_name": row.get(col_a, ""),
-                    "drug_1_token": token_a or "",
-                    "drug_1_vocab_idx": "" if idx_a is None else int(idx_a),
-                    "drug_2_concept_name": row.get(col_b, ""),
-                    "drug_2_token": token_b or "",
-                    "drug_2_vocab_idx": "" if idx_b is None else int(idx_b),
-                    "passes_statistical_filter": True if matched_a and matched_b else False,
-                    "both_drugs_matched_vocab": bool(matched_a and matched_b),
-                }
+            ingredient_names = rxnorm_index.ingredient_index.rxcui_to_ingredient_names.get(
+                canonical_rxcui,
+                (),
             )
-            _emit_canonical_row(stats, canonical_row, canonical_row_writer=canonical_row_writer)
-            _maybe_prune_unmatched_counter(stats)
-            _maybe_log_parse_progress(stats)
+            candidate_names.extend(
+                str(name).strip()
+                for name in ingredient_names
+                if str(name).strip()
+            )
 
-    if stats["retained_pairs"]:
-        stats["reason"] = "available"
-    elif stats["candidate_pairs"]:
-        stats["reason"] = "no_retained_pairs"
-    else:
-        stats["reason"] = "no_matched_pairs"
-    return stats
+        raw_name_candidates = [
+            candidate
+            for raw_token in metadata_row.get("source_raw_tokens", [])
+            if (candidate := _candidate_name_from_raw_token(str(raw_token)))
+        ]
+        if raw_name_candidates:
+            candidate_names.extend(raw_name_candidates)
+            num_items_with_raw_name_candidates += 1
 
+        fallback_name = _medication_token_body(token_text).replace("_", " ").strip()
+        if fallback_name and any(character.isalpha() for character in fallback_name):
+            candidate_names.append(fallback_name)
 
-def _twosides_ci_lower_bound(*, prr: float | None, prr_error: float | None) -> float | None:
-    if prr is None or prr_error is None:
-        return None
-    if not math.isfinite(prr) or not math.isfinite(prr_error):
-        return None
-    return float(prr - (1.96 * prr_error))
-
-
-def _safe_parse_int(raw_value: Any) -> int | None:
-    try:
-        return parse_int(raw_value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _safe_parse_float(raw_value: Any) -> float | None:
-    try:
-        return parse_float(raw_value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _looks_like_twosides_header_row(row: Mapping[str, Any]) -> bool:
-    return (
-        str(row.get("drug_1_concept_name", "")).strip().lower() == "drug_1_concept_name"
-        or str(row.get("drug_2_concept_name", "")).strip().lower() == "drug_2_concept_name"
-        or (
-            str(row.get("A", "")).strip().lower() == "a"
-            and str(row.get("PRR", "")).strip().lower() == "prr"
+        finalized_candidate_names = tuple(_dedupe_preserve_order(candidate_names))
+        normalized_candidate_names = tuple(
+            _dedupe_preserve_order(
+                normalized_name
+                for candidate_name in finalized_candidate_names
+                if (normalized_name := normalize_ddinter_text(candidate_name))
+            )
         )
-    )
+        canonical_match_key = normalized_candidate_names[0] if normalized_candidate_names else None
 
-
-def _parse_twosides_source(
-    *,
-    source_path: Path,
-    drug_vocab: Mapping[str, Any],
-    source_metadata: Mapping[str, Any],
-    min_support_a: int,
-    min_prr_ci_lower_bound: float,
-    canonical_row_writer: Any | None = None,
-    pair_stride: int,
-    progress_output_path: str = "",
-) -> dict[str, Any]:
-    stats = _init_parse_stats(source_path=source_path, source_format=_TWOSIDES_SOURCE_FORMAT, source_metadata=source_metadata)
-    stats["progress_output_path"] = progress_output_path
-    token_to_idx = drug_vocab["token_to_idx"]
-
-    with open_csv(source_path) as handle:
-        reader = csv.DictReader(handle)
-        if not reader.fieldnames:
-            stats["reason"] = "missing_header"
-            return stats
-        required_columns = {
-            "drug_1_concept_name",
-            "drug_2_concept_name",
-            "condition_meddra_id",
-            "condition_concept_name",
-            "A",
-            "PRR",
-            "PRR_error",
-            "mean_reporting_frequency",
+        vocab_item_to_candidate_names[item_index] = finalized_candidate_names
+        candidate_profiles[item_index] = {
+            "item_index": int(item_index),
+            "token": token_text,
+            "canonical_rxcui": canonical_rxcui,
+            "canonical_name": canonical_name or None,
+            "candidate_names": list(finalized_candidate_names[:20]),
+            "normalized_candidate_names": list(normalized_candidate_names[:20]),
+            "canonical_match_key": canonical_match_key,
+            "source_raw_tokens": list(metadata_row.get("source_raw_tokens", []))[:20],
         }
-        missing = sorted(column for column in required_columns if column not in reader.fieldnames)
-        if missing:
-            raise ValueError(f"TwoSIDES source is missing required columns {missing} in {source_path}")
 
-        for row in reader:
-            stats["rows_scanned"] += 1
-            if _looks_like_twosides_header_row(row):
-                stats["header_rows_skipped"] += 1
-                _maybe_prune_unmatched_counter(stats)
-                _maybe_log_parse_progress(stats)
-                continue
-            token_a = canonicalize_medication_text(row.get("drug_1_concept_name", ""))
-            token_b = canonicalize_medication_text(row.get("drug_2_concept_name", ""))
-            if token_a and token_b and token_a == token_b:
-                stats["self_pair_rows_skipped"] += 1
-                _maybe_prune_unmatched_counter(stats)
-                _maybe_log_parse_progress(stats)
-                continue
-            if not token_a or not token_b:
-                _maybe_prune_unmatched_counter(stats)
-                _maybe_log_parse_progress(stats)
-                continue
+    meta = {
+        "num_real_vocab_items": int(num_real_vocab_items),
+        "num_items_with_canonical_rxcui": int(num_items_with_canonical_rxcui),
+        "num_items_with_metadata_name": int(num_items_with_metadata_name),
+        "num_items_with_rxnorm_name": int(num_items_with_rxnorm_name),
+        "num_items_with_rxnorm_synonyms": int(num_items_with_rxnorm_synonyms),
+        "num_items_with_raw_name_candidates": int(num_items_with_raw_name_candidates),
+        "sample_candidate_profiles": [
+            candidate_profiles[item_index]
+            for item_index in sorted(candidate_profiles)[:20]
+        ],
+    }
+    return vocab_item_to_candidate_names, candidate_profiles, meta
 
-            idx_a = token_to_idx.get(token_a)
-            idx_b = token_to_idx.get(token_b)
-            matched_a = idx_a is not None
-            matched_b = idx_b is not None
-            pair_matched = matched_a and matched_b
-            raw_support_a = row.get("A")
-            raw_prr = row.get("PRR")
-            raw_prr_error = row.get("PRR_error")
-            support_a = _safe_parse_int(raw_support_a)
-            prr = _safe_parse_float(raw_prr)
-            prr_error = _safe_parse_float(raw_prr_error)
-            invalid_numeric_row = False
-            if str(raw_support_a or "").strip() and support_a is None:
-                invalid_numeric_row = True
-            if str(raw_prr or "").strip() and prr is None:
-                invalid_numeric_row = True
-            if str(raw_prr_error or "").strip() and prr_error is None:
-                invalid_numeric_row = True
-            if invalid_numeric_row:
-                stats["invalid_numeric_rows"] += 1
-            ci_lower_bound = _twosides_ci_lower_bound(prr=prr, prr_error=prr_error)
-            passes_filter = (
-                pair_matched
-                and support_a is not None
-                and int(support_a) >= int(min_support_a)
-                and ci_lower_bound is not None
-                and float(ci_lower_bound) > float(min_prr_ci_lower_bound)
-            )
 
-            if pair_matched:
-                pair = _pair_key(int(idx_a), int(idx_b), stride=pair_stride)
-                stats["candidate_pairs"].add(pair)
-                stats["rows_mapped"] += 1
-                if passes_filter:
-                    stats["retained_pairs"].add(pair)
-                    stats["rows_retained"] += 1
-            else:
-                _record_unmatched(
-                    stats["unmatched_counter"],
-                    token_a=token_a,
-                    token_b=token_b,
-                    matched_a=matched_a,
-                    matched_b=matched_b,
+def _match_vocab_items_to_ddinter(
+    vocab_item_to_candidate_names: Mapping[int, Iterable[str]],
+    candidate_profiles: Mapping[int, Mapping[str, Any]],
+    *,
+    ddinter_dataset: Any,
+    drugbank_index: Any,
+    example_limit: int = 20,
+) -> tuple[dict[int, tuple[str, ...]], dict[str, Any]]:
+    vocab_item_to_ddinter_ids: dict[int, tuple[str, ...]] = {}
+    matched_ddinter_ids: set[str] = set()
+    unmatched_examples: list[dict[str, Any]] = []
+    sample_matches: list[dict[str, Any]] = []
+
+    direct_name_match_count = 0
+    drugbank_bridge_match_count = 0
+    unmatched_name_count = 0
+
+    for item_index in sorted(vocab_item_to_candidate_names):
+        candidate_name_list = [
+            str(value).strip()
+            for value in vocab_item_to_candidate_names[item_index]
+            if str(value).strip()
+        ]
+        resolved_ids, match_report = match_names_to_ddinter_ids(
+            candidate_name_list,
+            ddinter_dataset=ddinter_dataset,
+            drugbank_index=drugbank_index,
+        )
+
+        direct_name_match_count += len(match_report["direct_name_matches"])
+        drugbank_bridge_match_count += len(match_report["drugbank_bridge_matches"])
+        unmatched_name_count += len(match_report["unmatched_names"])
+
+        if resolved_ids:
+            sorted_ids = tuple(sorted(resolved_ids))
+            vocab_item_to_ddinter_ids[item_index] = sorted_ids
+            matched_ddinter_ids.update(sorted_ids)
+            if len(sample_matches) < example_limit:
+                sample_matches.append(
+                    {
+                        **dict(candidate_profiles.get(item_index, {})),
+                        "ddinter_ids": list(sorted_ids),
+                        "matched_by_direct_names": sorted(
+                            str(value) for value in match_report["direct_name_matches"]
+                        )[:10],
+                        "matched_by_drugbank_bridge": sorted(
+                            str(value) for value in match_report["drugbank_bridge_matches"]
+                        )[:10],
+                    }
                 )
+            continue
 
-            canonical_row = _base_canonical_row(source_format=_TWOSIDES_SOURCE_FORMAT, source_path=source_path)
-            canonical_row.update(
+        if len(unmatched_examples) < example_limit:
+            unmatched_examples.append(
                 {
-                    "drug_1_rxnorm_id": next((row.get(column, "") for column in _TWOSIDES_RXNORM_A_COLUMNS if row.get(column, "")), ""),
-                    "drug_1_concept_name": row.get("drug_1_concept_name", ""),
-                    "drug_1_token": token_a or "",
-                    "drug_1_vocab_idx": "" if idx_a is None else int(idx_a),
-                    "drug_2_rxnorm_id": next((row.get(column, "") for column in _TWOSIDES_RXNORM_B_COLUMNS if row.get(column, "")), ""),
-                    "drug_2_concept_name": row.get("drug_2_concept_name", ""),
-                    "drug_2_token": token_b or "",
-                    "drug_2_vocab_idx": "" if idx_b is None else int(idx_b),
-                    "condition_meddra_id": row.get("condition_meddra_id", ""),
-                    "condition_concept_name": row.get("condition_concept_name", ""),
-                    "A": "" if support_a is None else int(support_a),
-                    "PRR": "" if prr is None else float(prr),
-                    "PRR_error": "" if prr_error is None else float(prr_error),
-                    "mean_reporting_frequency": row.get("mean_reporting_frequency", ""),
-                    "passes_statistical_filter": bool(passes_filter),
-                    "both_drugs_matched_vocab": bool(pair_matched),
+                    **dict(candidate_profiles.get(item_index, {})),
+                    "unmatched_names": list(match_report["unmatched_names"])[:10],
                 }
             )
-            _emit_canonical_row(stats, canonical_row, canonical_row_writer=canonical_row_writer)
-            _maybe_prune_unmatched_counter(stats)
-            _maybe_log_parse_progress(stats)
 
-    if stats["retained_pairs"]:
-        stats["reason"] = "available"
-    elif stats["candidate_pairs"]:
-        stats["reason"] = "no_retained_pairs"
-    else:
-        stats["reason"] = "no_matched_pairs"
-    return stats
-
-
-def _canonical_row_passes_filter(row: Mapping[str, str]) -> bool:
-    raw_flag = row.get("passes_statistical_filter")
-    if raw_flag is not None and str(raw_flag).strip() != "":
-        return _coerce_bool(raw_flag, default=False)
-    return False
-
-
-def _parse_canonical_pair_source(
-    *,
-    source_path: Path,
-    drug_vocab: Mapping[str, Any],
-    source_metadata: Mapping[str, Any],
-    canonical_row_writer: Any | None = None,
-    pair_stride: int,
-    progress_output_path: str = "",
-) -> dict[str, Any]:
-    stats = _init_parse_stats(source_path=source_path, source_format=_CANONICAL_PAIR_SOURCE_FORMAT, source_metadata=source_metadata)
-    stats["progress_output_path"] = progress_output_path
-    token_to_idx = drug_vocab["token_to_idx"]
-
-    with open_csv(source_path) as handle:
-        reader = csv.DictReader(handle)
-        if not reader.fieldnames:
-            stats["reason"] = "missing_header"
-            return stats
-        canonical_token_columns = _find_canonical_token_columns(list(reader.fieldnames))
-        pair_columns = _find_pair_columns(list(reader.fieldnames))
-        if canonical_token_columns is None and pair_columns is None:
-            raise ValueError(f"Canonical pair source {source_path} must contain token columns or generic pair columns.")
-
-        for row in reader:
-            stats["rows_scanned"] += 1
-            if canonical_token_columns is not None:
-                token_a = str(row.get(canonical_token_columns[0], "")).strip() or None
-                token_b = str(row.get(canonical_token_columns[1], "")).strip() or None
-            else:
-                col_a, col_b = pair_columns
-                token_a = canonicalize_medication_text(row.get(col_a, ""))
-                token_b = canonicalize_medication_text(row.get(col_b, ""))
-            if token_a and token_b and token_a == token_b:
-                stats["self_pair_rows_skipped"] += 1
-                _maybe_prune_unmatched_counter(stats)
-                _maybe_log_parse_progress(stats)
-                continue
-            if not token_a or not token_b:
-                _maybe_prune_unmatched_counter(stats)
-                _maybe_log_parse_progress(stats)
-                continue
-
-            idx_a = token_to_idx.get(token_a)
-            idx_b = token_to_idx.get(token_b)
-            matched_a = idx_a is not None
-            matched_b = idx_b is not None
-            pair_matched = matched_a and matched_b
-            passes_filter = pair_matched and _canonical_row_passes_filter(row)
-            if pair_matched:
-                pair = _pair_key(int(idx_a), int(idx_b), stride=pair_stride)
-                stats["candidate_pairs"].add(pair)
-                stats["rows_mapped"] += 1
-                if passes_filter:
-                    stats["retained_pairs"].add(pair)
-                    stats["rows_retained"] += 1
-            else:
-                _record_unmatched(
-                    stats["unmatched_counter"],
-                    token_a=token_a,
-                    token_b=token_b,
-                    matched_a=matched_a,
-                    matched_b=matched_b,
-                )
-
-            canonical_row = _base_canonical_row(source_format=_CANONICAL_PAIR_SOURCE_FORMAT, source_path=source_path)
-            canonical_row.update({field: row.get(field, canonical_row[field]) for field in _CANONICAL_PAIR_FIELDS if field in row})
-            canonical_row["drug_1_token"] = token_a or ""
-            canonical_row["drug_2_token"] = token_b or ""
-            canonical_row["drug_1_vocab_idx"] = "" if idx_a is None else int(idx_a)
-            canonical_row["drug_2_vocab_idx"] = "" if idx_b is None else int(idx_b)
-            canonical_row["passes_statistical_filter"] = bool(passes_filter)
-            canonical_row["both_drugs_matched_vocab"] = bool(pair_matched)
-            _emit_canonical_row(stats, canonical_row, canonical_row_writer=canonical_row_writer)
-            _maybe_prune_unmatched_counter(stats)
-            _maybe_log_parse_progress(stats)
-
-    if stats["retained_pairs"]:
-        stats["reason"] = "available"
-    elif stats["candidate_pairs"]:
-        stats["reason"] = "no_retained_pairs"
-    else:
-        stats["reason"] = "no_matched_pairs"
-    return stats
-
-
-def _build_matrix_from_pairs(*, retained_pairs: set[int], drug_count: int) -> list[list[int]]:
-    matrix = [[0 for _ in range(drug_count)] for _ in range(drug_count)]
-    for pair_key in retained_pairs:
-        idx_a, idx_b = _decode_pair_key(int(pair_key), stride=drug_count)
-        matrix[idx_a][idx_b] = 1
-        matrix[idx_b][idx_a] = 1
-    return matrix
-
-
-def _build_source_result(
-    *,
-    source_path: Path,
-    source_format: str,
-    drug_vocab: Mapping[str, Any],
-    min_support_a: int,
-    min_prr_ci_lower_bound: float,
-    canonical_pairs_path: Path | None = None,
-) -> dict[str, Any]:
-    if not source_path.exists():
-        raise FileNotFoundError(f"Configured DDI source path does not exist: {source_path}")
-    source_metadata = _read_source_metadata(source_path, source_format=source_format)
-    progress_output_path = "" if canonical_pairs_path is None else str(_part_path(canonical_pairs_path))
-    writer_context = _canonical_pair_writer(canonical_pairs_path) if canonical_pairs_path is not None else nullcontext(None)
-    with writer_context as canonical_row_writer:
-        if source_format == _MANUAL_SMOKE_SOURCE_FORMAT:
-            stats = _parse_manual_smoke_source(
-                source_path=source_path,
-                drug_vocab=drug_vocab,
-                source_metadata=source_metadata,
-                canonical_row_writer=canonical_row_writer,
-                pair_stride=len(drug_vocab["idx_to_token"]),
-                progress_output_path=progress_output_path,
-            )
-        elif source_format == _TWOSIDES_SOURCE_FORMAT:
-            stats = _parse_twosides_source(
-                source_path=source_path,
-                drug_vocab=drug_vocab,
-                source_metadata=source_metadata,
-                min_support_a=min_support_a,
-                min_prr_ci_lower_bound=min_prr_ci_lower_bound,
-                canonical_row_writer=canonical_row_writer,
-                pair_stride=len(drug_vocab["idx_to_token"]),
-                progress_output_path=progress_output_path,
-            )
-        elif source_format == _CANONICAL_PAIR_SOURCE_FORMAT:
-            stats = _parse_canonical_pair_source(
-                source_path=source_path,
-                drug_vocab=drug_vocab,
-                source_metadata=source_metadata,
-                canonical_row_writer=canonical_row_writer,
-                pair_stride=len(drug_vocab["idx_to_token"]),
-                progress_output_path=progress_output_path,
-            )
-        else:
-            raise ValueError(f"Unsupported source_format `{source_format}`.")
-
-    retained_pairs = set(stats["retained_pairs"])
-    candidate_pairs = set(stats["candidate_pairs"])
-    source_metadata = dict(stats["source_metadata"])
-    is_research_grade = bool(source_format == _TWOSIDES_SOURCE_FORMAT and retained_pairs)
-    source_metadata["research_grade"] = is_research_grade
-    matrix = _build_matrix_from_pairs(retained_pairs=retained_pairs, drug_count=len(drug_vocab["idx_to_token"]))
-    ddi_type = str(source_metadata.get("kind") or "unknown")
-    return {
-        "matrix": matrix,
-        "active": bool(retained_pairs),
-        "reason": str(stats["reason"]),
-        "source": str(source_path.resolve()),
-        "source_path": str(source_path.resolve()),
-        "source_format": source_format,
-        "ddi_type": ddi_type,
-        "ddi_source": str(source_path.resolve()),
-        "ddi_research_grade": is_research_grade,
-        "matched_pairs": int(len(candidate_pairs)),
-        "nonzero_pairs": int(len(retained_pairs)),
-        "rows_scanned": int(stats["rows_scanned"]),
-        "rows_mapped": int(stats["rows_mapped"]),
-        "rows_retained": int(stats["rows_retained"]),
-        "header_rows_skipped": int(stats["header_rows_skipped"]),
-        "invalid_numeric_rows": int(stats["invalid_numeric_rows"]),
-        "self_pair_rows_skipped": int(stats["self_pair_rows_skipped"]),
-        "source_metadata": source_metadata,
-        "unmatched_drugs_topk": [token for token, _ in stats["unmatched_counter"].most_common(_UNMATCHED_COUNTER_REPORT_LIMIT)],
-        "unmatched_drugs": [token for token, _ in stats["unmatched_counter"].most_common(_UNMATCHED_COUNTER_REPORT_LIMIT)],
-        "canonical_rows_written": int(stats["canonical_rows_written"]),
+    meta = {
+        "num_vocab_items": int(len(vocab_item_to_candidate_names)),
+        "num_vocab_items_matched": int(len(vocab_item_to_ddinter_ids)),
+        "num_vocab_items_unmatched": int(
+            len(vocab_item_to_candidate_names) - len(vocab_item_to_ddinter_ids)
+        ),
+        "matched_ddinter_id_count": int(len(matched_ddinter_ids)),
+        "direct_name_match_count": int(direct_name_match_count),
+        "drugbank_bridge_match_count": int(drugbank_bridge_match_count),
+        "unmatched_name_count": int(unmatched_name_count),
+        "sample_matches": sample_matches,
+        "unmatched_examples": unmatched_examples,
     }
+    LOGGER.info(
+        "Matched %s/%s medication vocab items to DDInter IDs",
+        len(vocab_item_to_ddinter_ids),
+        len(vocab_item_to_candidate_names),
+    )
+    return vocab_item_to_ddinter_ids, meta
 
 
-def _write_pt_atomic(path: Path, payload: Mapping[str, Any]) -> Path:
-    part_path = _prepare_part_path(path)
-    save_pt(part_path, payload)
-    return _atomic_replace(part_path, path)
+def _require_torch() -> Any:
+    try:
+        import torch
+    except ImportError as exc:  # pragma: no cover - environment dependent
+        raise RuntimeError(
+            "build_ddi_matrix requires `torch` to serialize tensor outputs."
+        ) from exc
+    return torch
 
 
-def _write_json_atomic(path: Path, payload: Mapping[str, Any]) -> Path:
-    part_path = _prepare_part_path(path)
-    write_json(part_path, payload)
-    return _atomic_replace(part_path, path)
+def _build_ddi_tensors(
+    projected_pairs: Iterable[Any],
+    *,
+    vocab_size: int,
+    example_limit: int = 20,
+) -> tuple[Any, Any, dict[str, Any]]:
+    torch = _require_torch()
+    matrix = torch.zeros((vocab_size, vocab_size), dtype=torch.uint8)
+    severity_matrix = torch.zeros((vocab_size, vocab_size), dtype=torch.uint8)
+
+    severity_counter: Counter[str] = Counter()
+    unknown_severity_levels: set[str] = set()
+    pair_metadata_examples: list[dict[str, Any]] = []
+
+    for pair in projected_pairs:
+        left_index = int(pair.left_item_id)
+        right_index = int(pair.right_item_id)
+        if left_index == right_index:
+            continue
+
+        matrix[left_index, right_index] = 1
+        matrix[right_index, left_index] = 1
+
+        severity_level = str(pair.max_severity_level or "unknown").strip().lower()
+        if severity_level not in LEVEL_SEVERITY_PRIORITY:
+            unknown_severity_levels.add(severity_level)
+        severity_weight = int(LEVEL_SEVERITY_PRIORITY.get(severity_level, 0))
+        current_weight = int(severity_matrix[left_index, right_index].item())
+        if severity_weight > current_weight:
+            severity_matrix[left_index, right_index] = severity_weight
+            severity_matrix[right_index, left_index] = severity_weight
+
+        severity_counter[severity_level] += 1
+
+        if len(pair_metadata_examples) < example_limit:
+            pair_metadata_examples.append(
+                {
+                    "left_index": left_index,
+                    "right_index": right_index,
+                    "max_severity_level": pair.max_severity_level,
+                    "dominant_level": pair.dominant_level,
+                    "level_counts": list(pair.level_counts),
+                    "row_count": int(pair.row_count),
+                    "ddinter_pairs": [list(ddinter_pair) for ddinter_pair in pair.ddinter_pairs[:10]],
+                }
+            )
+
+    matrix.fill_diagonal_(0)
+    severity_matrix.fill_diagonal_(0)
+
+    unique_pair_count = int(torch.triu(matrix, diagonal=1).sum().item())
+    matrix_nonzero = int(matrix.sum().item())
+    severity_nonzero = int((severity_matrix > 0).sum().item())
+
+    meta = {
+        "num_projected_vocab_pairs": int(unique_pair_count),
+        "matrix_nonzero": int(matrix_nonzero),
+        "severity_nonzero": int(severity_nonzero),
+        "severity_counts": {key: int(value) for key, value in sorted(severity_counter.items())},
+        "unknown_severity_levels": sorted(
+            level for level in unknown_severity_levels if str(level).strip()
+        ),
+        "pair_metadata_examples": pair_metadata_examples,
+    }
+    return matrix, severity_matrix, meta
 
 
 def build_ddi_matrix(config_path: str | Path) -> Path:
-    config = load_yaml_config(config_path)
-    vocab_bundle = load_vocab_bundle(config)
-    drug_vocab = vocab_bundle["drug"]
-    drug_count = len(drug_vocab["idx_to_token"])
-    matrix_path, report_path, canonical_pairs_path = _ddi_output_paths(config)
-    settings = _resolve_ddi_settings(config)
-    canonical_pairs_temp_path = _part_path(canonical_pairs_path) if settings["canonical_pairs_configured"] else None
+    """
+    Build a DDInter-backed DDI matrix aligned to ``med_vocab_main``.
 
-    print(
-        "Starting DDI build: "
-        f"requested_source={settings['source_path']} "
-        f"source_format={settings['source_format']} "
-        f"fallback_source={settings['fallback_source_path']} "
-        f"fallback_source_format={settings['fallback_source_format']} "
-        f"canonical_pairs_temp={canonical_pairs_temp_path}",
-        flush=True,
+    The pipeline is:
+    1. load ``med_vocab_main`` and its metadata
+    2. derive candidate drug names from canonical RxNorm ingredient labels
+    3. use DrugBank Vocabulary as an alias bridge
+    4. match onto DDInter entities
+    5. project DDInter pairs back to the benchmark medication vocabulary
+    6. persist binary and severity-aware tensor artifacts plus a coverage report
+    """
+
+    _configure_logging()
+    config = load_yaml_config(config_path)
+    warnings: list[str] = []
+    representation = _resolve_ddi_representation(config, warnings)
+
+    matrix_path, report_path = _ddi_output_paths(config)
+    med_vocab, med_vocab_metadata, med_vocab_paths = _load_med_vocab_main(config)
+    vocab_tokens = [str(token) for token in med_vocab["idx_to_token"]]
+    vocab_size = len(vocab_tokens)
+    real_vocab_tokens = [token for token in vocab_tokens if token not in SPECIAL_VOCAB_TOKENS]
+
+    rxnorm_root = _resolve_required_source_path(
+        config,
+        key="rxnorm_root",
+        description="RxNorm release directory",
+        defaults=(
+            "data/processed/ddi/RxNorm_full_04062026",
+            "data/raw/ddi/RxNorm_full_04062026",
+        ),
+    )
+    drugbank_vocab_path = _resolve_required_source_path(
+        config,
+        key="drugbank_vocab_path",
+        description="DrugBank vocabulary CSV",
+        defaults=("data/processed/ddi/drugbank vocabulary.csv",),
+    )
+    ddinter_root = _resolve_required_source_path(
+        config,
+        key="ddinter_root",
+        description="DDInter directory or CSV",
+        defaults=("data/processed/ddi",),
+    )
+    ddinter_glob = (
+        str(dict(config.get("paths", {})).get("ddinter_glob", DEFAULT_DDINTER_GLOB)).strip()
+        or DEFAULT_DDINTER_GLOB
+    )
+    include_unknown = bool(config.get("ddinter_include_unknown", True))
+
+    LOGGER.info("Loading RxNorm tables from %s", rxnorm_root)
+    rxnorm_index = build_minimal_rxnorm_index(rxnorm_root)
+
+    LOGGER.info("Loading DrugBank Vocabulary from %s", drugbank_vocab_path)
+    drugbank_index = load_drugbank_vocabulary_index(drugbank_vocab_path)
+
+    LOGGER.info(
+        "Loading DDInter from %s using glob=%s (include_unknown=%s)",
+        ddinter_root,
+        ddinter_glob,
+        include_unknown,
+    )
+    ddinter_dataset = load_ddinter_dataset(
+        ddinter_root,
+        glob_pattern=ddinter_glob,
+        include_unknown=include_unknown,
     )
 
-    report = _empty_effective_report(drug_count=drug_count)
-    report["vocab_size"] = int(drug_count)
+    vocab_item_to_candidate_names, candidate_profiles, candidate_meta = _build_vocab_candidate_index(
+        med_vocab,
+        med_vocab_metadata,
+        rxnorm_index=rxnorm_index,
+    )
+    vocab_item_to_ddinter_ids, vocab_match_meta = _match_vocab_items_to_ddinter(
+        vocab_item_to_candidate_names,
+        candidate_profiles,
+        ddinter_dataset=ddinter_dataset,
+        drugbank_index=drugbank_index,
+    )
+    projected_pairs, pair_projection_meta = project_ddinter_pairs_to_vocab(
+        vocab_item_to_ddinter_ids,
+        ddinter_dataset=ddinter_dataset,
+    )
+    matrix, severity_matrix, matrix_meta = _build_ddi_tensors(projected_pairs, vocab_size=vocab_size)
 
-    primary_result: dict[str, Any] | None = None
-    source_path = settings["source_path"]
-    if source_path is not None:
-        primary_result = _build_source_result(
-            source_path=source_path,
-            source_format=str(settings["source_format"]),
-            drug_vocab=drug_vocab,
-            min_support_a=int(settings["min_support_a"]),
-            min_prr_ci_lower_bound=float(settings["min_prr_ci_lower_bound"]),
-            canonical_pairs_path=canonical_pairs_path if settings["canonical_pairs_configured"] else None,
+    num_vocab_drugs = int(len(real_vocab_tokens))
+    num_vocab_drugs_matched = int(vocab_match_meta["num_vocab_items_matched"])
+    num_ddi_pairs_raw = int(len(ddinter_dataset.pair_records))
+    num_ddi_pairs_matched = int(matrix_meta["num_projected_vocab_pairs"])
+    match_rate = (
+        float(num_vocab_drugs_matched) / float(num_vocab_drugs)
+        if num_vocab_drugs > 0
+        else 0.0
+    )
+
+    if num_vocab_drugs_matched == 0:
+        warning = "No medication vocabulary items were matched to DDInter entities."
+        LOGGER.warning(warning)
+        warnings.append(warning)
+    if num_ddi_pairs_matched == 0:
+        warning = "Projected DDInter pair count is 0; the saved DDI matrix will be all zeros."
+        LOGGER.warning(warning)
+        warnings.append(warning)
+    if matrix_meta["unknown_severity_levels"]:
+        warning = (
+            "Observed unrecognized DDInter severity levels: "
+            f"{matrix_meta['unknown_severity_levels'][:10]}"
         )
-    elif settings["canonical_pairs_configured"]:
-        warnings.warn(
-            "DDI canonical_pairs_path was configured but ddi.source_path is empty; no canonical pair file was written.",
-            stacklevel=2,
-        )
+        LOGGER.warning(warning)
+        warnings.append(warning)
 
-    effective_result = primary_result
-    fallback_reason = ""
-    fallback_source_path = settings["fallback_source_path"]
-    if primary_result is None:
-        fallback_reason = "missing_ddi_source_path"
-    elif not bool(primary_result["active"]):
-        fallback_reason = str(primary_result["reason"])
+    notes = [
+        "Matrix rows and columns follow med_vocab_main.json, including PAD and UNK as zero rows.",
+        "Binary adjacency marks any DDInter interaction projected onto the benchmark medication vocabulary.",
+        "severity_matrix stores the maximum DDInter severity weight observed per vocab pair.",
+    ]
 
-    should_use_fallback = bool(fallback_source_path is not None and fallback_reason)
-    if should_use_fallback:
-        if fallback_source_path.exists():
-            fallback_result = _build_source_result(
-                source_path=fallback_source_path,
-                source_format=str(settings["fallback_source_format"]),
-                drug_vocab=drug_vocab,
-                min_support_a=int(settings["min_support_a"]),
-                min_prr_ci_lower_bound=float(settings["min_prr_ci_lower_bound"]),
-                canonical_pairs_path=None,
-            )
-            if bool(fallback_result["active"]):
-                effective_result = fallback_result
-            else:
-                effective_result = fallback_result
-                if primary_result is None:
-                    fallback_reason = f"{fallback_reason}; fallback_result={fallback_result['reason']}"
-                else:
-                    fallback_reason = (
-                        f"{fallback_reason}; fallback_result={fallback_result['reason']}"
-                    )
-        else:
-            if primary_result is None:
-                fallback_reason = (
-                    f"{fallback_reason}; fallback_source_missing={fallback_source_path.resolve()}"
-                )
-            else:
-                fallback_reason = (
-                    f"{fallback_reason}; fallback_source_missing={fallback_source_path.resolve()}"
-                )
+    report = {
+        "representation": representation,
+        "label_level": "ingredient_rxcui",
+        "label_token_format": "MEDRX:<ingredient_rxcui>",
+        "num_vocab_tokens_total": int(vocab_size),
+        "num_vocab_drugs": int(num_vocab_drugs),
+        "num_vocab_drugs_matched": int(num_vocab_drugs_matched),
+        "match_rate": float(match_rate),
+        "num_ddi_pairs_raw": int(num_ddi_pairs_raw),
+        "num_ddi_pairs_matched": int(num_ddi_pairs_matched),
+        "matrix_shape": [int(vocab_size), int(vocab_size)],
+        "matrix_nonzero": int(matrix_meta["matrix_nonzero"]),
+        "matrix_nonzero_upper": int(matrix_meta["num_projected_vocab_pairs"]),
+        "severity_nonzero": int(matrix_meta["severity_nonzero"]),
+        "severity_counts": dict(matrix_meta["severity_counts"]),
+        "severity_level_to_weight": {
+            key: int(value) for key, value in sorted(LEVEL_SEVERITY_PRIORITY.items())
+        },
+        "matched_pairs": int(num_ddi_pairs_matched),
+        "num_vocab_tokens_mapped_to_ddinter": int(num_vocab_drugs_matched),
+        "num_interacting_pairs_real_labels": int(num_ddi_pairs_matched),
+        "unmatched_vocab_examples": list(vocab_match_meta["unmatched_examples"]),
+        "notes": notes,
+        "warnings": warnings,
+        "source_paths": {
+            **med_vocab_paths,
+            "rxnorm_root": str(rxnorm_root),
+            "drugbank_vocab_path": str(drugbank_vocab_path),
+            "ddinter_root": str(ddinter_root),
+            "ddinter_glob": ddinter_glob,
+        },
+        "rxnorm_meta": dict(rxnorm_index.meta),
+        "drugbank_meta": dict(drugbank_index.meta),
+        "ddinter_meta": dict(ddinter_dataset.meta),
+        "candidate_generation": candidate_meta,
+        "vocab_match": vocab_match_meta,
+        "pair_projection": pair_projection_meta,
+        "ddinter_projection": {
+            **{
+                key: value
+                for key, value in vocab_match_meta.items()
+                if key
+                in {
+                    "num_vocab_items",
+                    "num_vocab_items_matched",
+                    "num_vocab_items_unmatched",
+                    "matched_ddinter_id_count",
+                    "direct_name_match_count",
+                    "drugbank_bridge_match_count",
+                    "unmatched_name_count",
+                }
+            },
+            **{
+                key: value
+                for key, value in pair_projection_meta.items()
+                if key
+                in {
+                    "num_vocab_items_with_ddinter_ids",
+                    "num_ddinter_ids_in_vocab_map",
+                    "num_ddinter_pair_records",
+                    "num_ddinter_pair_records_with_vocab_match",
+                    "num_ddinter_pair_records_without_vocab_match",
+                    "num_pair_records_collapsed_to_same_item",
+                    "num_projected_vocab_pairs",
+                }
+            },
+        },
+        "pair_metadata_examples": list(matrix_meta["pair_metadata_examples"]),
+    }
 
-    if effective_result is None:
-        matrix = [[0 for _ in range(drug_count)] for _ in range(drug_count)]
-        effective_result = {
-            "matrix": matrix,
-            "active": False,
-            "reason": "missing_ddi_source_path",
-            "source": _FALLBACK_SOURCE,
-            "source_path": _FALLBACK_SOURCE,
-            "source_format": "fallback_zero",
-            "ddi_type": "fallback_zero",
-            "ddi_source": _FALLBACK_SOURCE,
-            "ddi_research_grade": False,
-            "matched_pairs": 0,
-            "nonzero_pairs": 0,
-            "rows_scanned": 0,
-            "rows_mapped": 0,
-            "rows_retained": 0,
-            "header_rows_skipped": 0,
-            "invalid_numeric_rows": 0,
-            "self_pair_rows_skipped": 0,
-            "source_metadata": report["source_metadata"],
-            "unmatched_drugs_topk": [],
-            "unmatched_drugs": [],
-            "canonical_rows_written": 0,
-        }
-
-    requested_source = "" if source_path is None else str(source_path.resolve())
-    requested_source_format = "" if source_path is None else str(settings["source_format"])
-    effective_source = str(effective_result["source"])
-    effective_source_format = str(effective_result["source_format"])
-    if effective_result["active"]:
-        report.update(
-            {
-                "active": True,
-                "reason": "available",
-                "source": effective_source,
-                "requested_source": requested_source,
-                "requested_source_format": requested_source_format,
-                "effective_source": effective_source,
-                "effective_source_format": effective_source_format,
-                "source_format": effective_source_format,
-                "ddi_type": str(effective_result["ddi_type"]),
-                "ddi_source": effective_source,
-                "ddi_research_grade": bool(effective_result["ddi_research_grade"]),
-                "matched_pairs": int(effective_result["matched_pairs"]),
-                "nonzero_pairs": int(effective_result["nonzero_pairs"]),
-                "rows_scanned": int(effective_result["rows_scanned"]),
-                "rows_mapped": int(effective_result["rows_mapped"]),
-                "rows_retained": int(effective_result["rows_retained"]),
-                "header_rows_skipped": int(effective_result.get("header_rows_skipped", 0)),
-                "invalid_numeric_rows": int(effective_result.get("invalid_numeric_rows", 0)),
-                "self_pair_rows_skipped": int(effective_result.get("self_pair_rows_skipped", 0)),
-                "source_metadata": dict(effective_result["source_metadata"]),
-                "fallback_reason": "" if effective_source == requested_source or not fallback_reason else fallback_reason,
-                "unmatched_drugs_topk": list(effective_result["unmatched_drugs_topk"]),
-                "unmatched_drugs": list(effective_result["unmatched_drugs"]),
-                "canonical_rows_written": int(effective_result.get("canonical_rows_written", 0)),
-            }
-        )
-    else:
-        reason = str(fallback_reason or effective_result["reason"] or "no_matched_pairs")
-        report.update(
-            {
-                "active": False,
-                "reason": reason,
-                "source": effective_source,
-                "requested_source": requested_source,
-                "requested_source_format": requested_source_format,
-                "effective_source": effective_source,
-                "effective_source_format": effective_source_format,
-                "source_format": effective_source_format,
-                "ddi_type": str(effective_result["ddi_type"]),
-                "ddi_source": effective_source,
-                "ddi_research_grade": False,
-                "matched_pairs": int(effective_result["matched_pairs"]),
-                "nonzero_pairs": int(effective_result["nonzero_pairs"]),
-                "rows_scanned": int(effective_result["rows_scanned"]),
-                "rows_mapped": int(effective_result["rows_mapped"]),
-                "rows_retained": int(effective_result["rows_retained"]),
-                "header_rows_skipped": int(effective_result.get("header_rows_skipped", 0)),
-                "invalid_numeric_rows": int(effective_result.get("invalid_numeric_rows", 0)),
-                "self_pair_rows_skipped": int(effective_result.get("self_pair_rows_skipped", 0)),
-                "source_metadata": dict(effective_result["source_metadata"]),
-                "fallback_reason": reason if fallback_reason else "",
-                "unmatched_drugs_topk": list(effective_result["unmatched_drugs_topk"]),
-                "unmatched_drugs": list(effective_result["unmatched_drugs"]),
-                "canonical_rows_written": int(effective_result.get("canonical_rows_written", 0)),
-            }
-        )
-        warnings.warn(
-            "DDI source did not yield an active artifact; writing an inactive fallback_zero DDI artifact.",
-            stacklevel=2,
-        )
-
-    effective_matrix = effective_result["matrix"]
-    _write_pt_atomic(
+    LOGGER.info("Saving DDI tensor payload to %s", matrix_path)
+    save_pt(
         matrix_path,
         {
-            "matrix": effective_matrix,
-            "active": bool(report["active"]),
-            "reason": str(report["reason"]),
-            "source": report["source"],
-            "requested_source": str(report["requested_source"]),
-            "requested_source_format": str(report["requested_source_format"]),
-            "effective_source": str(report["effective_source"]),
-            "effective_source_format": str(report["effective_source_format"]),
-            "source_format": str(report["source_format"]),
-            "ddi_type": str(report["ddi_type"]),
-            "ddi_source": str(report["ddi_source"]),
-            "ddi_research_grade": bool(report["ddi_research_grade"]),
-            "matched_pairs": int(report["matched_pairs"]),
-            "nonzero_pairs": int(report["nonzero_pairs"]),
-            "rows_scanned": int(report["rows_scanned"]),
-            "rows_mapped": int(report["rows_mapped"]),
-            "rows_retained": int(report["rows_retained"]),
-            "header_rows_skipped": int(report.get("header_rows_skipped", 0)),
-            "invalid_numeric_rows": int(report.get("invalid_numeric_rows", 0)),
-            "self_pair_rows_skipped": int(report.get("self_pair_rows_skipped", 0)),
-            "vocab_size": int(drug_count),
-            "pad_idx": int(drug_vocab["pad_idx"]),
-            "unk_idx": int(drug_vocab["unk_idx"]),
-            "fallback_reason": str(report["fallback_reason"]),
-            "source_metadata": dict(report["source_metadata"]),
-            "unmatched_drugs_topk": list(report["unmatched_drugs_topk"]),
-            "unmatched_drugs": list(report["unmatched_drugs"]),
-            "canonical_rows_written": int(report.get("canonical_rows_written", 0)),
+            "matrix": matrix,
+            "severity_matrix": severity_matrix,
+            "severity_level_to_weight": {
+                key: int(value) for key, value in sorted(LEVEL_SEVERITY_PRIORITY.items())
+            },
+            "representation": representation,
+            "vocab_name": str(med_vocab.get("name", CANONICAL_DDI_REPRESENTATION)),
+            "vocab_size": int(vocab_size),
+            "pad_idx": int(med_vocab["pad_idx"]),
+            "unk_idx": int(med_vocab["unk_idx"]),
+            "num_vocab_drugs": int(num_vocab_drugs),
+            "num_vocab_drugs_matched": int(num_vocab_drugs_matched),
+            "num_ddi_pairs_raw": int(num_ddi_pairs_raw),
+            "num_ddi_pairs_matched": int(num_ddi_pairs_matched),
+            "matched_pairs": int(num_ddi_pairs_matched),
+            "pair_metadata_examples": list(matrix_meta["pair_metadata_examples"]),
         },
     )
-    _write_json_atomic(report_path, report)
-    print(
-        "Completed DDI build: "
-        f"active={bool(report['active'])} "
-        f"ddi_type={report['ddi_type']} "
-        f"ddi_research_grade={bool(report['ddi_research_grade'])} "
-        f"matched_pairs={int(report['matched_pairs'])} "
-        f"nonzero_pairs={int(report['nonzero_pairs'])} "
-        f"effective_source={report['effective_source']} "
-        f"fallback_reason={report['fallback_reason']}",
-        flush=True,
+    write_json(report_path, report)
+
+    LOGGER.info(
+        "DDI matrix built successfully (matched_vocab=%s/%s, matched_pairs=%s)",
+        num_vocab_drugs_matched,
+        num_vocab_drugs,
+        num_ddi_pairs_matched,
     )
     return matrix_path
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Build DDI matrix aligned with the drug vocabulary.")
-    parser.add_argument("--config", required=True, help="Path to configs/data.yaml")
+    parser = argparse.ArgumentParser(
+        description="Build a DDInter-backed DDI matrix aligned to the benchmark med_vocab_main."
+    )
+    parser.add_argument("--config", type=str, default="configs/data.yaml")
     args = parser.parse_args()
     build_ddi_matrix(args.config)
 

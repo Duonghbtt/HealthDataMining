@@ -5,430 +5,211 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from src.retrieval.dynamic_graph import build_edge_artifact
-from src.retrieval.memory_bank import MemoryBank, build_last_visit_queries
-from src.retrieval.topk_retriever import (
-    _retrieve_patient_neighbors_reference,
-    retrieve_patient_neighbors,
-    retrieve_personal_history,
-    validate_retrieval_payload,
-)
+from src.data.dataset import collate_batch
+from src.retrieval.faiss_index import VisitFaissIndex
+from src.retrieval.memory_bank import VisitMemoryBank
+from src.retrieval.topk_retriever import TopKVisitRetriever
 
 
-def _build_memory_bank() -> MemoryBank:
-    return MemoryBank(
-        visit_states=torch.tensor(
+def test_visit_memory_bank_builds_visit_level_records() -> None:
+    bank = VisitMemoryBank(split_name="train")
+    bank.add_batch(
+        patient_ids=[101, 202],
+        visit_embeddings=torch.tensor(
             [
-                [1.00, 0.00],  # stay 301 visit 0
-                [0.96, 0.04],  # stay 301 visit 1
-                [0.95, 0.03],  # stay 302 visit 0
-                [0.92, 0.02],  # stay 302 visit 1
-                [0.00, 1.00],  # stay 304 visit 0
+                [[1.0, 0.0, 0.0, 0.0], [0.8, 0.2, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0]],
+                [[0.0, 1.0, 0.0, 0.0], [0.0, 0.8, 0.2, 0.0], [0.0, 0.0, 0.0, 0.0]],
             ],
             dtype=torch.float32,
         ),
-        visit_repr=torch.tensor(
+        medication_evidence=torch.tensor(
             [
-                [1.00, 0.00],
-                [0.96, 0.04],
-                [0.95, 0.03],
-                [0.92, 0.02],
-                [0.00, 1.00],
+                [[1, 0, 0, 0, 0], [0, 1, 0, 0, 0], [0, 0, 0, 0, 0]],
+                [[0, 0, 1, 0, 0], [0, 0, 0, 1, 0], [0, 0, 0, 0, 0]],
             ],
             dtype=torch.float32,
         ),
-        subject_ids=[101, 101, 102, 102, 104],
-        hadm_ids=[201, 201, 202, 202, 204],
-        stay_ids=[301, 301, 302, 302, 304],
-        visit_index=[0, 1, 0, 1, 0],
-        visit_time_days=[1.0, 3.0, 2.0, 4.0, 3.0],
-        visit_time_text=[
-            "2020-01-01 00:00:00",
-            "2020-01-03 00:00:00",
-            "2020-01-02 00:00:00",
-            "2020-01-04 00:00:00",
-            "2020-01-03 00:00:00",
-        ],
-        target_drugs=[(1,), (1, 2), (1, 3), (1, 2), (4,)],
-        num_steps=[2, 2, 2, 2, 1],
-        diag_code_sets=[(10, 20), (10, 20, 30), (10, 20, 31), (10, 20, 30), (99,)],
-        proc_code_sets=[(1,), (1, 2), (1,), (1, 2), (8,)],
-        lab_feature_sets=[(0, 1), (0, 1, 2), (0, 1), (0, 1, 2), (7,)],
-        vital_feature_sets=[(0,), (0, 1), (0,), (0, 1), (5,)],
-        split="train",
+        visit_mask=torch.tensor([[1, 1, 0], [1, 1, 0]], dtype=torch.bool),
+        time_delta_hours=torch.tensor([[0.0, 24.0, 0.0], [0.0, 12.0, 0.0]], dtype=torch.float32),
     )
 
-
-def _query_metadata() -> dict[str, object]:
-    return {
-        "stay_ids": [301, 399],
-        "subject_ids": [101, 199],
-        "hadm_ids": [201, 299],
-        "visit_indices": [1, 0],
-        "visit_time_days": [3.0, 4.0],
-        "diag_code_sets": [(10, 20, 30), (10, 20, 30)],
-        "proc_code_sets": [(1, 2), (1, 2)],
-        "lab_feature_sets": [(0, 1, 2), (0, 1, 2)],
-        "vital_feature_sets": [(0, 1), (0, 1)],
-        "split": ["train", "train"],
-    }
+    assert bank.num_visits == 4
+    assert bank.export_embeddings().shape == (4, 4)
+    assert bank.export_medication_evidence().shape == (4, 5)
+    assert bank.export_metadata()["visit_indices"].tolist() == [0, 1, 0, 1]
 
 
-def test_retrieve_personal_history_only_looks_backward() -> None:
-    bank = _build_memory_bank()
-    out = retrieve_personal_history(
-        torch.tensor([[0.96, 0.04]], dtype=torch.float32),
-        {
-            "stay_ids": [301],
-            "visit_indices": [1],
-            "visit_time_days": [3.0],
-            "diag_code_sets": [(10, 20, 30)],
-            "proc_code_sets": [(1, 2)],
-            "lab_feature_sets": [(0, 1, 2)],
-            "vital_feature_sets": [(0, 1)],
-        },
-        bank,
-        top_k=3,
+def test_future_leakage_filtering_blocks_same_patient_future_and_exact_match() -> None:
+    bank = VisitMemoryBank(split_name="train")
+    for visit_index in range(3):
+        bank.add(
+            patient_id=11,
+            visit_index=visit_index,
+            visit_time=float(visit_index),
+            visit_embedding=torch.tensor([1.0, 0.0, 0.0, 0.0], dtype=torch.float32),
+            medication_evidence=torch.tensor([float(visit_index), 0.0, 0.0], dtype=torch.float32),
+        )
+    bank.add(
+        patient_id=22,
+        visit_index=0,
+        visit_time=0.0,
+        visit_embedding=torch.tensor([0.0, 1.0, 0.0, 0.0], dtype=torch.float32),
+        medication_evidence=torch.tensor([0.0, 1.0, 0.0], dtype=torch.float32),
+    )
+
+    candidates = bank.get_candidate_pool(
+        patient_id=11,
+        visit_index=1,
+        visit_time=1.0,
+        allow_same_patient=True,
+        exclude_future=True,
+        exclude_exact_match=True,
+    )
+
+    assert set(candidates["visit_indices"].tolist()) == {0, 0}
+    assert set(candidates["patient_ids"].tolist()) == {11, 22}
+    assert 1 not in candidates["visit_indices"].tolist()
+    assert 2 not in candidates["visit_indices"].tolist()
+
+
+def test_topk_retriever_returns_weighted_medication_context() -> None:
+    bank = VisitMemoryBank(split_name="train")
+    bank.add(
+        patient_id=31,
+        visit_index=0,
+        visit_time=0.0,
+        visit_embedding=torch.tensor([1.0, 0.0, 0.0, 0.0], dtype=torch.float32),
+        medication_evidence=torch.tensor([1.0, 0.0, 0.0, 0.0, 0.0], dtype=torch.float32),
+    )
+    bank.add(
+        patient_id=32,
+        visit_index=0,
+        visit_time=0.0,
+        visit_embedding=torch.tensor([0.8, 0.2, 0.0, 0.0], dtype=torch.float32),
+        medication_evidence=torch.tensor([0.0, 1.0, 0.0, 0.0, 0.0], dtype=torch.float32),
+    )
+    bank.add(
+        patient_id=33,
+        visit_index=0,
+        visit_time=0.0,
+        visit_embedding=torch.tensor([0.0, 1.0, 0.0, 0.0], dtype=torch.float32),
+        medication_evidence=torch.tensor([0.0, 0.0, 1.0, 0.0, 0.0], dtype=torch.float32),
+    )
+
+    retriever = TopKVisitRetriever(
+        hidden_dim=4,
+        drug_vocab_size=5,
+        top_k=2,
+        backend="bruteforce",
+        allow_same_patient=False,
+        exclude_future=True,
+        exclude_exact_match=True,
+        similarity_mode="cosine_decay",
         temporal_decay_alpha=0.1,
     )
-    assert out["indices"].shape == (1, 1)
-    assert out["indices"][0, 0].item() == 0
-
-
-def test_retrieve_patient_neighbors_sorts_scores_and_groups_by_stay() -> None:
-    bank = _build_memory_bank()
-    payload = retrieve_patient_neighbors(
-        torch.tensor([[0.96, 0.04]], dtype=torch.float32),
-        {key: [value[0]] for key, value in _query_metadata().items()},
-        bank,
-        top_k=3,
-        temporal_decay_alpha=0.2,
+    retriever.set_memory_bank(bank)
+    outputs = retriever.retrieve(
+        current_state=torch.tensor([[0.9, 0.1, 0.0, 0.0]], dtype=torch.float32),
+        current_patient_ids=[999],
+        current_visit_indices=[1],
+        current_visit_times=torch.tensor([1.0], dtype=torch.float32),
     )
-    validate_retrieval_payload(payload)
-    assert payload["neighbor_stay_ids"].shape == (1, 2)
-    assert payload["neighbor_stay_ids"][0, 0].item() == 302
-    assert payload["neighbor_scores"][0, 0] >= payload["neighbor_scores"][0, 1]
-    assert payload["matched_visit_indices"][0, 0].item() == 1
+
+    assert outputs["aggregated_retrieval_context"].shape == (1, 4)
+    assert outputs["retrieval_medication_context"].shape == (1, 5)
+    assert outputs["retrieved_indices"].shape == (1, 2)
+    assert outputs["retrieved_scores"].shape == (1, 2)
+    assert outputs["retrieval_weights"].shape == (1, 2)
+    assert outputs["retrieved_medication_evidence"].shape == (1, 2, 5)
+    assert outputs["retrieval_weights"][0].sum().item() == pytest.approx(1.0)
+    assert int(outputs["valid_candidate_counts"][0].item()) == 3
 
 
-def test_cross_patient_retrieval_excludes_same_stay() -> None:
-    bank = _build_memory_bank()
-    payload = retrieve_patient_neighbors(
-        torch.tensor([[0.96, 0.04]], dtype=torch.float32),
-        {key: [value[0]] for key, value in _query_metadata().items()},
-        bank,
-        top_k=3,
-        temporal_decay_alpha=0.2,
-    )
-    assert 301 not in payload["neighbor_stay_ids"][0].tolist()
+def test_faiss_index_falls_back_without_optional_dependency() -> None:
+    index = VisitFaissIndex(backend="faiss", use_faiss_if_available=False)
+    index.build_index(torch.tensor([[1.0, 0.0], [0.0, 1.0]], dtype=torch.float32))
+    outputs = index.search(torch.tensor([[1.0, 0.0]], dtype=torch.float32), top_k=1)
+
+    assert outputs["indices"].shape == (1, 1)
+    assert outputs["scores"].shape == (1, 1)
+    assert int(outputs["indices"][0, 0].item()) == 0
 
 
-def test_empty_memory_bank_returns_empty_neighbors_without_crashing() -> None:
-    bank = MemoryBank(
-        visit_states=torch.empty((0, 2), dtype=torch.float32),
-        visit_repr=torch.empty((0, 2), dtype=torch.float32),
-        subject_ids=[],
-        hadm_ids=[],
-        stay_ids=[],
-        visit_index=[],
-        visit_time_days=[],
-        visit_time_text=[],
-        target_drugs=[],
-        num_steps=[],
-        diag_code_sets=[],
-        proc_code_sets=[],
-        lab_feature_sets=[],
-        vital_feature_sets=[],
-        split="train",
-    )
-    payload = retrieve_patient_neighbors(
-        torch.tensor([[0.96, 0.04]], dtype=torch.float32),
-        {
-            "stay_ids": [399],
-            "subject_ids": [199],
-            "hadm_ids": [299],
-            "visit_indices": [0],
-            "visit_time_days": [4.0],
-            "diag_code_sets": [(10, 20, 30)],
-            "proc_code_sets": [(1, 2)],
-            "lab_feature_sets": [(0, 1, 2)],
-            "vital_feature_sets": [(0, 1)],
-            "split": ["train"],
-        },
-        bank,
-        top_k=2,
-        temporal_decay_alpha=0.2,
-    )
-    validate_retrieval_payload(payload)
-    assert payload["neighbor_indices"].shape == (1, 0)
-
-
-def test_batch_query_supports_more_than_one_patient() -> None:
-    bank = _build_memory_bank()
-    payload = retrieve_patient_neighbors(
-        torch.tensor([[0.96, 0.04], [0.95, 0.03]], dtype=torch.float32),
-        _query_metadata(),
-        bank,
-        top_k=2,
-        temporal_decay_alpha=0.2,
-    )
-    assert payload["neighbor_indices"].shape[0] == 2
-    assert payload["query_visit_indices"].shape == (2,)
-
-
-def test_temporal_similarity_changes_ranking() -> None:
-    bank = _build_memory_bank()
-    payload = retrieve_patient_neighbors(
-        torch.tensor([[0.96, 0.04]], dtype=torch.float32),
-        {
-            "stay_ids": [399],
-            "subject_ids": [199],
-            "hadm_ids": [299],
-            "visit_indices": [0],
-            "visit_time_days": [4.0],
-            "diag_code_sets": [(10, 20, 30)],
-            "proc_code_sets": [(1, 2)],
-            "lab_feature_sets": [(0, 1, 2)],
-            "vital_feature_sets": [(0, 1)],
-            "split": ["train"],
-        },
-        bank,
-        top_k=2,
-        temporal_decay_alpha=0.5,
-    )
-    assert payload["neighbor_stay_ids"][0, 0].item() == 302
-    assert payload["neighbor_time_gaps_days"][0, 0] <= payload["neighbor_time_gaps_days"][0, 1]
-
-
-def test_retrieval_rejects_cross_split_by_default() -> None:
-    bank = _build_memory_bank()
-    with pytest.raises(ValueError, match="Cross-split retrieval is disabled"):
-        retrieve_patient_neighbors(
-            torch.tensor([[0.96, 0.04]], dtype=torch.float32),
+def test_collate_batch_exposes_absolute_visit_times_when_intime_exists() -> None:
+    batch = collate_batch(
+        [
             {
-                "stay_ids": [399],
-                "subject_ids": [199],
-                "hadm_ids": [299],
-                "visit_indices": [0],
-                "visit_time_days": [4.0],
-                "diag_code_sets": [(10, 20, 30)],
-                "proc_code_sets": [(1, 2)],
-                "lab_feature_sets": [(0, 1, 2)],
-                "vital_feature_sets": [(0, 1)],
-                "split": ["test"],
-            },
-            bank,
-            top_k=2,
-            temporal_decay_alpha=0.2,
-        )
-
-
-def test_retrieval_rejects_mixed_query_splits() -> None:
-    bank = _build_memory_bank()
-    with pytest.raises(ValueError, match="Mixed query splits are not supported"):
-        retrieve_patient_neighbors(
-            torch.tensor([[0.96, 0.04], [0.95, 0.03]], dtype=torch.float32),
-            {
-                "stay_ids": [399, 400],
-                "subject_ids": [199, 200],
-                "hadm_ids": [299, 300],
-                "visit_indices": [0, 0],
-                "visit_time_days": [4.0, 4.0],
-                "diag_code_sets": [(10, 20, 30), (10, 20, 30)],
-                "proc_code_sets": [(1, 2), (1, 2)],
-                "lab_feature_sets": [(0, 1, 2), (0, 1, 2)],
-                "vital_feature_sets": [(0, 1), (0, 1)],
-                "split": ["train", "val"],
-            },
-            bank,
-            top_k=2,
-            temporal_decay_alpha=0.2,
-        )
-
-
-def test_retrieval_train_bank_only_allows_cross_split_eval_queries() -> None:
-    bank = _build_memory_bank()
-    payload = retrieve_patient_neighbors(
-        torch.tensor([[0.96, 0.04]], dtype=torch.float32),
-        {
-            "stay_ids": [399],
-            "subject_ids": [199],
-            "hadm_ids": [299],
-            "visit_indices": [0],
-            "visit_time_days": [4.0],
-            "diag_code_sets": [(10, 20, 30)],
-            "proc_code_sets": [(1, 2)],
-            "lab_feature_sets": [(0, 1, 2)],
-            "vital_feature_sets": [(0, 1)],
-            "split": ["val"],
-        },
-        bank,
-        top_k=2,
-        temporal_decay_alpha=0.2,
-        cross_split_policy="train_bank_only",
-    )
-    validate_retrieval_payload(payload)
-    assert payload["query_split"] == "val"
-    assert payload["bank_split"] == "train"
-    assert payload["cross_split_policy"] == "train_bank_only"
-
-
-def test_retrieval_scoring_mode_changes_neighbor_scores() -> None:
-    bank = _build_memory_bank()
-    query = torch.tensor([[0.96, 0.04]], dtype=torch.float32)
-    metadata = {
-        "stay_ids": [399],
-        "subject_ids": [199],
-        "hadm_ids": [299],
-        "visit_indices": [0],
-        "visit_time_days": [4.0],
-        "diag_code_sets": [(10, 20, 30)],
-        "proc_code_sets": [(1, 2)],
-        "lab_feature_sets": [(0, 1, 2)],
-        "vital_feature_sets": [(0, 1)],
-        "split": ["train"],
-    }
-    static_payload = retrieve_patient_neighbors(
-        query,
-        metadata,
-        bank,
-        top_k=2,
-        temporal_decay_alpha=0.5,
-        scoring_mode="static_cosine",
-    )
-    temporal_payload = retrieve_patient_neighbors(
-        query,
-        metadata,
-        bank,
-        top_k=2,
-        temporal_decay_alpha=0.5,
-        scoring_mode="temporal_cosine",
-    )
-    assert static_payload["retrieval_scoring_mode"] == "static_cosine"
-    assert temporal_payload["retrieval_scoring_mode"] == "temporal_cosine"
-    assert temporal_payload["neighbor_scores"][0, 0].item() != pytest.approx(
-        static_payload["neighbor_scores"][0, 0].item()
+                "subject_id": 1,
+                "hadm_id": 10,
+                "stay_id": 100,
+                "patient_id": 1,
+                "num_steps": 2,
+                "intime": "2020-01-01 00:00:00",
+                "steps": [
+                    {"delta_hours": 0.0, "target_drugs": [0]},
+                    {"delta_hours": 24.0, "target_drugs": [1]},
+                ],
+            }
+        ]
     )
 
+    assert "visit_time_absolute_hours" in batch
+    assert "visit_time_absolute_mask" in batch
+    assert bool(batch["visit_time_absolute_mask"][0, 0].item())
+    assert bool(batch["visit_time_absolute_mask"][0, 1].item())
+    assert batch["visit_time_absolute_hours"][0, 1].item() > batch["visit_time_absolute_hours"][0, 0].item()
+    assert bool(batch["has_absolute_visit_time"][0].item())
 
-@pytest.mark.parametrize("scoring_mode", ["static_cosine", "temporal_cosine", "temporal_relevance"])
-def test_optimized_bruteforce_matches_reference(scoring_mode: str) -> None:
-    bank = _build_memory_bank()
-    query = torch.tensor([[0.96, 0.04], [0.95, 0.03]], dtype=torch.float32)
-    metadata = {
-        "stay_ids": [399, 400],
-        "subject_ids": [199, 200],
-        "hadm_ids": [299, 300],
-        "visit_indices": [0, 0],
-        "visit_time_days": [4.0, 4.0],
-        "diag_code_sets": [(10, 20, 30), (10, 20, 30)],
-        "proc_code_sets": [(1, 2), (1, 2)],
-        "lab_feature_sets": [(0, 1, 2), (0, 1, 2)],
-        "vital_feature_sets": [(0, 1), (0, 1)],
-        "split": ["val", "val"],
-    }
-    optimized = retrieve_patient_neighbors(
-        query,
-        metadata,
-        bank,
-        top_k=2,
-        temporal_decay_alpha=0.2,
-        backend="bruteforce",
-        use_faiss_if_available=False,
-        cross_split_policy="train_bank_only",
-        scoring_mode=scoring_mode,
+
+def test_absolute_time_filter_blocks_cross_patient_future_candidates() -> None:
+    bank = VisitMemoryBank(split_name="train")
+    bank.add(
+        patient_id=11,
+        visit_index=0,
+        visit_time=10.0,
+        has_absolute_time=True,
+        visit_embedding=torch.tensor([1.0, 0.0], dtype=torch.float32),
+        medication_evidence=torch.tensor([1.0, 0.0], dtype=torch.float32),
     )
-    reference = _retrieve_patient_neighbors_reference(
-        query,
-        metadata,
-        bank,
-        top_k=2,
-        temporal_decay_alpha=0.2,
-        backend="bruteforce",
-        use_faiss_if_available=False,
-        cross_split_policy="train_bank_only",
-        scoring_mode=scoring_mode,
+    bank.add(
+        patient_id=22,
+        visit_index=0,
+        visit_time=12.0,
+        has_absolute_time=True,
+        visit_embedding=torch.tensor([0.0, 1.0], dtype=torch.float32),
+        medication_evidence=torch.tensor([0.0, 1.0], dtype=torch.float32),
     )
 
-    assert optimized["query_split"] == reference["query_split"]
-    assert optimized["bank_split"] == reference["bank_split"]
-    assert optimized["cross_split_policy"] == reference["cross_split_policy"]
-    for field in (
-        "neighbor_indices",
-        "neighbor_scores",
-        "neighbor_static_scores",
-        "neighbor_time_gaps_days",
-        "neighbor_subject_ids",
-        "neighbor_hadm_ids",
-        "neighbor_stay_ids",
-        "matched_visit_indices",
-        "aux_personal_history_indices",
-        "aux_personal_history_scores",
-    ):
-        assert torch.equal(optimized[field], reference[field]), field
-
-
-def test_build_last_visit_queries_uses_record_split_when_not_overridden() -> None:
-    records = [
-        {
-            "subject_id": 1,
-            "hadm_id": 11,
-            "stay_id": 111,
-            "split": "test",
-            "intime": "2020-01-01 00:00:00",
-            "steps": [
-                {
-                    "delta_hours": 0.0,
-                    "diagnosis_ids": [2],
-                    "procedure_ids": [3],
-                    "lab_mask": [1, 0],
-                    "vital_mask": [1, 1],
-                }
-            ],
-        }
-    ]
-    encoder_outputs = {
-        "state_sequence": torch.tensor([[[1.0, 0.0]]], dtype=torch.float32),
-        "visit_mask": torch.tensor([[True]], dtype=torch.bool),
-    }
-    query_states, metadata = build_last_visit_queries(records, encoder_outputs)
-    assert query_states.shape == (1, 2)
-    assert metadata["split"] == ["test"]
-
-
-def test_faiss_backend_falls_back_when_package_missing(monkeypatch: pytest.MonkeyPatch) -> None:
-    bank = _build_memory_bank()
-    monkeypatch.setattr("src.retrieval.topk_retriever.FaissIndex.is_available", lambda: False)
-    payload = retrieve_patient_neighbors(
-        torch.tensor([[0.96, 0.04]], dtype=torch.float32),
-        {key: [value[0]] for key, value in _query_metadata().items()},
-        bank,
-        top_k=2,
-        temporal_decay_alpha=0.2,
-        backend="faiss",
-        use_faiss_if_available=True,
+    candidates = bank.get_candidate_pool(
+        patient_id=99,
+        visit_index=0,
+        visit_time=11.0,
+        query_has_absolute_time=True,
+        allow_same_patient=False,
+        exclude_future=True,
+        exclude_exact_match=True,
+        exclude_future_all_patients_if_absolute_time=True,
+        require_absolute_time_for_cross_patient_temporal_filter=False,
     )
-    assert payload["backend"] == "bruteforce"
+
+    assert candidates["patient_ids"].tolist() == [11]
+    assert candidates["visit_times"].tolist() == [10.0]
 
 
-def test_dynamic_graph_stays_edge_artifact_only() -> None:
-    bank = _build_memory_bank()
-    payload = retrieve_patient_neighbors(
-        torch.tensor([[0.96, 0.04]], dtype=torch.float32),
-        {key: [value[0]] for key, value in _query_metadata().items()},
-        bank,
-        top_k=2,
-        temporal_decay_alpha=0.2,
+def test_retriever_policy_reports_when_absolute_time_is_missing() -> None:
+    bank = VisitMemoryBank(split_name="train")
+    bank.add(
+        patient_id=1,
+        visit_index=0,
+        visit_time=0.0,
+        has_absolute_time=False,
+        visit_embedding=torch.tensor([1.0, 0.0, 0.0], dtype=torch.float32),
+        medication_evidence=torch.tensor([1.0, 0.0], dtype=torch.float32),
     )
-    graph_payload = build_edge_artifact(payload)
-    assert graph_payload["split"] == "train"
-    assert len(graph_payload["edges"]) == 2
-    assert set(graph_payload["edges"][0]) == {
-        "src_stay_id",
-        "dst_stay_id",
-        "score",
-        "time_gap_days",
-        "rank",
-        "split",
-        "matched_visit_index",
-    }
+    retriever = TopKVisitRetriever(hidden_dim=3, drug_vocab_size=2, top_k=1)
+    retriever.set_memory_bank(bank)
+    policy = retriever.describe_leakage_policy()
+
+    assert not bool(policy["has_absolute_time"])
+    assert bool(policy["same_patient_future_blocked"])
+    assert not bool(policy["cross_patient_absolute_temporal_filter"])

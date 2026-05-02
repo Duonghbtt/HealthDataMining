@@ -1,405 +1,395 @@
 from __future__ import annotations
 
 import argparse
-import math
+import json
+import sys
+import tempfile
 from pathlib import Path
 from typing import Any, Mapping
 
-from src.utils.io import ensure_dir, read_json, resolve_path, write_csv_gz, write_json
+import torch
 
-
-ABLATION_ORDER = (
-    "Base",
-    "TempSim",
-    "SelfSel",
-    "NbrSel",
-    "NoAttrGate",
-    "NoGroupAware",
-    "NoFusionReg",
-    "Full Core",
-    "Extended",
-)
-PRIMARY_METRIC_CANDIDATES = ("jaccard", "prauc", "f1", "roc_auc")
-PERSON3_VARIANT_ALIASES = {
-    "attribute_gate_on": ("AttrGate", "AttributeGate", "Full Core", "Extended"),
-    "attribute_gate_off": ("NoAttrGate", "WithoutAttrGate", "No Attribute Gate"),
-    "group_aware_on": ("GroupAware", "GroupAwareReweight", "Full Core", "Extended"),
-    "group_aware_off": ("NoGroupAware", "WithoutGroupAware", "No Group Aware"),
-    "fusion_reg_on": ("FusionReg", "FusionRegularized", "Full Core", "Extended"),
-    "fusion_reg_off": ("NoFusionReg", "WithoutFusionReg", "FusionUnregularized"),
-}
-
-
-def _normalize_name(name: str) -> str:
-    return name.strip().lower().replace("_", "").replace("-", "").replace(" ", "")
-
-
-def _display_name(name: str) -> str:
-    lookup = {_normalize_name(value): value for value in ABLATION_ORDER}
-    return lookup.get(_normalize_name(name), name)
-
-
-def _primary_metric(metrics_by_variant: Mapping[str, Mapping[str, float]]) -> str:
-    available = {
-        metric_name
-        for payload in metrics_by_variant.values()
-        for metric_name in payload.keys()
-        if isinstance(payload[metric_name], (int, float))
-    }
-    for metric_name in PRIMARY_METRIC_CANDIDATES:
-        if metric_name in available:
-            return metric_name
-    if not available:
-        raise ValueError("No numeric metrics found for ablation report")
-    return sorted(available)[0]
-
-
-def _metric_summary(value: Any) -> tuple[float, float, int] | None:
-    if isinstance(value, (int, float)):
-        return float(value), 0.0, 1
-    if isinstance(value, list) and value and all(isinstance(item, (int, float)) for item in value):
-        numbers = [float(item) for item in value]
-        mean_value = sum(numbers) / float(len(numbers))
-        variance = sum((item - mean_value) ** 2 for item in numbers) / float(len(numbers))
-        return mean_value, math.sqrt(variance), len(numbers)
-    return None
-
-
-def _metric_series(value: Any) -> list[float] | None:
-    if isinstance(value, (int, float)):
-        return [float(value)]
-    if isinstance(value, list) and value and all(isinstance(item, (int, float)) for item in value):
-        return [float(item) for item in value]
-    return None
-
-
-def _normalize_metrics(payload: Mapping[str, Any]) -> dict[str, float]:
-    normalized: dict[str, float] = {}
-    for key, value in payload.items():
-        summary = _metric_summary(value)
-        if summary is None:
-            continue
-        mean_value, std_value, num_seeds = summary
-        normalized[key] = mean_value
-        if num_seeds > 1:
-            normalized[f"{key}_std"] = std_value
-            normalized[f"{key}_num_seeds"] = float(num_seeds)
-    return normalized
-
-
-def _extract_metric_series(payload: Mapping[str, Any]) -> dict[str, list[float]]:
-    series: dict[str, list[float]] = {}
-    for key, value in payload.items():
-        metric_values = _metric_series(value)
-        if metric_values is not None:
-            series[key] = metric_values
-    return series
-
-
-def _comparison_summary(
-    left_name: str,
-    right_name: str,
-    metric_name: str,
-    series_by_variant: Mapping[str, Mapping[str, list[float]]],
-) -> dict[str, Any]:
-    left_series = series_by_variant.get(left_name, {}).get(metric_name, [])
-    right_series = series_by_variant.get(right_name, {}).get(metric_name, [])
-    if not left_series or not right_series:
-        return {
-            "left": left_name,
-            "right": right_name,
-            "metric": metric_name,
-            "mean_delta": None,
-            "win_rate": None,
-            "effect_size": None,
-        }
-    paired_count = min(len(left_series), len(right_series))
-    paired_left = left_series[:paired_count]
-    paired_right = right_series[:paired_count]
-    deltas = [left - right for left, right in zip(paired_left, paired_right)]
-    mean_delta = sum(deltas) / float(len(deltas))
-    win_rate = sum(1 for delta in deltas if delta > 0.0) / float(len(deltas))
-    pooled_values = paired_left + paired_right
-    pooled_mean = sum(pooled_values) / float(len(pooled_values))
-    pooled_variance = sum((value - pooled_mean) ** 2 for value in pooled_values) / float(len(pooled_values))
-    pooled_std = math.sqrt(pooled_variance)
-    return {
-        "left": left_name,
-        "right": right_name,
-        "metric": metric_name,
-        "mean_delta": mean_delta,
-        "win_rate": win_rate,
-        "effect_size": 0.0 if pooled_std == 0.0 else mean_delta / pooled_std,
-    }
-
-
-def _first_metric_value(
-    metrics_by_variant: Mapping[str, Mapping[str, float]],
-    *,
-    metric_name: str,
-    variant_names: tuple[str, ...],
-) -> float | None:
-    normalized_lookup = {_normalize_name(name): payload for name, payload in metrics_by_variant.items()}
-    for variant_name in variant_names:
-        payload = normalized_lookup.get(_normalize_name(variant_name))
-        if payload is None:
-            continue
-        value = payload.get(metric_name)
-        if isinstance(value, (int, float)):
-            return float(value)
-    return None
-
-
-def _delta_if_present(
-    metrics_by_variant: Mapping[str, Mapping[str, float]],
-    *,
-    metric_name: str,
-    left_aliases: tuple[str, ...],
-    right_aliases: tuple[str, ...],
-) -> float | None:
-    left_value = _first_metric_value(metrics_by_variant, metric_name=metric_name, variant_names=left_aliases)
-    right_value = _first_metric_value(metrics_by_variant, metric_name=metric_name, variant_names=right_aliases)
-    if left_value is None or right_value is None:
-        return None
-    return left_value - right_value
-
-
-def _positive_if_present(
-    metrics_by_variant: Mapping[str, Mapping[str, float]],
-    *,
-    metric_name: str,
-    left_aliases: tuple[str, ...],
-    right_aliases: tuple[str, ...],
-) -> bool | None:
-    delta = _delta_if_present(
-        metrics_by_variant,
-        metric_name=metric_name,
-        left_aliases=left_aliases,
-        right_aliases=right_aliases,
+if __package__ in {None, ""}:
+    PROJECT_ROOT = Path(__file__).resolve().parents[2]
+    if str(PROJECT_ROOT) not in sys.path:
+        sys.path.insert(0, str(PROJECT_ROOT))
+    from evaluate_core import (  # type: ignore[import-not-found]
+        _load_embedded_or_yaml_config,
+        _normalize_prediction_selection,
+        _resolve_prediction_selection,
+        _resolve_checkpoint_path,
+        _resolve_eval_paths,
+        _selection_label,
+        _selection_metric_kwargs,
+        _write_plain_csv,
+        build_eval_dataloader,
+        build_runtime_data_config_file,
+        run_core_evaluation,
     )
-    if delta is None:
-        return None
-    return delta > 0.0
-
-
-def build_ablation_summary(metrics_by_variant: Mapping[str, Mapping[str, float]]) -> dict[str, Any]:
-    resolved = {_display_name(name): _normalize_metrics(payload) for name, payload in metrics_by_variant.items()}
-    series_by_variant = {_display_name(name): _extract_metric_series(payload) for name, payload in metrics_by_variant.items()}
-    metric_name = _primary_metric(resolved)
-    ordered_variants = [name for name in ABLATION_ORDER if name in resolved]
-    extra_variants = sorted(name for name in resolved.keys() if name not in ABLATION_ORDER)
-    variant_names = [*ordered_variants, *extra_variants]
-    rows = []
-    base_value = float(resolved.get("Base", {}).get(metric_name, 0.0))
-    full_core_value = float(resolved.get("Full Core", {}).get(metric_name, 0.0))
-
-    for variant_name in variant_names:
-        payload = resolved.get(variant_name)
-        if payload is None:
-            continue
-        numeric_metrics = {
-            key: float(value)
-            for key, value in payload.items()
-            if isinstance(value, (int, float))
-        }
-        primary_value = float(numeric_metrics.get(metric_name, 0.0))
-        rows.append(
-            {
-                "variant": variant_name,
-                "primary_metric": metric_name,
-                "primary_value": primary_value,
-                "primary_std": float(numeric_metrics.get(f"{metric_name}_std", 0.0)),
-                "num_seeds": int(numeric_metrics.get(f"{metric_name}_num_seeds", 1.0)),
-                "delta_vs_base": primary_value - base_value,
-                "delta_vs_full_core": primary_value - full_core_value,
-                **numeric_metrics,
-            }
-        )
-
-    questions = {
-        "selection_beats_tempsim": (
-            float(resolved.get("SelfSel", {}).get(metric_name, float("-inf"))) > float(resolved.get("TempSim", {}).get(metric_name, float("-inf")))
-            or float(resolved.get("NbrSel", {}).get(metric_name, float("-inf"))) > float(resolved.get("TempSim", {}).get(metric_name, float("-inf")))
-            or float(resolved.get("Full Core", {}).get(metric_name, float("-inf"))) > float(resolved.get("TempSim", {}).get(metric_name, float("-inf")))
-        ),
-        "hypergraph_beats_full_core": float(resolved.get("Extended", {}).get(metric_name, float("-inf"))) > float(
-            resolved.get("Full Core", {}).get(metric_name, float("-inf"))
-        ),
-        "attribute_gate_helps": _positive_if_present(
-            resolved,
-            metric_name=metric_name,
-            left_aliases=PERSON3_VARIANT_ALIASES["attribute_gate_on"],
-            right_aliases=PERSON3_VARIANT_ALIASES["attribute_gate_off"],
-        ),
-        "group_aware_helps": _positive_if_present(
-            resolved,
-            metric_name=metric_name,
-            left_aliases=PERSON3_VARIANT_ALIASES["group_aware_on"],
-            right_aliases=PERSON3_VARIANT_ALIASES["group_aware_off"],
-        ),
-        "fusion_reg_helps": _positive_if_present(
-            resolved,
-            metric_name=metric_name,
-            left_aliases=PERSON3_VARIANT_ALIASES["fusion_reg_on"],
-            right_aliases=PERSON3_VARIANT_ALIASES["fusion_reg_off"],
-        ),
-    }
-    diagnostics = {
-        "history_selection": {
-            "self_only_vs_neighbor_only": float(resolved.get("SelfSel", {}).get(metric_name, float("-inf")))
-            - float(resolved.get("NbrSel", {}).get(metric_name, float("-inf"))),
-            "full_core_vs_tempsim": float(resolved.get("Full Core", {}).get(metric_name, float("-inf")))
-            - float(resolved.get("TempSim", {}).get(metric_name, float("-inf"))),
-        },
-        "fusion": {
-            "gated_vs_concat": float(resolved.get("FusionGated", {}).get(metric_name, float("-inf")))
-            - float(resolved.get("FusionConcat", {}).get(metric_name, float("-inf"))),
-            "gated_vs_mean": float(resolved.get("FusionGated", {}).get(metric_name, float("-inf")))
-            - float(resolved.get("FusionMean", {}).get(metric_name, float("-inf"))),
-        },
-        "hypergraph": {
-            "weighted_vs_unweighted": float(resolved.get("HypergraphWeighted", {}).get(metric_name, float("-inf")))
-            - float(resolved.get("HypergraphUnweighted", {}).get(metric_name, float("-inf"))),
-            "extended_vs_full_core": float(resolved.get("Extended", {}).get(metric_name, float("-inf")))
-            - float(resolved.get("Full Core", {}).get(metric_name, float("-inf"))),
-        },
-        "person3": {
-            "attribute_gate_vs_off": _delta_if_present(
-                resolved,
-                metric_name=metric_name,
-                left_aliases=PERSON3_VARIANT_ALIASES["attribute_gate_on"],
-                right_aliases=PERSON3_VARIANT_ALIASES["attribute_gate_off"],
-            ),
-            "group_aware_vs_off": _delta_if_present(
-                resolved,
-                metric_name=metric_name,
-                left_aliases=PERSON3_VARIANT_ALIASES["group_aware_on"],
-                right_aliases=PERSON3_VARIANT_ALIASES["group_aware_off"],
-            ),
-            "fusion_reg_vs_off": _delta_if_present(
-                resolved,
-                metric_name=metric_name,
-                left_aliases=PERSON3_VARIANT_ALIASES["fusion_reg_on"],
-                right_aliases=PERSON3_VARIANT_ALIASES["fusion_reg_off"],
-            ),
-        },
-    }
-    comparisons = {
-        "selection_vs_tempsim": _comparison_summary("Full Core", "TempSim", metric_name, series_by_variant),
-        "hypergraph_vs_full_core": _comparison_summary("Extended", "Full Core", metric_name, series_by_variant),
-        "self_vs_neighbor": _comparison_summary("SelfSel", "NbrSel", metric_name, series_by_variant),
-        "fusion_gated_vs_concat": _comparison_summary("FusionGated", "FusionConcat", metric_name, series_by_variant),
-        "fusion_gated_vs_mean": _comparison_summary("FusionGated", "FusionMean", metric_name, series_by_variant),
-        "hypergraph_weighted_vs_unweighted": _comparison_summary(
-            "HypergraphWeighted",
-            "HypergraphUnweighted",
-            metric_name,
-            series_by_variant,
-        ),
-        "attribute_gate_vs_off": _comparison_summary("Full Core", "NoAttrGate", metric_name, series_by_variant),
-        "group_aware_vs_off": _comparison_summary("Full Core", "NoGroupAware", metric_name, series_by_variant),
-        "fusion_reg_vs_off": _comparison_summary("Full Core", "NoFusionReg", metric_name, series_by_variant),
-    }
-    return {
-        "primary_metric": metric_name,
-        "rows": rows,
-        "questions": questions,
-        "diagnostics": diagnostics,
-        "comparisons": comparisons,
-    }
-
-
-def report_dir(project_root: str | Path) -> Path:
-    return ensure_dir(resolve_path(project_root, "outputs/reports"))
-
-
-def save_ablation_report(
-    project_root: str | Path,
-    metrics_by_variant: Mapping[str, Mapping[str, float]],
-    *,
-    report_name: str = "ablation",
-) -> dict[str, Path]:
-    summary = build_ablation_summary(metrics_by_variant)
-    output_dir = report_dir(project_root)
-    json_path = write_json(output_dir / f"{report_name}.json", summary)
-    csv_path = write_csv_gz(
-        output_dir / f"{report_name}.csv.gz",
-        summary["rows"],
-        fieldnames=sorted({key for row in summary["rows"] for key in row.keys()}),
+    from metrics import compute_core_metrics, compute_ddi_flags, select_binary_predictions  # type: ignore[import-not-found]
+else:
+    from .evaluate_core import (
+        _load_embedded_or_yaml_config,
+        _normalize_prediction_selection,
+        _resolve_prediction_selection,
+        _resolve_checkpoint_path,
+        _resolve_eval_paths,
+        _selection_label,
+        _selection_metric_kwargs,
+        _write_plain_csv,
+        build_eval_dataloader,
+        build_runtime_data_config_file,
+        run_core_evaluation,
     )
-    markdown_lines = [
-        f"# Ablation Summary ({summary['primary_metric']})",
-        "",
-        f"- selection_beats_tempsim: {summary['questions']['selection_beats_tempsim']}",
-        f"- hypergraph_beats_full_core: {summary['questions']['hypergraph_beats_full_core']}",
-        "",
-        "| Variant | Primary | Std | Seeds | Delta vs Base | Delta vs Full Core |",
-        "|---|---:|---:|---:|---:|---:|",
+    from .metrics import compute_core_metrics, compute_ddi_flags, select_binary_predictions
+
+from src.models.ddi_regularization import load_ddi_matrix
+from src.training.runtime_builder import build_core_model, resolve_device
+from src.utils.io import ensure_dir, load_yaml_config, read_json, resolve_path, write_json
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Evaluate ablation settings for the core ClinRec medication model.")
+    parser.add_argument("--config", default="configs/eval.yaml", help="Path to configs/eval.yaml")
+    parser.add_argument("--data-config", default=None, help="Optional override for configs/data.yaml")
+    parser.add_argument("--model-config", default=None, help="Optional override for configs/model.yaml")
+    parser.add_argument("--train-config", default=None, help="Optional override for configs/train.yaml")
+    parser.add_argument("--checkpoint", default=None, help="Optional override for best checkpoint path")
+    parser.add_argument("--split", default=None, help="Optional override for evaluation split")
+    parser.add_argument("--threshold", type=float, default=None, help="Optional override for base prediction threshold")
+    parser.add_argument("--device", default=None, help="Optional override for runtime device")
+    parser.add_argument("--processed-root", default=None, help="Optional override for processed data root")
+    parser.add_argument("--vocab-root", default=None, help="Optional override for vocab directory")
+    parser.add_argument("--ddi-matrix-path", default=None, help="Optional override for DDI matrix artifact")
+    return parser.parse_args()
+
+
+def _clamp_threshold(value: float) -> float:
+    return max(0.0, min(1.0, float(value)))
+
+
+def _resolve_ablation_thresholds(
+    *,
+    base_threshold: float,
+    eval_config: Mapping[str, Any],
+) -> tuple[float, float]:
+    ablation_cfg = dict(eval_config.get("ablation", {}))
+    higher_threshold = _clamp_threshold(
+        float(ablation_cfg.get("higher_threshold", min(float(base_threshold) + 0.1, 0.95)))
+    )
+    lower_threshold = _clamp_threshold(
+        float(ablation_cfg.get("lower_threshold", max(float(base_threshold) - 0.1, 0.05)))
+    )
+    return higher_threshold, lower_threshold
+
+
+def _build_ablation_settings(
+    *,
+    base_selection: Mapping[str, Any],
+    eval_config: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    resolved_base_selection = _normalize_prediction_selection(base_selection)
+    settings: list[dict[str, Any]] = [
+        {
+            "name": "full_model",
+            "selection_config": dict(resolved_base_selection),
+            "ddi_regularizer_enabled": True,
+        },
+        {
+            "name": "no_ddi_regularizer",
+            "selection_config": dict(resolved_base_selection),
+            "ddi_regularizer_enabled": False,
+            "notes": "Inference probabilities are reused; disabling the DDI regularizer only affects training loss.",
+        },
     ]
-    for row in summary["rows"]:
-        markdown_lines.append(
-            f"| {row['variant']} | {row['primary_value']:.6f} | {row['primary_std']:.6f} | {row['num_seeds']} | {row['delta_vs_base']:.6f} | {row['delta_vs_full_core']:.6f} |"
+    method = str(resolved_base_selection["method"])
+    ablation_cfg = dict(eval_config.get("ablation", {}))
+    if method == "global":
+        higher_threshold, lower_threshold = _resolve_ablation_thresholds(
+            base_threshold=float(resolved_base_selection["threshold"]),
+            eval_config=eval_config,
         )
-    markdown_lines.extend(
-        [
-            "",
-            "## Diagnostics",
-            "",
-            f"- history.self_only_vs_neighbor_only: {summary['diagnostics']['history_selection']['self_only_vs_neighbor_only']:.6f}",
-            f"- history.full_core_vs_tempsim: {summary['diagnostics']['history_selection']['full_core_vs_tempsim']:.6f}",
-            f"- fusion.gated_vs_concat: {summary['diagnostics']['fusion']['gated_vs_concat']:.6f}",
-            f"- fusion.gated_vs_mean: {summary['diagnostics']['fusion']['gated_vs_mean']:.6f}",
-            f"- hypergraph.weighted_vs_unweighted: {summary['diagnostics']['hypergraph']['weighted_vs_unweighted']:.6f}",
-            f"- hypergraph.extended_vs_full_core: {summary['diagnostics']['hypergraph']['extended_vs_full_core']:.6f}",
-            f"- person3.attribute_gate_vs_off: {summary['diagnostics']['person3']['attribute_gate_vs_off']}",
-            f"- person3.group_aware_vs_off: {summary['diagnostics']['person3']['group_aware_vs_off']}",
-            f"- person3.fusion_reg_vs_off: {summary['diagnostics']['person3']['fusion_reg_vs_off']}",
-            "",
-            "## Seed Comparisons",
-            "",
-        ]
+        settings.extend(
+            [
+                {
+                    "name": "higher_threshold",
+                    "selection_config": {"method": "global", "threshold": float(higher_threshold)},
+                    "ddi_regularizer_enabled": True,
+                },
+                {
+                    "name": "lower_threshold",
+                    "selection_config": {"method": "global", "threshold": float(lower_threshold)},
+                    "ddi_regularizer_enabled": True,
+                },
+            ]
+        )
+    elif method == "topk":
+        top_k = int(resolved_base_selection["top_k"])
+        topk_delta = max(int(ablation_cfg.get("topk_delta", 5)), 1)
+        settings.extend(
+            [
+                {
+                    "name": "higher_topk",
+                    "selection_config": {"method": "topk", "top_k": top_k + topk_delta},
+                    "ddi_regularizer_enabled": True,
+                },
+                {
+                    "name": "lower_topk",
+                    "selection_config": {"method": "topk", "top_k": max(1, top_k - topk_delta)},
+                    "ddi_regularizer_enabled": True,
+                },
+            ]
+        )
+    elif method == "percentile":
+        percentile = float(resolved_base_selection["percentile"])
+        percentile_delta = max(float(ablation_cfg.get("percentile_delta", 5.0)), 1.0)
+        settings.extend(
+            [
+                {
+                    "name": "higher_percentile",
+                    "selection_config": {
+                        "method": "percentile",
+                        "percentile": _clamp_threshold((percentile + percentile_delta) / 100.0) * 100.0,
+                    },
+                    "ddi_regularizer_enabled": True,
+                },
+                {
+                    "name": "lower_percentile",
+                    "selection_config": {
+                        "method": "percentile",
+                        "percentile": _clamp_threshold((percentile - percentile_delta) / 100.0) * 100.0,
+                    },
+                    "ddi_regularizer_enabled": True,
+                },
+            ]
+        )
+    return settings
+
+
+def _summarize_ablation_setting(
+    *,
+    setting: Mapping[str, Any],
+    drug_probs: torch.Tensor,
+    targets: torch.Tensor,
+    ddi_matrix: torch.Tensor,
+) -> dict[str, Any]:
+    selection_config = _normalize_prediction_selection(setting.get("selection_config", setting))
+    selection_kwargs = _selection_metric_kwargs(selection_config)
+    binary_predictions = select_binary_predictions(
+        drug_probs,
+        **selection_kwargs,
+    ).cpu()
+    metrics = compute_core_metrics(
+        targets,
+        drug_probs,
+        threshold=float(selection_kwargs["threshold"]),
+        ddi_matrix=ddi_matrix,
+        prediction_method=str(selection_kwargs["prediction_method"]),
+        top_k=selection_kwargs["top_k"],
+        percentile=selection_kwargs["percentile"],
     )
-    for comparison_name, payload in summary["comparisons"].items():
-        markdown_lines.append(
-            f"- {comparison_name}: mean_delta={payload['mean_delta']} win_rate={payload['win_rate']} effect_size={payload['effect_size']}"
-        )
-    markdown_path = output_dir / f"{report_name}.md"
-    markdown_path.write_text("\n".join(markdown_lines), encoding="utf-8")
-    return {"json": json_path, "csv": csv_path, "markdown": markdown_path}
+    ddi_flags = compute_ddi_flags(binary_predictions, ddi_matrix).cpu()
+    avg_predicted_drugs = float(binary_predictions.sum(dim=1, dtype=torch.float32).mean().item())
 
-
-def _load_metrics_from_dir(input_dir: Path) -> dict[str, dict[str, float]]:
-    payload = {}
-    for path in sorted(input_dir.glob("*.json")):
-        if path.name.startswith("ablation"):
-            continue
-        data = read_json(path)
-        if isinstance(data, dict):
-            payload[_display_name(path.stem)] = {
-                key: value
-                for key, value in data.items()
-                if isinstance(value, (int, float))
-            }
-    return payload
+    row = {
+        "setting": str(setting["name"]),
+        "method": str(selection_config["method"]),
+        "selection_label": _selection_label(selection_config),
+        "threshold": None if selection_config.get("threshold") is None else float(selection_config["threshold"]),
+        "top_k": None if selection_config.get("top_k") is None else int(selection_config["top_k"]),
+        "percentile": (
+            None if selection_config.get("percentile") is None else float(selection_config["percentile"])
+        ),
+        "ddi_regularizer_enabled": bool(setting.get("ddi_regularizer_enabled", True)),
+        "jaccard": float(metrics["jaccard"]),
+        "f1": float(metrics["f1"]),
+        "prauc": float(metrics["prauc"]),
+        "ddi_rate": float(metrics["ddi_rate"]),
+        "avg_predicted_drugs": avg_predicted_drugs,
+        "patients_with_ddi": int(metrics["patients_with_ddi"]),
+        "num_samples": int(targets.shape[0]),
+    }
+    if "notes" in setting:
+        row["notes"] = str(setting["notes"])
+    row["patients_with_ddi_ratio"] = (
+        0.0 if row["num_samples"] <= 0 else float(ddi_flags.sum(dtype=torch.float32).item() / float(row["num_samples"]))
+    )
+    return row
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Aggregate ablation metrics into JSON/CSV/Markdown artifacts.")
-    parser.add_argument("--project-root", default=".", help="Project root containing outputs/reports.")
-    parser.add_argument(
-        "--input-dir",
-        default="outputs/reports/ablation_inputs",
-        help="Directory of JSON metric payloads such as Base.json or Full Core.json.",
-    )
-    parser.add_argument("--report-name", default="ablation", help="Stem for the output report files.")
-    args = parser.parse_args()
+    args = parse_args()
+    eval_config = load_yaml_config(args.config)
+    project_root = Path(eval_config["_project_root"]).resolve()
+    checkpoint_path = _resolve_checkpoint_path(project_root, eval_config, args)
+    checkpoint_payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
 
-    project_root = Path(args.project_root).resolve()
-    input_dir = resolve_path(project_root, args.input_dir)
-    metrics_by_variant = _load_metrics_from_dir(input_dir)
-    if not metrics_by_variant:
-        raise FileNotFoundError(f"No ablation metric JSON files found in {input_dir}")
-    save_ablation_report(project_root, metrics_by_variant, report_name=args.report_name)
+    config_refs = dict(eval_config.get("config_refs", {}))
+    train_config = _load_embedded_or_yaml_config(
+        explicit_path=args.train_config,
+        embedded_payload=checkpoint_payload.get("train_config"),
+        fallback_path=resolve_path(project_root, config_refs.get("train", "configs/train.yaml")),
+    )
+    data_config = _load_embedded_or_yaml_config(
+        explicit_path=args.data_config,
+        embedded_payload=checkpoint_payload.get("data_config"),
+        fallback_path=resolve_path(project_root, config_refs.get("data", "configs/data.yaml")),
+    )
+    model_config = _load_embedded_or_yaml_config(
+        explicit_path=args.model_config,
+        embedded_payload=checkpoint_payload.get("model_config"),
+        fallback_path=resolve_path(project_root, config_refs.get("model", "configs/model.yaml")),
+    )
+
+    resolved_paths = _resolve_eval_paths(
+        project_root=project_root,
+        eval_config=eval_config,
+        train_config=train_config,
+        data_config=data_config,
+        checkpoint_payload=checkpoint_payload,
+        args=args,
+    )
+    print("Resolved ablation evaluation paths:")
+    for key, value in resolved_paths.items():
+        print(f"  {key}: {value}")
+
+    runtime_cfg = dict(eval_config.get("runtime", {}))
+    evaluation_cfg = dict(eval_config.get("evaluation", {}))
+
+    split = str(args.split or evaluation_cfg.get("split", "test"))
+    device = resolve_device(args.device or runtime_cfg.get("device", "cpu"))
+    batch_size = int(runtime_cfg.get("batch_size", 32))
+    max_eval_batches = eval_config.get("run", {}).get("max_eval_batches")
+    max_eval_batches = None if max_eval_batches is None else int(max_eval_batches)
+
+    ddi_matrix = load_ddi_matrix(resolved_paths["ddi_matrix_path"], device="cpu")
+    med_vocab_path = resolved_paths["vocab_root"] / "med_vocab_main.json"
+    legacy_drug_vocab_path = resolved_paths["vocab_root"] / "drug_vocab.json"
+    resolved_drug_vocab_path = med_vocab_path if med_vocab_path.exists() else legacy_drug_vocab_path
+    drug_vocab_size = int(read_json(resolved_drug_vocab_path)["size"])
+    if ddi_matrix.shape[0] != drug_vocab_size:
+        raise ValueError(
+            "DDI matrix width must match drug vocabulary size: "
+            f"got ddi={int(ddi_matrix.shape[0])}, vocab={drug_vocab_size}"
+        )
+
+    print(f"Using device: {device}")
+    print(f"Evaluating ablation split: {split}")
+    print(f"Loading checkpoint: {checkpoint_path}")
+
+    with tempfile.TemporaryDirectory(prefix="clinrec_ablation_eval_") as temp_dir_name:
+        temp_dir = Path(temp_dir_name)
+        runtime_data_config_path = build_runtime_data_config_file(
+            project_root=project_root,
+            data_config=data_config,
+            processed_root=resolved_paths["processed_root"],
+            vocab_root=resolved_paths["vocab_root"],
+            temp_dir=temp_dir,
+        )
+        dataloader = build_eval_dataloader(
+            split=split,
+            runtime_data_config_path=runtime_data_config_path,
+            processed_root=resolved_paths["processed_root"],
+            drug_vocab_size=drug_vocab_size,
+            batch_size=batch_size,
+        )
+        val_dataloader = build_eval_dataloader(
+            split="val",
+            runtime_data_config_path=runtime_data_config_path,
+            processed_root=resolved_paths["processed_root"],
+            drug_vocab_size=drug_vocab_size,
+            batch_size=batch_size,
+        )
+        model = build_core_model(
+            train_config=train_config,
+            model_config=model_config,
+            runtime_data_config_path=runtime_data_config_path,
+            processed_root=resolved_paths["processed_root"],
+            vocab_root=resolved_paths["vocab_root"],
+            ddi_matrix_path=resolved_paths["ddi_matrix_path"],
+        )
+
+    model_state_dict = checkpoint_payload.get("model_state_dict")
+    if not isinstance(model_state_dict, Mapping):
+        raise KeyError("Checkpoint does not contain `model_state_dict`.")
+    model.load_state_dict(model_state_dict, strict=True)
+
+    resolved_selection_config, selection_source, threshold_search_report, _ = _resolve_prediction_selection(
+        explicit_threshold=args.threshold,
+        checkpoint_payload=checkpoint_payload,
+        eval_config=eval_config,
+        train_config=train_config,
+        split=split,
+        model=model,
+        val_dataloader=val_dataloader,
+        device=device,
+        ddi_matrix=ddi_matrix,
+        max_eval_batches=max_eval_batches,
+    )
+    print(f"Using ablation base selection: {_selection_label(resolved_selection_config)} ({selection_source})")
+    if str(resolved_selection_config["method"]) == "global":
+        print(f"Using base threshold: {float(resolved_selection_config['threshold']):.2f}")
+
+    full_result = run_core_evaluation(
+        model=model,
+        dataloader=dataloader,
+        device=device,
+        selection_config=resolved_selection_config,
+        ddi_matrix=ddi_matrix,
+        max_eval_batches=max_eval_batches,
+    )
+
+    ablation_rows = [
+        _summarize_ablation_setting(
+            setting=setting,
+            drug_probs=full_result["drug_probs"],
+            targets=full_result["targets"],
+            ddi_matrix=ddi_matrix,
+        )
+        for setting in _build_ablation_settings(
+            base_selection=resolved_selection_config,
+            eval_config=eval_config,
+        )
+    ]
+
+    report: dict[str, Any] = {
+        "split": split,
+        "num_samples": int(full_result["targets"].shape[0]),
+        "base_selection": {
+            "method": str(resolved_selection_config["method"]),
+            "threshold": (
+                None
+                if resolved_selection_config.get("threshold") is None
+                else float(resolved_selection_config["threshold"])
+            ),
+            "top_k": (
+                None if resolved_selection_config.get("top_k") is None else int(resolved_selection_config["top_k"])
+            ),
+            "percentile": (
+                None
+                if resolved_selection_config.get("percentile") is None
+                else float(resolved_selection_config["percentile"])
+            ),
+            "selection_label": _selection_label(resolved_selection_config),
+            "source": selection_source,
+        },
+        "checkpoint_path": str(checkpoint_path),
+        "device": str(device),
+        "settings": ablation_rows,
+        "artifacts": {},
+    }
+    if threshold_search_report is not None:
+        report["threshold_search"] = threshold_search_report
+
+    report_dir = ensure_dir(resolved_paths["report_dir"])
+    report_stem = f"evaluate_ablation_{split}"
+    json_path = write_json(report_dir / f"{report_stem}.json", report)
+    csv_path = _write_plain_csv(report_dir / f"{report_stem}.csv", ablation_rows)
+    report["artifacts"]["json"] = str(json_path)
+    report["artifacts"]["csv"] = str(csv_path)
+    write_json(json_path, report)
+
+    print(json.dumps(report, ensure_ascii=True, indent=2, sort_keys=True))
 
 
 if __name__ == "__main__":

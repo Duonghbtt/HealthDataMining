@@ -5,6 +5,7 @@ import gzip
 import hashlib
 import json
 import pickle
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Sequence
@@ -16,6 +17,18 @@ DATETIME_FORMATS = (
     "%Y-%m-%d %H:%M:%S",
     "%Y-%m-%d",
 )
+
+
+def _set_max_csv_field_size() -> int:
+    """Raise the csv field-size limit as high as the current platform allows."""
+
+    limit = sys.maxsize
+    while limit > 0:
+        try:
+            return csv.field_size_limit(limit)
+        except OverflowError:
+            limit //= 10
+    return csv.field_size_limit()
 
 
 def project_root() -> Path:
@@ -173,6 +186,7 @@ def write_csv_gz(
 
 def read_csv_gz(path: str | Path) -> list[dict[str, str]]:
     with gzip.open(Path(path), "rt", encoding="utf-8", newline="") as handle:
+        _set_max_csv_field_size()
         return list(csv.DictReader(handle))
 
 

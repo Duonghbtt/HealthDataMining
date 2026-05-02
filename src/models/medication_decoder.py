@@ -3,8 +3,11 @@ from __future__ import annotations
 from typing import Any
 
 import torch
-import torch.nn.functional as F
 from torch import nn
+
+_VALID_DECODER_MODES = {"legacy", "copy_reuse_v2"}
+_VALID_GATE_TYPES = {"scalar", "drug_wise"}
+_VALID_COPY_PROJECTIONS = {"none", "linear", "mlp_light"}
 
 
 def _validate_positive_int(name: str, value: int) -> int:
@@ -13,73 +16,68 @@ def _validate_positive_int(name: str, value: int) -> int:
     return value
 
 
-def _validate_optional_top_k(name: str, value: int | None) -> int | None:
-    if value is None:
-        return None
-    if not isinstance(value, int) or value < 0:
-        raise ValueError(f"{name} must be None or a non-negative integer, got {value!r}")
-    return value
+def _build_activation(name: str) -> nn.Module:
+    normalized = str(name).strip().lower()
+    if normalized == "relu":
+        return nn.ReLU()
+    if normalized == "gelu":
+        return nn.GELU()
+    raise ValueError(f"Unsupported decoder activation: {name!r}")
 
 
-def _validate_non_negative_float(name: str, value: float) -> float:
-    resolved = float(value)
-    if resolved < 0.0:
-        raise ValueError(f"{name} must be non-negative, got {value!r}")
-    return resolved
+def _resolve_decoder_mode(*, decoder_mode: str | None, decoder_type: str) -> tuple[str, str]:
+    normalized_type = str(decoder_type).strip().lower()
+    normalized_mode = None if decoder_mode is None else str(decoder_mode).strip().lower()
+    if normalized_mode is None:
+        if normalized_type in _VALID_DECODER_MODES:
+            return normalized_type, "residual_mlp"
+        return "legacy", normalized_type
+    if normalized_mode not in _VALID_DECODER_MODES:
+        raise ValueError(f"decoder_mode must be one of {_VALID_DECODER_MODES}, got {decoder_mode!r}")
+    return normalized_mode, normalized_type
 
 
-def _resolve_decoder_mode(
-    decoder_mode: str | None,
+def _require_2d_tensor(
     *,
-    label_correlation_enabled: bool,
-) -> str:
-    if decoder_mode is None:
-        return "label_correlation_residual" if label_correlation_enabled else "independent"
-    resolved = str(decoder_mode).strip().lower()
-    if resolved in {"", "none"}:
-        resolved = "independent"
-    if resolved not in {"independent", "label_correlation_residual"}:
+    name: str,
+    value: torch.Tensor | None,
+    batch_size: int,
+    feature_dim: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    if value is None:
+        return torch.zeros(batch_size, feature_dim, device=device, dtype=dtype)
+    tensor = torch.as_tensor(value, device=device, dtype=dtype)
+    if tensor.ndim != 2:
+        raise ValueError(f"{name} must have shape (B, F), got {tuple(tensor.shape)}")
+    if tuple(tensor.shape) != (batch_size, feature_dim):
         raise ValueError(
-            "decoder_mode must be one of ['independent', 'label_correlation_residual'], "
-            f"got {decoder_mode!r}"
+            f"{name} must have shape {(batch_size, feature_dim)}, got {tuple(tensor.shape)}"
         )
-    if label_correlation_enabled and resolved == "independent":
-        return "label_correlation_residual"
-    return resolved
+    return tensor
+
+
+def _safe_logit(probabilities: torch.Tensor, eps: float = 1.0e-4) -> torch.Tensor:
+    clamped = probabilities.clamp(min=eps, max=1.0 - eps)
+    return torch.log(clamped) - torch.log1p(-clamped)
 
 
 class MedicationDecoder(nn.Module):
-    """Decode fused patient representations into medication recommendation scores.
+    """Decode medication logits from a fused state, optionally with copy/reuse.
 
-    Parameters
-    ----------
-    hidden_dim:
-        Dimensionality ``H`` of the incoming fused patient representation.
-    drug_vocab_size:
-        Number of medications ``D`` to score.
-    dropout:
-        Dropout probability used in the decoder MLP.
-    top_k_metadata:
-        Default number of top recommendations to expose in the metadata. Set to
-        ``None`` to disable top-k metadata by default.
-
-    Notes
-    -----
-    Input shape:
-        ``fused_repr`` has shape ``(B, H)``.
-
-    Output shapes:
-        - ``drug_logits``: ``(B, D)``
-        - ``drug_probs``: ``(B, D)``
-        - ``recommendation_metadata``: dict containing batch-level metadata and
-          optional ``topk_indices`` / ``topk_scores`` tensors with shape ``(B, K)``.
-
-    Example
+    Outputs
     -------
-    >>> decoder = MedicationDecoder(hidden_dim=128, drug_vocab_size=512)
-    >>> outputs = decoder(torch.randn(4, 128), top_k=5)
-    >>> outputs["drug_logits"].shape
-    torch.Size([4, 512])
+    drug_logits:
+        Raw pre-sigmoid scores used as input to ``BCEWithLogitsLoss``.
+    drug_probs:
+        ``torch.sigmoid(drug_logits)`` in ``[0, 1]``, used for metrics and thresholding.
+    logits_new:
+        Fresh medication logits predicted from the fused hidden representation.
+    logits_copy:
+        Copy/reuse logits derived from history/retrieval medication evidence.
+    gate:
+        Decoder mixing gate after broadcasting to drug space.
     """
 
     def __init__(
@@ -88,196 +86,266 @@ class MedicationDecoder(nn.Module):
         drug_vocab_size: int,
         *,
         dropout: float = 0.1,
-        top_k_metadata: int | None = 10,
+        hidden_multiplier: int = 2,
+        activation: str = "relu",
+        layer_norm: bool = True,
+        decoder_type: str = "residual_mlp",
         decoder_mode: str | None = None,
-        label_correlation_enabled: bool = False,
-        correlation_dim: int | None = None,
-        patient_residual_weight: float = 0.0,
-        coprescription_residual_weight: float = 0.0,
-        correlation_dropout: float | None = None,
+        gate_type: str = "scalar",
+        use_history_copy: bool = True,
+        use_retrieval_copy: bool = True,
+        use_memory_copy: bool = False,
+        copy_projection: str = "none",
+        gate_hidden_dim: int | None = None,
+        **_: Any,
     ) -> None:
         super().__init__()
-        self.hidden_dim = _validate_positive_int("hidden_dim", hidden_dim)
-        self.drug_vocab_size = _validate_positive_int("drug_vocab_size", drug_vocab_size)
-        self.top_k_metadata = _validate_optional_top_k("top_k_metadata", top_k_metadata)
-
+        self.hidden_dim = _validate_positive_int("hidden_dim", int(hidden_dim))
+        self.drug_vocab_size = _validate_positive_int("drug_vocab_size", int(drug_vocab_size))
+        self.hidden_multiplier = _validate_positive_int("hidden_multiplier", int(hidden_multiplier))
         if not 0.0 <= float(dropout) <= 1.0:
             raise ValueError(f"dropout must be in [0, 1], got {dropout!r}")
-        self.dropout = float(dropout)
-        self.decoder_mode = _resolve_decoder_mode(
-            decoder_mode,
-            label_correlation_enabled=bool(label_correlation_enabled),
+        self.decoder_mode, normalized_decoder_type = _resolve_decoder_mode(
+            decoder_mode=decoder_mode,
+            decoder_type=decoder_type,
         )
-        self.label_correlation_enabled = self.decoder_mode == "label_correlation_residual"
-        self.patient_residual_weight = _validate_non_negative_float(
-            "patient_residual_weight",
-            patient_residual_weight,
-        )
-        self.coprescription_residual_weight = _validate_non_negative_float(
-            "coprescription_residual_weight",
-            coprescription_residual_weight,
-        )
-        if correlation_dropout is None:
-            resolved_correlation_dropout = self.dropout
-        else:
-            resolved_correlation_dropout = float(correlation_dropout)
-        if not 0.0 <= resolved_correlation_dropout <= 1.0:
+        if normalized_decoder_type != "residual_mlp":
+            raise ValueError("MedicationDecoder currently supports only decoder_type='residual_mlp'.")
+        self.gate_type = str(gate_type).strip().lower()
+        if self.gate_type not in _VALID_GATE_TYPES:
+            raise ValueError(f"gate_type must be one of {_VALID_GATE_TYPES}, got {gate_type!r}")
+        self.copy_projection_mode = str(copy_projection).strip().lower()
+        if self.copy_projection_mode not in _VALID_COPY_PROJECTIONS:
             raise ValueError(
-                f"correlation_dropout must be in [0, 1], got {correlation_dropout!r}"
+                f"copy_projection must be one of {_VALID_COPY_PROJECTIONS}, got {copy_projection!r}"
             )
-        self.correlation_dropout = resolved_correlation_dropout
-        resolved_correlation_dim = (
-            min(self.hidden_dim, 64)
-            if correlation_dim is None
-            else _validate_positive_int("correlation_dim", int(correlation_dim))
-        )
-        self.correlation_dim = int(resolved_correlation_dim)
+        self.use_history_copy = bool(use_history_copy)
+        self.use_retrieval_copy = bool(use_retrieval_copy)
+        self.use_memory_copy = bool(use_memory_copy)
 
-        self.decoder = nn.Sequential(
-            nn.Linear(self.hidden_dim, self.hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(self.dropout),
-            nn.Linear(self.hidden_dim, self.drug_vocab_size),
+        expanded_dim = self.hidden_dim * self.hidden_multiplier
+        self.proj = nn.Sequential(
+            nn.Linear(self.hidden_dim, expanded_dim),
+            nn.LayerNorm(expanded_dim) if bool(layer_norm) else nn.Identity(),
+            _build_activation(activation),
+            nn.Dropout(float(dropout)),
+            nn.Linear(expanded_dim, self.hidden_dim),
+            nn.LayerNorm(self.hidden_dim) if bool(layer_norm) else nn.Identity(),
+            _build_activation(activation),
+            nn.Dropout(float(dropout)),
         )
-        self.patient_correlation_projection: nn.Module | None = None
-        self.drug_correlation_embedding: nn.Embedding | None = None
-        self.correlation_dropout_layer: nn.Module | None = None
-        if self.label_correlation_enabled:
-            self.patient_correlation_projection = nn.Sequential(
-                nn.Linear(self.hidden_dim, self.correlation_dim),
-                nn.Tanh(),
-                nn.Dropout(self.correlation_dropout),
+        self.fc = nn.Linear(self.hidden_dim, self.drug_vocab_size)
+        self.residual_fc = nn.Linear(self.hidden_dim, self.drug_vocab_size)
+        gate_width = _validate_positive_int(
+            "gate_hidden_dim",
+            int(self.hidden_dim if gate_hidden_dim is None else gate_hidden_dim),
+        )
+        gate_output_dim = 1 if self.gate_type == "scalar" else self.drug_vocab_size
+        self.copy_gate_mlp = nn.Sequential(
+            nn.Linear(self.hidden_dim * 3, gate_width),
+            _build_activation(activation),
+            nn.Dropout(float(dropout)),
+            nn.Linear(gate_width, gate_output_dim),
+        )
+        self.copy_source_gate = nn.Sequential(
+            nn.Linear(self.hidden_dim, gate_width),
+            _build_activation(activation),
+            nn.Dropout(float(dropout)),
+            nn.Linear(gate_width, 3),
+        )
+        if self.copy_projection_mode == "none":
+            self.copy_projection = None
+        elif self.copy_projection_mode == "linear":
+            self.copy_projection = nn.Linear(self.drug_vocab_size, self.drug_vocab_size)
+        else:
+            self.copy_projection = nn.Sequential(
+                nn.Linear(self.drug_vocab_size, self.drug_vocab_size),
+                _build_activation(activation),
+                nn.Dropout(float(dropout)),
+                nn.Linear(self.drug_vocab_size, self.drug_vocab_size),
             )
-            self.drug_correlation_embedding = nn.Embedding(
-                self.drug_vocab_size,
-                self.correlation_dim,
-            )
-            self.correlation_dropout_layer = nn.Dropout(self.correlation_dropout)
-            nn.init.normal_(self.drug_correlation_embedding.weight, mean=0.0, std=0.02)
 
-    def _correlation_logits(
+    def _compute_logits_new(self, context_vector: torch.Tensor) -> torch.Tensor:
+        x = self.proj(context_vector)                            # [B, H] main nonlinear decoder path
+        main_logits = self.fc(x)                                 # [B, D]
+        residual_logits = self.residual_fc(context_vector)       # [B, D] direct skip path from fused state
+        return main_logits + residual_logits                     # [B, D] raw pre-sigmoid logits
+
+    def _build_copy_signal(
         self,
         *,
-        fused_repr: torch.Tensor,
-        base_logits: torch.Tensor,
-    ) -> dict[str, torch.Tensor]:
-        zero_logits = torch.zeros_like(base_logits)
-        if (
-            not self.label_correlation_enabled
-            or self.drug_correlation_embedding is None
-            or self.patient_correlation_projection is None
-            or self.correlation_dropout_layer is None
-        ):
-            return {
-                "patient_correlation_logits": zero_logits,
-                "coprescription_correlation_logits": zero_logits,
-                "label_correlation_logits": zero_logits,
-                "correlation_residual_norm": zero_logits.new_zeros(()),
-                "logit_shift_mean_abs": zero_logits.new_zeros(()),
-                "logit_shift_max_abs": zero_logits.new_zeros(()),
-            }
-
-        drug_embeddings = F.normalize(
-            self.drug_correlation_embedding.weight.to(
-                device=base_logits.device,
-                dtype=base_logits.dtype,
+        current_state: torch.Tensor,
+        history_med_bag: torch.Tensor,
+        retrieval_med_bag: torch.Tensor,
+        medication_memory: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        batch_size = int(current_state.shape[0])
+        device = current_state.device
+        source_tensors = torch.stack(
+            (history_med_bag, retrieval_med_bag, medication_memory),
+            dim=1,
+        )  # [B, 3, D]
+        source_mask = torch.stack(
+            (
+                (history_med_bag.abs().sum(dim=1) > 0)
+                if self.use_history_copy
+                else torch.zeros(batch_size, device=device, dtype=torch.bool),
+                (retrieval_med_bag.abs().sum(dim=1) > 0)
+                if self.use_retrieval_copy
+                else torch.zeros(batch_size, device=device, dtype=torch.bool),
+                (medication_memory.abs().sum(dim=1) > 0)
+                if self.use_memory_copy
+                else torch.zeros(batch_size, device=device, dtype=torch.bool),
             ),
-            p=2,
-            dim=-1,
-            eps=1.0e-12,
-        )
-        patient_query = self.patient_correlation_projection(fused_repr)
-        patient_query = F.normalize(patient_query, p=2, dim=-1, eps=1.0e-12)
-        patient_logits = patient_query @ drug_embeddings.transpose(0, 1)
+            dim=1,
+        )  # [B, 3]
+        source_logits = self.copy_source_gate(current_state)
+        masked_logits = source_logits.masked_fill(~source_mask, -1.0e9)
+        source_weights = torch.softmax(masked_logits, dim=-1)
+        any_source = source_mask.any(dim=1, keepdim=True)
+        source_weights = torch.where(any_source, source_weights, torch.zeros_like(source_weights))
+        copy_signal = torch.sum(source_weights.unsqueeze(-1) * source_tensors, dim=1)
+        return copy_signal.clamp(min=0.0, max=1.0), source_weights, source_mask
 
-        base_probs = torch.sigmoid(base_logits)
-        dropped_probs = self.correlation_dropout_layer(base_probs)
-        coprescription_context = dropped_probs @ drug_embeddings
-        coprescription_logits = coprescription_context @ drug_embeddings.transpose(0, 1)
-        label_correlation_logits = (
-            self.patient_residual_weight * patient_logits
-            + self.coprescription_residual_weight * coprescription_logits
-        )
-        return {
-            "patient_correlation_logits": patient_logits,
-            "coprescription_correlation_logits": coprescription_logits,
-            "label_correlation_logits": label_correlation_logits,
-            "correlation_residual_norm": label_correlation_logits.norm(p=2, dim=-1).mean(),
-            "logit_shift_mean_abs": label_correlation_logits.abs().mean(),
-            "logit_shift_max_abs": label_correlation_logits.abs().max(),
-        }
+    def _compute_logits_copy(self, copy_signal: torch.Tensor) -> torch.Tensor:
+        if self.copy_projection is None:
+            return _safe_logit(copy_signal)
+        return self.copy_projection(copy_signal)
 
     def forward(
         self,
-        fused_repr: torch.Tensor,
+        context_vector: torch.Tensor,
         *,
-        top_k: int | None = None,
-    ) -> dict[str, Any]:
-        """Run medication decoding for a batch of fused patient states.
+        current_state: torch.Tensor | None = None,
+        history_context: torch.Tensor | None = None,
+        retrieval_context: torch.Tensor | None = None,
+        history_med_bag: torch.Tensor | None = None,
+        retrieval_med_bag: torch.Tensor | None = None,
+        medication_memory: torch.Tensor | None = None,
+        **_: Any,
+    ) -> dict[str, torch.Tensor]:
+        """Return raw medication logits plus copy/reuse decoder auxiliaries."""
 
-        Parameters
-        ----------
-        fused_repr:
-            Fused patient representation with shape ``(B, H)``.
-        top_k:
-            Optional override for how many top recommendations to expose inside
-            ``recommendation_metadata``. ``None`` falls back to ``top_k_metadata``.
-
-        Returns
-        -------
-        dict[str, Any]
-            Dictionary with ``drug_logits``, ``drug_probs``, and
-            ``recommendation_metadata``.
-        """
-
-        if not isinstance(fused_repr, torch.Tensor):
-            raise TypeError(f"fused_repr must be a torch.Tensor, got {type(fused_repr)!r}")
-        if fused_repr.ndim != 2:
-            raise ValueError(f"fused_repr must have shape (B, H), got {tuple(fused_repr.shape)}")
-        if fused_repr.shape[1] != self.hidden_dim:
+        if not isinstance(context_vector, torch.Tensor):
+            raise TypeError(f"context_vector must be a torch.Tensor, got {type(context_vector)!r}")
+        if context_vector.ndim != 2:
+            raise ValueError(f"context_vector must have shape (B, H), got {tuple(context_vector.shape)}")
+        if context_vector.shape[1] != self.hidden_dim:
             raise ValueError(
-                "fused_repr hidden dimension mismatch: "
-                f"expected {self.hidden_dim}, got {int(fused_repr.shape[1])}"
+                "context_vector hidden dimension mismatch: "
+                f"expected {self.hidden_dim}, got {int(context_vector.shape[1])}"
             )
 
-        resolved_top_k = _validate_optional_top_k("top_k", top_k)
-        if resolved_top_k is None:
-            resolved_top_k = self.top_k_metadata
+        batch_size = int(context_vector.shape[0])
+        device = context_vector.device
+        dtype = context_vector.dtype
+        logits_new = self._compute_logits_new(context_vector)
 
-        base_drug_logits = self.decoder(fused_repr)
-        correlation_outputs = self._correlation_logits(
-            fused_repr=fused_repr,
-            base_logits=base_drug_logits,
+        if self.decoder_mode == "legacy":
+            gate_raw = torch.ones(batch_size, 1, device=device, dtype=dtype)
+            gate = gate_raw.expand(-1, self.drug_vocab_size)
+            logits_copy = torch.zeros_like(logits_new)
+            copy_signal = torch.zeros_like(logits_new)
+            copy_source_weights = torch.zeros(batch_size, 3, device=device, dtype=dtype)
+            copy_source_mask = torch.zeros(batch_size, 3, device=device, dtype=torch.bool)
+            drug_logits = logits_new
+            drug_probs = torch.sigmoid(drug_logits)
+            return {
+                "drug_logits": drug_logits,
+                "final_logits": drug_logits,
+                "drug_probs": drug_probs,
+                "logits_new": logits_new,
+                "logits_copy": logits_copy,
+                "gate": gate,
+                "gate_raw": gate_raw,
+                "copy_signal": copy_signal,
+                "copy_source_weights": copy_source_weights,
+                "copy_source_mask": copy_source_mask,
+                "decoder_mode": self.decoder_mode,
+            }
+
+        resolved_current_state = _require_2d_tensor(
+            name="current_state",
+            value=context_vector if current_state is None else current_state,
+            batch_size=batch_size,
+            feature_dim=self.hidden_dim,
+            device=device,
+            dtype=dtype,
         )
-        drug_logits = base_drug_logits + correlation_outputs["label_correlation_logits"]
-        drug_probs = torch.sigmoid(drug_logits)
+        resolved_history_context = _require_2d_tensor(
+            name="history_context",
+            value=history_context,
+            batch_size=batch_size,
+            feature_dim=self.hidden_dim,
+            device=device,
+            dtype=dtype,
+        )
+        resolved_retrieval_context = _require_2d_tensor(
+            name="retrieval_context",
+            value=retrieval_context,
+            batch_size=batch_size,
+            feature_dim=self.hidden_dim,
+            device=device,
+            dtype=dtype,
+        )
+        resolved_history_med_bag = _require_2d_tensor(
+            name="history_med_bag",
+            value=history_med_bag,
+            batch_size=batch_size,
+            feature_dim=self.drug_vocab_size,
+            device=device,
+            dtype=dtype,
+        )
+        resolved_retrieval_med_bag = _require_2d_tensor(
+            name="retrieval_med_bag",
+            value=retrieval_med_bag,
+            batch_size=batch_size,
+            feature_dim=self.drug_vocab_size,
+            device=device,
+            dtype=dtype,
+        )
+        resolved_medication_memory = _require_2d_tensor(
+            name="medication_memory",
+            value=medication_memory,
+            batch_size=batch_size,
+            feature_dim=self.drug_vocab_size,
+            device=device,
+            dtype=dtype,
+        )
 
-        recommendation_metadata: dict[str, Any] = {
-            "batch_size": int(fused_repr.shape[0]),
-            "hidden_dim": self.hidden_dim,
-            "drug_vocab_size": self.drug_vocab_size,
-            "decoder_mode": self.decoder_mode,
-            "label_correlation_enabled": self.label_correlation_enabled,
-            "correlation_dim": self.correlation_dim,
-            "patient_residual_weight": self.patient_residual_weight,
-            "coprescription_residual_weight": self.coprescription_residual_weight,
-            "correlation_residual_norm": correlation_outputs["correlation_residual_norm"],
-            "logit_shift_mean_abs": correlation_outputs["logit_shift_mean_abs"],
-            "logit_shift_max_abs": correlation_outputs["logit_shift_max_abs"],
-        }
-
-        if resolved_top_k is not None and resolved_top_k > 0:
-            effective_top_k = min(resolved_top_k, self.drug_vocab_size)
-            topk_scores, topk_indices = torch.topk(drug_probs, k=effective_top_k, dim=-1)
-            recommendation_metadata["topk_indices"] = topk_indices
-            recommendation_metadata["topk_scores"] = topk_scores
-
+        copy_signal, copy_source_weights, copy_source_mask = self._build_copy_signal(
+            current_state=resolved_current_state,
+            history_med_bag=resolved_history_med_bag,
+            retrieval_med_bag=resolved_retrieval_med_bag,
+            medication_memory=resolved_medication_memory,
+        )
+        logits_copy = self._compute_logits_copy(copy_signal)
+        gate_input = torch.cat(
+            (resolved_current_state, resolved_history_context, resolved_retrieval_context),
+            dim=-1,
+        )
+        gate_raw = torch.sigmoid(self.copy_gate_mlp(gate_input))
+        if self.gate_type == "scalar":
+            gate = gate_raw.expand(-1, self.drug_vocab_size)
+        else:
+            gate = gate_raw
+        copy_available = copy_source_mask.any(dim=1, keepdim=True)
+        gate_raw = torch.where(copy_available, gate_raw, torch.ones_like(gate_raw))
+        gate = torch.where(copy_available, gate, torch.ones_like(gate))
+        drug_logits = gate * logits_new + (1.0 - gate) * logits_copy
+        drug_probs = torch.sigmoid(drug_logits)                  # [B, D] probabilities for metrics/thresholding
         return {
             "drug_logits": drug_logits,
+            "final_logits": drug_logits,
             "drug_probs": drug_probs,
-            "base_drug_logits": base_drug_logits,
-            **correlation_outputs,
-            "recommendation_metadata": recommendation_metadata,
+            "logits_new": logits_new,
+            "logits_copy": logits_copy,
+            "gate": gate,
+            "gate_raw": gate_raw,
+            "copy_signal": copy_signal,
+            "copy_source_weights": copy_source_weights,
+            "copy_source_mask": copy_source_mask,
+            "decoder_mode": self.decoder_mode,
         }
 
 
