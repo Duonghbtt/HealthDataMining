@@ -395,11 +395,19 @@ def build_dataloaders(
     num_workers: int,
     pin_memory: bool,
     seed: int | None = None,
+    train_num_workers: int | None = None,
+    val_num_workers: int | None = None,
+    persistent_workers: bool | None = None,
+    prefetch_factor: int | None = None,
 ) -> tuple[DataLoader, DataLoader, Dataset]:
     if int(batch_size) <= 0:
         raise ValueError(f"batch_size must be positive, got {batch_size!r}")
-    if int(num_workers) < 0:
-        raise ValueError(f"num_workers must be non-negative, got {num_workers!r}")
+    resolved_train_num_workers = int(num_workers if train_num_workers is None else train_num_workers)
+    resolved_val_num_workers = int(num_workers if val_num_workers is None else val_num_workers)
+    if resolved_train_num_workers < 0:
+        raise ValueError(f"train_num_workers must be non-negative, got {resolved_train_num_workers!r}")
+    if resolved_val_num_workers < 0:
+        raise ValueError(f"val_num_workers must be non-negative, got {resolved_val_num_workers!r}")
 
     split_validation = validate_patient_level_splits(runtime_data_config_path)
     if bool(split_validation.get("validated")):
@@ -428,27 +436,56 @@ def build_dataloaders(
     _print_dataset_details("train", train_dataset)
     _print_dataset_details("val", val_dataset)
 
-    persistent_workers = int(num_workers) > 0
-    prefetch_factor = 2 if persistent_workers else None
+    def _resolve_worker_settings(loader_name: str, worker_count: int) -> tuple[bool, int | None]:
+        resolved_persistent_workers = (
+            worker_count > 0 if persistent_workers is None else bool(persistent_workers)
+        )
+        if worker_count <= 0:
+            if resolved_persistent_workers:
+                raise ValueError(f"{loader_name} persistent_workers=True requires num_workers > 0")
+            return False, None
+        resolved_prefetch_factor = 2 if prefetch_factor is None else int(prefetch_factor)
+        if resolved_prefetch_factor <= 0:
+            raise ValueError(f"prefetch_factor must be positive when num_workers > 0, got {prefetch_factor!r}")
+        return resolved_persistent_workers, resolved_prefetch_factor
+
+    train_persistent_workers, train_prefetch_factor = _resolve_worker_settings(
+        "train",
+        resolved_train_num_workers,
+    )
+    val_persistent_workers, val_prefetch_factor = _resolve_worker_settings(
+        "val",
+        resolved_val_num_workers,
+    )
     print(
         "DataLoader settings: "
         f"batch_size={int(batch_size)} "
-        f"num_workers={int(num_workers)} "
         f"pin_memory={bool(pin_memory)} "
-        f"persistent_workers={persistent_workers} "
-        f"prefetch_factor={prefetch_factor}"
+        f"train_num_workers={resolved_train_num_workers} "
+        f"train_persistent_workers={train_persistent_workers} "
+        f"train_prefetch_factor={train_prefetch_factor} "
+        f"val_num_workers={resolved_val_num_workers} "
+        f"val_persistent_workers={val_persistent_workers} "
+        f"val_prefetch_factor={val_prefetch_factor}"
     )
 
-    loader_kwargs: dict[str, Any] = {
-        "batch_size": int(batch_size),
-        "num_workers": int(num_workers),
-        "pin_memory": bool(pin_memory),
-    }
-    if seed is not None:
-        loader_kwargs["worker_init_fn"] = seed_dataloader_worker
-    if persistent_workers:
-        loader_kwargs["persistent_workers"] = True
-        loader_kwargs["prefetch_factor"] = 2
+    def _build_loader_kwargs(
+        *,
+        worker_count: int,
+        resolved_persistent_workers: bool,
+        resolved_prefetch_factor: int | None,
+    ) -> dict[str, Any]:
+        loader_kwargs: dict[str, Any] = {
+            "batch_size": int(batch_size),
+            "num_workers": int(worker_count),
+            "pin_memory": bool(pin_memory),
+        }
+        if seed is not None and worker_count > 0:
+            loader_kwargs["worker_init_fn"] = seed_dataloader_worker
+        if worker_count > 0:
+            loader_kwargs["persistent_workers"] = bool(resolved_persistent_workers)
+            loader_kwargs["prefetch_factor"] = int(resolved_prefetch_factor)
+        return loader_kwargs
 
     train_generator = None
     if seed is not None:
@@ -460,13 +497,21 @@ def build_dataloaders(
         shuffle=True,
         collate_fn=select_collate_fn(train_dataset),
         generator=train_generator,
-        **loader_kwargs,
+        **_build_loader_kwargs(
+            worker_count=resolved_train_num_workers,
+            resolved_persistent_workers=train_persistent_workers,
+            resolved_prefetch_factor=train_prefetch_factor,
+        ),
     )
     val_loader = DataLoader(
         val_dataset,
         shuffle=False,
         collate_fn=select_collate_fn(val_dataset),
-        **loader_kwargs,
+        **_build_loader_kwargs(
+            worker_count=resolved_val_num_workers,
+            resolved_persistent_workers=val_persistent_workers,
+            resolved_prefetch_factor=val_prefetch_factor,
+        ),
     )
     return train_loader, val_loader, train_dataset
 

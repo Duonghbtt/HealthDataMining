@@ -741,7 +741,11 @@ def main() -> None:
     device = runtime_builder.resolve_device(args.device or runtime_cfg.get("device", "cpu"))
     seed = int(args.seed if args.seed is not None else data_config.get("seed", 17))
     num_workers = int(runtime_cfg.get("num_workers", 0))
+    train_num_workers = int(runtime_cfg.get("train_num_workers", num_workers))
+    val_num_workers = int(runtime_cfg.get("val_num_workers", num_workers))
     pin_memory = bool(runtime_cfg.get("pin_memory", device.type == "cuda"))
+    persistent_workers_value = runtime_cfg.get("persistent_workers")
+    prefetch_factor_value = runtime_cfg.get("prefetch_factor")
     threshold = float(args.threshold if args.threshold is not None else train_config.get("prediction", {}).get("threshold", 0.5))
     training_cfg = dict(train_config.get("training", {}))
     configured_selection_metric = str(training_cfg.get("selection_metric", "")).strip().lower()
@@ -826,6 +830,10 @@ def main() -> None:
             num_workers=num_workers,
             pin_memory=pin_memory,
             seed=seed,
+            train_num_workers=train_num_workers,
+            val_num_workers=val_num_workers,
+            persistent_workers=None if persistent_workers_value is None else bool(persistent_workers_value),
+            prefetch_factor=None if prefetch_factor_value is None else int(prefetch_factor_value),
         )
         model = runtime_builder.build_core_model(
             train_config=train_config,

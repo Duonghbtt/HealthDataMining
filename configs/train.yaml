@@ -12,8 +12,11 @@ runtime:
   mode: core
   device: cuda
   batch_size: 32
-  num_workers: 4
-  pin_memory: true
+  train_num_workers: 4
+  val_num_workers: 0
+  pin_memory: false
+  persistent_workers: false
+  prefetch_factor: 3
 
 optimization:
   epochs: 14
@@ -26,7 +29,7 @@ optimization:
   scheduler: none
 
 debug_checks:
-  enabled: true
+  enabled: false
   light_mode: true
   check_every_n_steps: 100
   sync_timing: false
@@ -36,15 +39,15 @@ loss:
   use_margin_loss: false
   margin_weight: 0.0
   use_ddi: true
-  lambda_ddi: 0.05
+  lambda_ddi: 5.0e-5
   stage_training: true
   ddi_schedule:
     enabled: true
     type: linear
     start_epoch: 9
     end_epoch: 14
-    start_value: 0.005
-    end_value: 0.05
+    start_value: 0.0
+    end_value: 5.0e-5
 
 decoder:
   mode: legacy
@@ -75,8 +78,8 @@ run:
   max_eval_batches: null
 
 prediction:
-  top_k: 10
-  threshold: 0.5
+  top_k: null
+  threshold: 0.3
 
 core:
   mode: core
