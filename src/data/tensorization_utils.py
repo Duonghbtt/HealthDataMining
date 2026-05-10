@@ -297,6 +297,45 @@ def validate_collated_batch(batch: Mapping[str, Any]) -> None:
         if len(value) != batch_size:
             raise ValueError(f"{key} must contain {batch_size} entries, got {len(value)}")
 
+    retrieval_mask = batch.get("retrieval_mask")
+    if retrieval_mask is not None:
+        if not isinstance(retrieval_mask, torch.Tensor):
+            raise TypeError("retrieval_mask must be a tensor when provided.")
+        if retrieval_mask.ndim != 2 or int(retrieval_mask.shape[0]) != batch_size:
+            raise ValueError(
+                f"retrieval_mask must have shape (B, K), got {tuple(retrieval_mask.shape)}"
+            )
+        top_k = int(retrieval_mask.shape[1])
+        for key in (
+            "retrieval_neighbor_ids",
+            "retrieval_neighbor_patient_ids",
+            "retrieval_neighbor_visit_indices",
+            "retrieval_scores",
+        ):
+            value = batch.get(key)
+            if not isinstance(value, torch.Tensor):
+                raise TypeError(f"{key} must be a tensor when retrieval_mask is provided.")
+            if value.ndim != 2 or tuple(value.shape) != (batch_size, top_k):
+                raise ValueError(f"{key} must have shape {(batch_size, top_k)}, got {tuple(value.shape)}")
+            _assert_finite_tensor(key, value)
+        medication_ids = batch.get("retrieval_medication_ids")
+        if not isinstance(medication_ids, torch.Tensor):
+            raise TypeError("retrieval_medication_ids must be a tensor when retrieval_mask is provided.")
+        if medication_ids.ndim != 3 or tuple(medication_ids.shape[:2]) != (batch_size, top_k):
+            raise ValueError(
+                "retrieval_medication_ids must have shape (B, K, M), "
+                f"got {tuple(medication_ids.shape)}"
+            )
+        medication_multi_hot = batch.get("retrieval_medication_multi_hot")
+        if not isinstance(medication_multi_hot, torch.Tensor):
+            raise TypeError("retrieval_medication_multi_hot must be a tensor when retrieval_mask is provided.")
+        if tuple(medication_multi_hot.shape) != (batch_size, top_k, int(target_drugs.shape[-1])):
+            raise ValueError(
+                "retrieval_medication_multi_hot must have shape (B, K, D), "
+                f"got {tuple(medication_multi_hot.shape)}"
+            )
+        _assert_finite_tensor("retrieval_medication_multi_hot", medication_multi_hot)
+
 
 def _write_id_sequence(
     target: torch.Tensor,

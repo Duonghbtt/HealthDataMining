@@ -9,6 +9,12 @@ import torch
 from torch.utils.data import Dataset
 
 from src.data.build_vocab import load_vocab_bundle
+from src.data.retrieval_cache import (
+    attach_retrieval_batch_fields,
+    load_retrieval_cache_for_split,
+    retrieval_cache_enabled,
+    retrieval_record_from_cache,
+)
 from src.data.tensorization_utils import load_optional_ddi_tensors, validate_collated_batch
 from src.utils.io import load_pt, load_yaml_config, read_json, resolve_path
 
@@ -167,6 +173,11 @@ def tensorized_collate_batch(records: list[dict[str, torch.Tensor]]) -> dict[str
             batch["ddi_adj"] = ddi_adj
         if ddi_severity_adj is not None:
             batch["ddi_severity_adj"] = ddi_severity_adj
+        attach_retrieval_batch_fields(
+            batch,
+            records,
+            drug_vocab_size=int(batch["target_drugs"].shape[-1]),
+        )
         validate_collated_batch(batch)
         return batch
 
@@ -235,6 +246,11 @@ def tensorized_collate_batch(records: list[dict[str, torch.Tensor]]) -> dict[str
         batch["ddi_adj"] = ddi_adj
     if ddi_severity_adj is not None:
         batch["ddi_severity_adj"] = ddi_severity_adj
+    attach_retrieval_batch_fields(
+        batch,
+        records,
+        drug_vocab_size=int(target_drugs.shape[-1]),
+    )
     validate_collated_batch(batch)
     return batch
 
@@ -283,6 +299,18 @@ class TensorizedTrajectoryDataset(Dataset):
             self.shards.append({"path": shard_path, "rows": rows})
             total += rows
             self.cumulative_rows.append(total)
+        self._retrieval_cache_config = (
+            dict(resolved_config)
+            if resolved_config is not None and retrieval_cache_enabled(resolved_config)
+            else None
+        )
+        self._retrieval_cache: dict[str, Any] | None = None
+
+    def __getstate__(self) -> dict[str, Any]:
+        state = dict(self.__dict__)
+        state["_retrieval_cache"] = None
+        state["_shard_cache"] = OrderedDict()
+        return state
 
     @property
     def storage_mode(self) -> str:
@@ -412,6 +440,19 @@ class TensorizedTrajectoryDataset(Dataset):
         )
         return payload
 
+    def _load_retrieval_cache(self) -> dict[str, Any] | None:
+        if self._retrieval_cache is not None:
+            return self._retrieval_cache
+        if self._retrieval_cache_config is None:
+            return None
+        self._retrieval_cache = load_retrieval_cache_for_split(
+            config=self._retrieval_cache_config,
+            split=self.split,
+            expected_rows=len(self),
+            drug_vocab_size=self.drug_vocab_size,
+        )
+        return self._retrieval_cache
+
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
         if index < 0 or index >= len(self):
             raise IndexError(index)
@@ -428,6 +469,9 @@ class TensorizedTrajectoryDataset(Dataset):
         record["history_length"] = visit_position
         if self.ddi_tensors:
             record.update(self.ddi_tensors)
+        retrieval_cache = self._load_retrieval_cache()
+        if retrieval_cache is not None:
+            record.update(retrieval_record_from_cache(retrieval_cache, index))
         return record
 
 

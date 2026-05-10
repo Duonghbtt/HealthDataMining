@@ -12,6 +12,7 @@ import yaml
 from torch.utils.data import DataLoader, Dataset
 
 from src.data.dataset import MIMICTrajectoryDataset, collate_batch, validate_patient_level_splits
+from src.data.retrieval_cache import retrieval_cache_enabled
 from src.data.tensorized_dataset import (
     TensorizedTrajectoryDataset,
     tensorized_collate_batch,
@@ -296,8 +297,11 @@ def build_runtime_data_config_file(
     processed_root: Path,
     vocab_root: Path,
     temp_dir: Path,
+    retrieval_cache_config: Mapping[str, Any] | None = None,
 ) -> Path:
     runtime_config = copy.deepcopy({key: value for key, value in data_config.items() if not str(key).startswith("_")})
+    if retrieval_cache_config is not None:
+        runtime_config["retrieval_cache"] = copy.deepcopy(dict(retrieval_cache_config))
     runtime_config.setdefault("paths", {})
     runtime_paths = runtime_config["paths"]
     runtime_paths["processed_root"] = str(processed_root.resolve())
@@ -319,6 +323,14 @@ def build_runtime_data_config_file(
         path_value = runtime_paths.get(path_key)
         if path_value:
             runtime_paths[path_key] = str(resolve_path(project_root, path_value).resolve())
+
+    retrieval_cache_cfg = runtime_config.get("retrieval_cache", {})
+    if isinstance(retrieval_cache_cfg, dict):
+        retrieval_cache_cfg = dict(retrieval_cache_cfg)
+        cache_root = retrieval_cache_cfg.get("cache_root")
+        if cache_root:
+            retrieval_cache_cfg["cache_root"] = str(resolve_path(project_root, cache_root).resolve())
+        runtime_config["retrieval_cache"] = retrieval_cache_cfg
 
     spark_cfg = runtime_config.get("spark", {})
     if isinstance(spark_cfg, dict):
@@ -360,6 +372,11 @@ def build_dataset(
             return dataset
         except FileNotFoundError as exc:
             print(f"Tensorized dataset unavailable for split `{split}`: {exc}")
+    if retrieval_cache_enabled(runtime_config):
+        raise FileNotFoundError(
+            "retrieval_cache.enabled=true requires TensorizedTrajectoryDataset so cache rows align "
+            f"with tensorized sample order; missing tensorized manifest at {tensorized_manifest_path}"
+        )
 
     try:
         dataset = MIMICTrajectoryDataset(split, runtime_data_config_path)
@@ -559,7 +576,31 @@ def build_core_model(
     encoder_cfg = dict(model_config.get("encoder", {}))
     history_cfg = dict(model_config.get("history_selector", {}))
     retrieval_cfg = dict(model_config.get("retrieval", {}))
+    train_core_cfg = dict(train_config.get("core", {}))
+    train_extended_cfg = dict(train_config.get("extended", {}))
+    retrieval_cache_cfg = dict(train_config.get("retrieval_cache", {}))
+    if train_core_cfg.get("use_retrieval") is not None:
+        retrieval_cfg["enabled"] = bool(train_core_cfg.get("use_retrieval"))
+    elif train_extended_cfg.get("use_retrieval") is not None:
+        retrieval_cfg["enabled"] = bool(train_extended_cfg.get("use_retrieval"))
+    if train_extended_cfg.get("retrieval_top_k") is not None:
+        retrieval_cfg["top_k"] = int(train_extended_cfg["retrieval_top_k"])
+    if train_extended_cfg.get("retrieval_backend") is not None:
+        retrieval_cfg["backend"] = train_extended_cfg["retrieval_backend"]
+        retrieval_cfg["mode"] = train_extended_cfg["retrieval_backend"]
+    if train_extended_cfg.get("use_faiss_if_available") is not None:
+        retrieval_cfg["use_faiss_if_available"] = bool(train_extended_cfg["use_faiss_if_available"])
+    if train_extended_cfg.get("temporal_decay_alpha") is not None:
+        retrieval_cfg["temporal_decay_alpha"] = float(train_extended_cfg["temporal_decay_alpha"])
+    use_precomputed_retrieval_cache = bool(
+        retrieval_cache_cfg.get("enabled", False)
+        and retrieval_cache_cfg.get("use_precomputed", True)
+    )
+    if use_precomputed_retrieval_cache:
+        retrieval_cfg["enabled"] = True
     full_model_cfg = dict(model_config.get("full_model", {}))
+    if retrieval_cfg.get("enabled") and str(full_model_cfg.get("history_mode", "self_only")) == "self_only":
+        full_model_cfg["history_mode"] = "self_retrieval"
     debug_cfg = dict(model_config.get("debug", {}))
     fusion_cfg = dict(model_config.get("fusion", {}))
     decoder_cfg = dict(train_config.get("decoder", {}))
@@ -694,6 +735,8 @@ def build_core_model(
         ),
         return_retrieval_aux=bool(debug_cfg.get("return_retrieval_aux", True)),
         loss_config=loss_cfg,
+        use_precomputed_retrieval_cache=use_precomputed_retrieval_cache,
+        retrieval_cache_config=retrieval_cache_cfg,
     )
 
 

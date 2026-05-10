@@ -285,6 +285,7 @@ def main() -> None:
             processed_root=resolved_paths["processed_root"],
             vocab_root=resolved_paths["vocab_root"],
             temp_dir=temp_dir,
+            retrieval_cache_config=train_config.get("retrieval_cache"),
         )
         dataloader = build_eval_dataloader(
             split=split,

@@ -795,8 +795,17 @@ def main() -> None:
     print(f"  use_self_history: {baseline_settings['use_self_history']}")
     print(f"  use_ddi: {baseline_settings['use_ddi']}")
     print(f"  lambda_ddi: {float(baseline_settings['lambda_ddi']):.6f}")
-    print(f"  retrieval_enabled: {bool(model_config.get('retrieval', {}).get('enabled', False))}")
-    print(f"  history_mode: {str(model_config.get('full_model', {}).get('history_mode', 'self_only'))}")
+    retrieval_enabled_for_run = bool(
+        train_config.get("core", {}).get(
+            "use_retrieval",
+            train_config.get("extended", {}).get("use_retrieval", model_config.get("retrieval", {}).get("enabled", False)),
+        )
+    )
+    if bool(train_config.get("retrieval_cache", {}).get("enabled", False)):
+        retrieval_enabled_for_run = True
+    print(f"  retrieval_enabled: {retrieval_enabled_for_run}")
+    print(f"  retrieval_cache_enabled: {bool(train_config.get('retrieval_cache', {}).get('enabled', False))}")
+    print(f"  history_mode: {'self_retrieval' if retrieval_enabled_for_run else str(model_config.get('full_model', {}).get('history_mode', 'self_only'))}")
     print(f"  stage_training: {bool(train_config.get('loss', {}).get('stage_training', False))}")
     print(f"  stage1_epochs: {int(train_config.get('training', {}).get('stage1_epochs', 0))}")
     print(f"  stage2_epochs: {int(train_config.get('training', {}).get('stage2_epochs', 0))}")
@@ -816,6 +825,7 @@ def main() -> None:
             processed_root=resolved_paths["processed_root"],
             vocab_root=resolved_paths["vocab_root"],
             temp_dir=temp_dir,
+            retrieval_cache_config=train_config.get("retrieval_cache"),
         )
         med_vocab_path = resolved_paths["vocab_root"] / "med_vocab_main.json"
         legacy_drug_vocab_path = resolved_paths["vocab_root"] / "drug_vocab.json"

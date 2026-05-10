@@ -202,6 +202,137 @@ Khi chạy CPU, có thể ghi đè trực tiếp:
 python -m src.training.train_core --config configs/train.yaml --device cpu --smoke-test
 ```
 
+## Offline cached retrieval / cross-patient memory
+
+Pipeline core mặc định trong `configs/train.yaml` vẫn giữ baseline không dùng retrieval:
+
+```yaml
+core:
+  use_retrieval: false
+
+extended:
+  use_retrieval: false
+```
+
+Muốn train với cross-patient memory theo hướng offline cached retrieval, dùng config riêng:
+
+```text
+configs/train_retrieval_cached.yaml
+```
+
+Config này bật:
+
+- `core.use_retrieval: true`
+- `extended.use_retrieval: true`
+- `decoder.use_retrieval_copy: true`
+- `retrieval_cache.enabled: true`
+- `retrieval_cache.use_precomputed: true`
+- `retrieval_cache.memory_split_for_eval: train`
+- `retrieval_cache.allow_cross_split: false`
+- `retrieval_cache.allow_same_patient: false`
+
+Lưu ý quan trọng: train loop không search neighbor online. Neighbor được precompute trước và lưu vào cache. Dataset/DataLoader chỉ đọc `neighbor_ids`, `scores`, `mask` và medication evidence từ cache.
+
+### Build retrieval cache
+
+Chạy sau khi đã có tensorized trajectories trong `data/processed/{train,val,test}`:
+
+```powershell
+python src\data\build_retrieval_cache.py --config configs\data.yaml --train-config configs\train_retrieval_cached.yaml --splits train val test --top-k 3 --overwrite
+```
+
+Artifact sinh ra:
+
+```text
+data/artifacts/retrieval_cache/train_topk.pt
+data/artifacts/retrieval_cache/val_topk.pt
+data/artifacts/retrieval_cache/test_topk.pt
+outputs/reports/retrieval_cache_report.json
+```
+
+Cache mỗi sample gồm các trường chính:
+
+- `retrieval_neighbor_ids`
+- `retrieval_neighbor_patient_ids`
+- `retrieval_neighbor_visit_indices`
+- `retrieval_scores`
+- `retrieval_mask`
+- `retrieval_medication_ids`
+
+Báo cáo cache nên được kiểm tra trước khi train:
+
+- `fraction_with_neighbors`
+- `avg_valid_neighbors`
+- `avg_score`
+- `leakage_check_counts`
+- `backend_used`
+
+Nếu FAISS không cài được, builder có thể fallback sang brute force. Cách này đúng về logic nhưng có thể chậm hơn nhiều trên full train memory.
+
+### Leakage policy
+
+Mặc định `allow_cross_split: false`:
+
+- train query chỉ retrieve từ train memory.
+- val/test query chỉ retrieve từ train memory.
+- không dùng val/test labels làm memory khi evaluate.
+- không lấy chính sample/visit đó làm neighbor.
+- không lấy future visit của cùng patient.
+- `allow_same_patient: false` nên cache ưu tiên cross-patient memory; nếu bật same-patient về sau thì vẫn chặn self/future visit.
+
+Query representation trong cache builder dùng diagnosis ids, procedure ids và medication history ids. Target medication của chính sample không được dùng để tạo query representation.
+
+### Kiểm tra cache và forward pass
+
+Sau khi build cache, chạy script kiểm tra nhanh:
+
+```powershell
+python scripts\check_retrieval_cache.py --config configs\data.yaml --train-config configs\train_retrieval_cached.yaml --model-config configs\model.yaml --split val --forward --device cuda
+```
+
+Script này kiểm tra cache load được, batch có retrieval fields đúng shape, và model forward được với `use_retrieval=true`.
+
+### Train với cached retrieval
+
+Smoke test 2 batch:
+
+```powershell
+python src\training\train_core.py --config configs\train_retrieval_cached.yaml --data-config configs\data.yaml --model-config configs\model.yaml --baseline-mode current_self_history_ddi --seed 42 --smoke-test --epochs 1 --max-train-batches 2 --max-val-batches 2
+```
+
+Train full:
+
+```powershell
+python src\training\train_core.py --config configs\train_retrieval_cached.yaml --data-config configs\data.yaml --model-config configs\model.yaml --baseline-mode current_self_history_ddi --seed 42
+```
+
+Trong log mỗi epoch sẽ có thêm retrieval metrics:
+
+- `train_retrieval_fraction_with_context`
+- `train_retrieval_avg_valid_candidates`
+- `train_retrieval_avg_score`
+- `val_retrieval_fraction_with_context`
+- `val_retrieval_avg_valid_candidates`
+- `val_retrieval_avg_score`
+
+Nếu retrieval đã bật nhưng `fraction_with_context = 0`, cần dừng lại kiểm tra cache path, split, top-k và leakage filter.
+
+### Evaluate checkpoint retrieval
+
+Sau khi train xong:
+
+```powershell
+python src\evaluation\evaluate_core.py --config configs\eval.yaml --checkpoint outputs\checkpoints\train_core_best.pt --split test
+python src\evaluation\evaluate_safety.py --config configs\eval.yaml --checkpoint outputs\checkpoints\train_core_best.pt --split test
+```
+
+Retrieval policy trong report cần thể hiện:
+
+- retrieval branch enabled
+- use precomputed cache
+- allow cross split false
+- memory split for eval train
+
 ## Chạy preprocessing
 
 Cách nhanh nhất trên PowerShell:

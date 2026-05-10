@@ -971,6 +971,7 @@ def evaluate_checkpoint(
             processed_root=resolved_paths["processed_root"],
             vocab_root=resolved_paths["vocab_root"],
             temp_dir=temp_dir,
+            retrieval_cache_config=train_config.get("retrieval_cache"),
         )
 
         need_val_dataloader = (
@@ -1006,7 +1007,9 @@ def evaluate_checkpoint(
             vocab_root=resolved_paths["vocab_root"],
             ddi_matrix_path=resolved_paths["ddi_matrix_path"],
         )
-        if bool(getattr(model, "use_retrieval", False)):
+        if bool(getattr(model, "use_retrieval", False)) and not bool(
+            getattr(model, "uses_precomputed_retrieval_cache", False)
+        ):
             train_retrieval_dataloader = build_eval_dataloader(
                 split="train",
                 runtime_data_config_path=runtime_data_config_path,
@@ -1019,7 +1022,11 @@ def evaluate_checkpoint(
     if not isinstance(model_state_dict, Mapping):
         raise KeyError("Checkpoint does not contain `model_state_dict`.")
     model.load_state_dict(model_state_dict, strict=True)
-    if bool(getattr(model, "use_retrieval", False)) and train_retrieval_dataloader is not None:
+    if (
+        bool(getattr(model, "use_retrieval", False))
+        and not bool(getattr(model, "uses_precomputed_retrieval_cache", False))
+        and train_retrieval_dataloader is not None
+    ):
         retrieval_bank = model.refresh_retrieval_memory_bank(
             train_retrieval_dataloader,
             split_name="train",

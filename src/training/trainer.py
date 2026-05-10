@@ -463,6 +463,10 @@ class Trainer:
             str(spec["label"]): 0.0
             for spec in _CODE_EMBEDDING_SPECS
         }
+        retrieval_total_valid_candidates = 0.0
+        retrieval_examples_with_context = 0.0
+        retrieval_score_total = 0.0
+        retrieval_score_count = 0.0
 
         self.model.train(mode=training)
         grad_context = torch.enable_grad if training else torch.no_grad
@@ -574,6 +578,22 @@ class Trainer:
                         "Model forward must return `total_loss`, `prediction_loss`, and `ddi_loss` "
                         "for the new training pipeline."
                     )
+                retrieval_valid_counts = outputs.get("retrieval_valid_candidate_counts")
+                if isinstance(retrieval_valid_counts, torch.Tensor):
+                    valid_counts_cpu = retrieval_valid_counts.detach().cpu().to(dtype=torch.float32)
+                    retrieval_total_valid_candidates += float(valid_counts_cpu.sum().item())
+                    retrieval_examples_with_context += float((valid_counts_cpu > 0).sum().item())
+                retrieved_scores = outputs.get("retrieved_scores")
+                retrieved_indices = outputs.get("retrieved_indices")
+                if isinstance(retrieved_scores, torch.Tensor):
+                    score_tensor = retrieved_scores.detach().cpu().to(dtype=torch.float32)
+                    if isinstance(retrieved_indices, torch.Tensor) and tuple(retrieved_indices.shape) == tuple(retrieved_scores.shape):
+                        score_mask = retrieved_indices.detach().cpu() >= 0
+                    else:
+                        score_mask = torch.ones_like(score_tensor, dtype=torch.bool)
+                    if bool(score_mask.any().item()):
+                        retrieval_score_total += float(score_tensor[score_mask].sum().item())
+                        retrieval_score_count += float(score_mask.sum().item())
                 if not training:
                     drug_probs = outputs.get("drug_probs")
                     target_current = self._resolve_validation_targets(outputs, batch_on_device)
@@ -686,6 +706,22 @@ class Trainer:
         metrics = {f"{phase}_{key}": totals[key] / float(total_examples) for key in _LOSS_KEYS}
         average_batches = float(max(total_batches, 1))
         metrics.update({f"{phase}_{key}": timing_totals[key] / average_batches for key in _TIME_KEYS})
+        if self.use_retrieval:
+            retrieval_fraction = retrieval_examples_with_context / float(total_examples)
+            metrics.update(
+                {
+                    f"{phase}_retrieval_fraction_with_context": float(retrieval_fraction),
+                    f"{phase}_retrieval_avg_valid_candidates": retrieval_total_valid_candidates / float(total_examples),
+                    f"{phase}_retrieval_avg_score": (
+                        0.0 if retrieval_score_count <= 0.0 else retrieval_score_total / retrieval_score_count
+                    ),
+                }
+            )
+            if retrieval_fraction <= 0.0:
+                _log_line(
+                    f"WARNING: retrieval is enabled but {phase}_retrieval_fraction_with_context=0. "
+                    "Check that offline retrieval cache is built and loaded."
+                )
         if training and grad_batches > 0:
             metrics.update(
                 {
@@ -898,7 +934,19 @@ class Trainer:
                 trainable=code_embeddings_trainable,
                 epoch=epoch,
             )
-            if self.use_retrieval and hasattr(self.model, "refresh_retrieval_memory_bank"):
+            use_precomputed_cache = bool(getattr(self.model, "uses_precomputed_retrieval_cache", False))
+            if self.use_retrieval and use_precomputed_cache and not self._retrieval_policy_logged:
+                if hasattr(self.model, "get_retrieval_policy"):
+                    retrieval_policy = self.model.get_retrieval_policy()
+                    _log_line(
+                        "Retrieval policy: "
+                        f"use_precomputed_cache={bool(retrieval_policy.get('use_precomputed_cache', False))} "
+                        f"allow_cross_split={bool(retrieval_policy.get('allow_cross_split', False))} "
+                        f"memory_split_for_eval={retrieval_policy.get('memory_split_for_eval')}"
+                    )
+                    _log_line(str(retrieval_policy.get("notes", "")))
+                self._retrieval_policy_logged = True
+            if self.use_retrieval and not use_precomputed_cache and hasattr(self.model, "refresh_retrieval_memory_bank"):
                 retrieval_bank = self.model.refresh_retrieval_memory_bank(
                     train_dataloader,
                     split_name="train",
@@ -922,7 +970,7 @@ class Trainer:
                         _log_line(str(retrieval_policy.get("notes", "")))
                         self._retrieval_policy_logged = True
             train_metrics = self.train_one_epoch(train_dataloader, epoch=epoch)
-            if self.use_retrieval and hasattr(self.model, "refresh_retrieval_memory_bank"):
+            if self.use_retrieval and not use_precomputed_cache and hasattr(self.model, "refresh_retrieval_memory_bank"):
                 retrieval_bank = self.model.refresh_retrieval_memory_bank(
                     train_dataloader,
                     split_name="train",

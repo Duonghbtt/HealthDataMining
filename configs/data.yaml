@@ -67,3 +67,11 @@ spark:
   cache_codec: snappy
   trajectory_rows_per_file: 8192
   max_open_shards_per_dataset: 8
+
+retrieval_cache:
+  enabled: false
+  cache_root: data/artifacts/retrieval_cache
+  top_k: 3
+  use_precomputed: true
+  build_if_missing: false
+  memory_split_for_eval: train

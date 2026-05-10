@@ -175,6 +175,8 @@ class FullMedicationModel(nn.Module):
         history_mode: str = "self_only",
         return_retrieval_aux: bool = True,
         loss_config: Mapping[str, Any] | None = None,
+        use_precomputed_retrieval_cache: bool = False,
+        retrieval_cache_config: Mapping[str, Any] | None = None,
         **_: Any,
     ) -> None:
         super().__init__()
@@ -189,6 +191,8 @@ class FullMedicationModel(nn.Module):
         if self.history_mode not in _VALID_HISTORY_MODES:
             raise ValueError(f"history_mode must be one of {_VALID_HISTORY_MODES}, got {history_mode!r}")
         self.return_retrieval_aux = bool(return_retrieval_aux)
+        self.use_precomputed_retrieval_cache = bool(use_precomputed_retrieval_cache)
+        self.retrieval_cache_config = dict(retrieval_cache_config or {})
         self.loss_config = build_medication_loss_config(loss_config=loss_config)
         self.loss_config["lambda_ddi"] = float(lambda_ddi)
         self.retrieval_memory_bank: VisitMemoryBank | None = None
@@ -372,6 +376,10 @@ class FullMedicationModel(nn.Module):
     def use_retrieval(self) -> bool:
         return self.retriever is not None and self.history_mode in {"retrieval_only", "self_retrieval"}
 
+    @property
+    def uses_precomputed_retrieval_cache(self) -> bool:
+        return bool(self.use_retrieval and self.use_precomputed_retrieval_cache)
+
     def set_retrieval_memory_bank(self, memory_bank: VisitMemoryBank | None) -> None:
         self.retrieval_memory_bank = memory_bank
         if self.retriever is not None:
@@ -387,6 +395,30 @@ class FullMedicationModel(nn.Module):
                 "same_patient_future_blocked": False,
                 "cross_patient_absolute_temporal_filter": False,
                 "notes": "Retrieval branch is disabled in this model.",
+            }
+        if self.uses_precomputed_retrieval_cache:
+            memory_split_for_eval = str(self.retrieval_cache_config.get("memory_split_for_eval", "train"))
+            allow_cross_split = bool(self.retrieval_cache_config.get("allow_cross_split", False))
+            return {
+                "retrieval_branch_enabled": True,
+                "use_precomputed_cache": True,
+                "cache_root": self.retrieval_cache_config.get("cache_root"),
+                "top_k": int(self.retrieval_cache_config.get("top_k", getattr(self.retriever, "top_k", 0))),
+                "memory_split_for_eval": memory_split_for_eval,
+                "allow_cross_split": allow_cross_split,
+                "memory_bank_split": memory_split_for_eval,
+                "has_absolute_time": False,
+                "all_visits_have_absolute_time": False,
+                "exact_match_blocked": True,
+                "same_patient_future_blocked": True,
+                "cross_patient_absolute_temporal_filter": False,
+                "allow_same_patient": bool(self.retrieval_cache_config.get("allow_same_patient", False)),
+                "retrieval_backend": str(self.retrieval_cache_config.get("backend", "offline_cache")),
+                "notes": (
+                    "Retrieval uses offline precomputed neighbor cache. No online FAISS/bruteforce "
+                    "neighbor search is performed inside model.forward. Absolute visit times are not "
+                    "required; split boundary and visit-order filters are enforced when building cache."
+                ),
             }
         return self.retriever.describe_leakage_policy(memory_bank=self.retrieval_memory_bank)
 
@@ -647,6 +679,80 @@ class FullMedicationModel(nn.Module):
             "avg_retrieved_score": 0.0,
         }
 
+    def _precomputed_retrieval_outputs(
+        self,
+        *,
+        batch: Mapping[str, Any],
+        current_state: torch.Tensor,
+    ) -> dict[str, Any]:
+        if self.retriever is None:
+            return self._zero_retrieval_outputs(current_state=current_state)
+        medication_evidence = batch.get("retrieval_medication_multi_hot")
+        retrieval_scores = batch.get("retrieval_scores")
+        retrieval_mask = batch.get("retrieval_mask")
+        if medication_evidence is None or retrieval_scores is None or retrieval_mask is None:
+            raise RuntimeError(
+                "Model is configured for precomputed retrieval cache, but the batch is missing "
+                "`retrieval_medication_multi_hot`, `retrieval_scores`, or `retrieval_mask`."
+            )
+        device = current_state.device
+        dtype = current_state.dtype
+        medication_tensor = torch.as_tensor(medication_evidence, device=device, dtype=dtype)
+        score_tensor = torch.as_tensor(retrieval_scores, device=device, dtype=dtype)
+        mask_tensor = torch.as_tensor(retrieval_mask, device=device, dtype=torch.bool)
+        if medication_tensor.ndim != 3:
+            raise ValueError(
+                "retrieval_medication_multi_hot must have shape (B, K, D), "
+                f"got {tuple(medication_tensor.shape)}"
+            )
+        batch_size, top_k, drug_vocab_size = medication_tensor.shape
+        if int(batch_size) != int(current_state.shape[0]) or int(drug_vocab_size) != int(self.retriever.drug_vocab_size):
+            raise ValueError(
+                "Precomputed retrieval medication tensor must align with batch/model: "
+                f"got {tuple(medication_tensor.shape)}, batch={int(current_state.shape[0])}, "
+                f"drug_vocab={int(self.retriever.drug_vocab_size)}"
+            )
+        if tuple(score_tensor.shape) != (batch_size, top_k) or tuple(mask_tensor.shape) != (batch_size, top_k):
+            raise ValueError(
+                "retrieval_scores and retrieval_mask must have shape (B, K), "
+                f"got {tuple(score_tensor.shape)} and {tuple(mask_tensor.shape)}"
+            )
+
+        masked_scores = score_tensor.masked_fill(~mask_tensor, -1.0e9)
+        safe_weights = torch.softmax(masked_scores, dim=1)
+        safe_weights = torch.where(mask_tensor, safe_weights, torch.zeros_like(safe_weights))
+        weight_sums = safe_weights.sum(dim=1, keepdim=True).clamp(min=1.0e-12)
+        safe_weights = torch.where(weight_sums > 0.0, safe_weights / weight_sums, safe_weights)
+        raw_context = (safe_weights.unsqueeze(-1) * medication_tensor).sum(dim=1)
+        has_context = mask_tensor.any(dim=1)
+        raw_context = torch.where(has_context.unsqueeze(-1), raw_context, torch.zeros_like(raw_context))
+        projected_context = self.retriever.medication_projection(raw_context)
+        projected_context = torch.where(
+            has_context.unsqueeze(-1),
+            projected_context,
+            torch.zeros_like(projected_context),
+        )
+
+        neighbor_ids = torch.as_tensor(
+            batch.get("retrieval_neighbor_ids", torch.full((batch_size, top_k), -1)),
+            device=device,
+            dtype=torch.long,
+        )
+        valid_counts = mask_tensor.sum(dim=1, dtype=torch.long)
+        valid_scores = score_tensor[mask_tensor]
+        return {
+            "aggregated_retrieval_context": projected_context,
+            "retrieval_medication_context": raw_context,
+            "retrieved_indices": neighbor_ids,
+            "retrieved_scores": score_tensor,
+            "retrieval_weights": safe_weights,
+            "retrieved_medication_evidence": medication_tensor,
+            "retrieved_metadata": [[] for _ in range(batch_size)],
+            "valid_candidate_counts": valid_counts,
+            "avg_valid_candidates": float(valid_counts.to(dtype=torch.float32).mean().item()),
+            "avg_retrieved_score": 0.0 if valid_scores.numel() <= 0 else float(valid_scores.mean().item()),
+        }
+
     def forward(self, batch: Mapping[str, Any], **_: Any) -> dict[str, Any]:
         return_aux = bool(_.get("return_aux", False)) or self.return_retrieval_aux
         debug_checks_enabled = _should_debug_check(batch)
@@ -694,7 +800,12 @@ class FullMedicationModel(nn.Module):
             _assert_finite_tree("history.attribute_contexts", sel_out.get("attribute_contexts"))
             _assert_finite_tree("history.attribute_attention_weights", sel_out.get("attribute_attention_weights"))
 
-        if self.use_retrieval:
+        if self.uses_precomputed_retrieval_cache:
+            retrieval_out = self._precomputed_retrieval_outputs(
+                batch=batch,
+                current_state=current_state,
+            )
+        elif self.use_retrieval:
             (
                 current_patient_ids,
                 current_visit_indices,
