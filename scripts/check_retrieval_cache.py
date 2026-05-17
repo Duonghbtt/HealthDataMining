@@ -25,7 +25,7 @@ from src.utils.io import load_yaml_config, resolve_path  # noqa: E402
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Smoke-check offline retrieval cache wiring.")
     parser.add_argument("--config", default="configs/data.yaml")
-    parser.add_argument("--train-config", default="configs/train_retrieval_cached.yaml")
+    parser.add_argument("--train-config", default="configs/train.yaml")
     parser.add_argument("--model-config", default="configs/model.yaml")
     parser.add_argument("--split", default="val", choices=("train", "val", "test"))
     parser.add_argument("--batches", type=int, default=1)

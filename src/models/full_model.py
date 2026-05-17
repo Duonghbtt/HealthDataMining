@@ -423,6 +423,8 @@ class FullMedicationModel(nn.Module):
         return self.retriever.describe_leakage_policy(memory_bank=self.retrieval_memory_bank)
 
     def clear_retrieval_memory_bank(self) -> None:
+        """Compatibility helper; retained for older retrieval/memory-bank workflows."""
+
         self.set_retrieval_memory_bank(None)
 
     def _move_batch_to_device(self, batch: Mapping[str, Any], device: torch.device) -> dict[str, Any]:

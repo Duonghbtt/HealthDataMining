@@ -4,7 +4,7 @@ from src.features.lab_processor import NumericFeatureEncoder, NumericFeatureProc
 
 
 class VitalProcessor(NumericFeatureProcessor):
-    pass
+    """Kept for optional lab/vital pipeline support."""
 
 
 class VitalFeatureEncoder(NumericFeatureEncoder):

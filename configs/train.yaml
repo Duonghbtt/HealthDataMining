@@ -12,11 +12,12 @@ runtime:
   mode: core
   device: cuda
   batch_size: 32
+  num_workers: 4
   train_num_workers: 4
   val_num_workers: 0
   pin_memory: false
   persistent_workers: false
-  prefetch_factor: 3
+  prefetch_factor: 2
 
 optimization:
   epochs: 14
@@ -83,15 +84,26 @@ prediction:
 
 core:
   mode: core
-  use_retrieval: false
+  use_retrieval: true
   use_group_encoder: false
 
 extended:
   mode: extended
-  use_retrieval: false
-  use_group_encoder: true
-  retrieval_top_k: 5
+  use_retrieval: true
+  use_group_encoder: false
+  retrieval_top_k: 3
   temporal_decay_alpha: 0.05
-  retrieval_backend: bruteforce
+  retrieval_backend: faiss
   use_faiss_if_available: true
   allow_cross_split: false
+
+retrieval_cache:
+  enabled: true
+  cache_root: data/artifacts/retrieval_cache
+  top_k: 3
+  use_precomputed: true
+  build_if_missing: false
+  memory_split_for_eval: train
+  allow_cross_split: false
+  allow_same_patient: false
+  backend: faiss

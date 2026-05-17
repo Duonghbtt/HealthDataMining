@@ -99,7 +99,7 @@ HealthDataMining/
 
 Ghi chú:
 
-- `src/retrieval/` vẫn có trong repo, nhưng cấu hình core hiện tại đang tắt retrieval (`use_retrieval: false`).
+- `src/retrieval/` là đường train mặc định hiện tại qua offline cached retrieval trong `configs/train.yaml`.
 - Một số notebook cũ như temporal similarity hoặc hypergraph có thể dùng cho thử nghiệm, không phải đường chính của pipeline core.
 - `data/` và `outputs/` được ignore trong git để tránh commit dữ liệu MIMIC-IV, checkpoint lớn và artifact sinh ra khi chạy.
 
@@ -204,20 +204,24 @@ python -m src.training.train_core --config configs/train.yaml --device cpu --smo
 
 ## Offline cached retrieval / cross-patient memory
 
-Pipeline core mặc định trong `configs/train.yaml` vẫn giữ baseline không dùng retrieval:
+Pipeline core mặc định trong `configs/train.yaml` dùng offline cached retrieval:
 
 ```yaml
 core:
-  use_retrieval: false
+  use_retrieval: true
 
 extended:
-  use_retrieval: false
+  use_retrieval: true
+
+retrieval_cache:
+  enabled: true
+  use_precomputed: true
 ```
 
-Muốn train với cross-patient memory theo hướng offline cached retrieval, dùng config riêng:
+Config train chính hiện tại là bản cross-patient memory theo hướng offline cached retrieval:
 
 ```text
-configs/train_retrieval_cached.yaml
+configs/train.yaml
 ```
 
 Config này bật:
@@ -238,7 +242,7 @@ Lưu ý quan trọng: train loop không search neighbor online. Neighbor đượ
 Chạy sau khi đã có tensorized trajectories trong `data/processed/{train,val,test}`:
 
 ```powershell
-python src\data\build_retrieval_cache.py --config configs\data.yaml --train-config configs\train_retrieval_cached.yaml --splits train val test --top-k 3 --overwrite
+python src\data\build_retrieval_cache.py --config configs\data.yaml --train-config configs\train.yaml --splits train val test --top-k 3 --overwrite
 ```
 
 Artifact sinh ra:
@@ -287,7 +291,7 @@ Query representation trong cache builder dùng diagnosis ids, procedure ids và 
 Sau khi build cache, chạy script kiểm tra nhanh:
 
 ```powershell
-python scripts\check_retrieval_cache.py --config configs\data.yaml --train-config configs\train_retrieval_cached.yaml --model-config configs\model.yaml --split val --forward --device cuda
+python scripts\check_retrieval_cache.py --config configs\data.yaml --train-config configs\train.yaml --model-config configs\model.yaml --split val --forward --device cuda
 ```
 
 Script này kiểm tra cache load được, batch có retrieval fields đúng shape, và model forward được với `use_retrieval=true`.
@@ -297,13 +301,13 @@ Script này kiểm tra cache load được, batch có retrieval fields đúng sh
 Smoke test 2 batch:
 
 ```powershell
-python src\training\train_core.py --config configs\train_retrieval_cached.yaml --data-config configs\data.yaml --model-config configs\model.yaml --baseline-mode current_self_history_ddi --seed 42 --smoke-test --epochs 1 --max-train-batches 2 --max-val-batches 2
+python src\training\train_core.py --config configs\train.yaml --data-config configs\data.yaml --model-config configs\model.yaml --baseline-mode current_self_history_ddi --seed 42 --smoke-test --epochs 1 --max-train-batches 2 --max-val-batches 2
 ```
 
 Train full:
 
 ```powershell
-python src\training\train_core.py --config configs\train_retrieval_cached.yaml --data-config configs\data.yaml --model-config configs\model.yaml --baseline-mode current_self_history_ddi --seed 42
+python src\training\train_core.py --config configs\train.yaml --data-config configs\data.yaml --model-config configs\model.yaml --baseline-mode current_self_history_ddi --seed 42
 ```
 
 Trong log mỗi epoch sẽ có thêm retrieval metrics:

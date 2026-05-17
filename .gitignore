@@ -34,5 +34,5 @@ Thumbs.db
 .gitattributes
 *.docx
 *.codex
-
+docs/
 .codex/

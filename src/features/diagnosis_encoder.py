@@ -160,7 +160,7 @@ class VisitCodeEncoder(nn.Module):
 
 
 class MaskedCodeEmbeddingPool(VisitCodeEncoder):
-    """Backward-compatible alias for code embedding pooling."""
+    """Kept for backward compatibility with older notebooks/scripts."""
 
 
 class DiagnosisEncoder(VisitCodeEncoder):

@@ -78,6 +78,8 @@ class TopKVisitRetriever(nn.Module):
 
     @property
     def retrieval_enabled(self) -> bool:
+        """Compatibility helper; retained for older retrieval/memory-bank workflows."""
+
         return self.memory_bank is not None and self.memory_bank.num_visits > 0
 
     def describe_leakage_policy(

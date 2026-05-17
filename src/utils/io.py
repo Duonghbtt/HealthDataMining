@@ -138,19 +138,6 @@ def fingerprint_payload(payload: Any, *, digest_size: int = 16) -> str:
     ).hexdigest()
 
 
-def fingerprint_path(path: str | Path) -> str:
-    source = Path(path)
-    if not source.exists():
-        raise FileNotFoundError(f"Cannot fingerprint missing path: {source}")
-    stat = source.stat()
-    payload = {
-        "path": str(source.resolve()),
-        "size": stat.st_size,
-        "mtime_ns": stat.st_mtime_ns,
-    }
-    return fingerprint_payload(payload)
-
-
 def write_jsonl_gz(path: str | Path, records: Iterable[Mapping[str, Any]]) -> Path:
     destination = Path(path)
     ensure_dir(destination.parent)

@@ -137,33 +137,6 @@ def read_lookup(
     return lookup
 
 
-def choose_stay_for_event(
-    stays: list[dict[str, object]],
-    event_time,
-) -> dict[str, object] | None:
-    if not stays:
-        return None
-    if len(stays) == 1 or event_time is None:
-        return stays[0]
-
-    containing: list[dict[str, object]] = []
-    for stay in stays:
-        if stay["intime_dt"] <= event_time <= stay["outtime_dt"]:
-            containing.append(stay)
-    if containing:
-        containing.sort(key=lambda item: item["intime_dt"])
-        return containing[0]
-
-    def distance_hours(stay: Mapping[str, object]) -> float:
-        start = stay["intime_dt"]
-        end = stay["outtime_dt"]
-        if event_time < start:
-            return (start - event_time).total_seconds() / 3600.0
-        return (event_time - end).total_seconds() / 3600.0
-
-    return min(stays, key=distance_hours)
-
-
 def coerce_event_time(row: Mapping[str, str], candidate_fields: Iterable[str]):
     for field in candidate_fields:
         value = row.get(field, "")

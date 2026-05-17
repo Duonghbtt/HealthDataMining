@@ -15,6 +15,8 @@ class NumericFeatureStats:
 
 
 class NumericFeatureProcessor:
+    """Kept for optional lab/vital pipeline support."""
+
     def __init__(
         self,
         feature_size: int,
@@ -100,7 +102,7 @@ class NumericFeatureProcessor:
 
 
 class LabProcessor(NumericFeatureProcessor):
-    pass
+    """Kept for optional lab/vital pipeline support."""
 
 
 class NumericFeatureEncoder(nn.Module):

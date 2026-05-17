@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from typing import Iterable, Mapping
+from typing import Mapping
 
 from src.features.diagnosis_encoder import VisitCodeEncoder
 from src.data.load_mimic import coerce_event_time
@@ -44,22 +44,15 @@ def extract_medication_token(row: Mapping[str, str]) -> str | None:
 
 
 def medication_event_time(table_name: str, row: Mapping[str, str]):
+    """Kept for optional medication-history pipeline support."""
+
     fields = MEDICATION_TIME_PRIORITY.get(table_name, ())
     return coerce_event_time(row, fields)
 
 
-def dedupe_preserve_order(values: Iterable[int]) -> list[int]:
-    seen: set[int] = set()
-    ordered: list[int] = []
-    for value in values:
-        if value in seen:
-            continue
-        seen.add(value)
-        ordered.append(value)
-    return ordered
-
-
 def build_cumulative_history(bucket_drug_ids: list[list[int]], max_history: int) -> list[list[int]]:
+    """Kept for optional medication-history pipeline support."""
+
     history: list[int] = []
     output: list[list[int]] = []
     for bucket_ids in bucket_drug_ids:
