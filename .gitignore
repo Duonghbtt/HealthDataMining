@@ -1,38 +1,38 @@
-# virtual env
+# env
 .venv/
 venv/
-env/
 
 # IDE
 .idea/
 .vscode/
 
-# Python cache
+# cache
 __pycache__/
 .pytest_cache/
 pytest-cache-files-*/
 *.pyc
-*.pyo
-*.pyd
-
-# Jupyter
-.ipynb_checkpoints/
 
 # data
-/data/
+data/
+data/raw/
+data/raw/drugbank/
+data/raw/drugbank/full database.xml
+data/interim/
+data/processed/
+handover_data/
 handover_data.tar.gz
+cach_dung.md
 
-# outputs / artifacts
+# outputs
 outputs/
 test_artifacts/
-
-# logs
-*.log
-
-# local secrets / env
-.env
-.env.*
 
 # system
 .DS_Store
 Thumbs.db
+
+.gitattributes
+*.docx
+*.codex
+
+.codex/
