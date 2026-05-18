@@ -491,10 +491,10 @@ Sau khi chạy `build_ddi_matrix`, mở `drug_ddi_report.json` và kiểm tra s�
 
 | Thành viên | Vai trò chính |
 |---|---|
-| Bùi Đức Đại | Data, feature engineering, Patient State Encoder |
-| Đỗ Mạnh Cường | Self-history selection, integration support |
-| Nguyễn Văn Phúc | Fusion, ablation, model integration |
-| Nguyễn Thế Dương | Decoder, training, evaluation, documentation |
+| Bùi Đức Đại | Dữ liệu, đặc trưng và Patient State Encoder |
+| Đỗ Mạnh Cường | Self-history selection và tích hợp lịch sử bệnh nhân |
+| Nguyễn Văn Phúc | Offline cached retrieval, fusion và tích hợp mô hình |
+| Nguyễn Thế Dương | Decoder, huấn luyện, đánh giá và tài liệu |
 
 ## Quy tắc sử dụng repo
 
