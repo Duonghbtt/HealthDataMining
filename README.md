@@ -47,8 +47,9 @@ Luồng mô hình core:
 diag_codes + proc_codes + lab_values + vital_values + med_history
   -> PatientStateEncoder
   -> SelfHistorySelector
-  -> Fusion
-  -> MedicationDecoder
+  -> Offline cached retrieval context
+  -> Fusion / gated fusion
+  -> MedicationDecoder + history/retrieval copy branch
   -> DDI-aware loss / safety evaluation
 ```
 
@@ -56,8 +57,9 @@ Các thành phần chính:
 
 - `PatientStateEncoder`: mã hóa trạng thái bệnh nhân theo từng visit.
 - `SelfHistorySelector`: chọn các visit quan trọng trong lịch sử của chính bệnh nhân.
-- `FusionModule`: hợp nhất trạng thái hiện tại và tóm tắt lịch sử.
-- `MedicationDecoder`: dự đoán xác suất cho từng thuốc trong vocabulary.
+- `src.retrieval`: nạp ngữ cảnh truy hồi đã được tính trước từ offline cache.
+- `FusionModule`: hợp nhất trạng thái hiện tại, tóm tắt lịch sử và retrieval context.
+- `MedicationDecoder`: dự đoán xác suất cho từng thuốc trong vocabulary, có hỗ trợ history/retrieval copy branch.
 - `ddi_regularization`: nạp ma trận DDI và hỗ trợ regularization/rerank an toàn.
 
 ## Cấu trúc thư mục
@@ -323,11 +325,12 @@ Nếu retrieval đã bật nhưng `fraction_with_context = 0`, cần dừng lạ
 
 ### Evaluate checkpoint retrieval
 
-Sau khi train xong:
+`train_core` tự gọi `evaluate_core` trên best checkpoint sau khi huấn luyện xong. Nếu cần chạy lại hoặc chạy thêm safety evaluation, dùng:
 
 ```powershell
 python src\evaluation\evaluate_core.py --config configs\eval.yaml --checkpoint outputs\checkpoints\train_core_best.pt --split test
 python src\evaluation\evaluate_safety.py --config configs\eval.yaml --checkpoint outputs\checkpoints\train_core_best.pt --split test
+python src\evaluation\evaluate_ablation.py --config configs\eval.yaml --checkpoint outputs\checkpoints\train_core_best.pt --split test
 ```
 
 Retrieval policy trong report cần thể hiện:
@@ -374,16 +377,16 @@ Các artifact quan trọng sau preprocessing:
 
 ## Huấn luyện
 
-Train mô hình core:
+Train chính hiện tại là bản retrieval cached trong `configs/train.yaml`. Nên dùng lệnh đầy đủ để khóa rõ data/model config, baseline mode và seed:
 
 ```powershell
-python -m src.training.train_core --config configs/train.yaml
+python src\training\train_core.py --config configs\train.yaml --data-config configs\data.yaml --model-config configs\model.yaml --baseline-mode current_self_history_ddi --seed 42
 ```
 
 Chạy smoke test ngắn để kiểm tra pipeline:
 
 ```powershell
-python -m src.training.train_core --config configs/train.yaml --smoke-test --device cpu
+python src\training\train_core.py --config configs\train.yaml --data-config configs\data.yaml --model-config configs\model.yaml --baseline-mode current_self_history_ddi --seed 42 --smoke-test --epochs 1 --max-train-batches 2 --max-val-batches 2
 ```
 
 Checkpoint và log được ghi vào:
@@ -392,6 +395,8 @@ Checkpoint và log được ghi vào:
 outputs/checkpoints/
 outputs/logs/
 ```
+
+`outputs/checkpoints/train_core_best.pt` là checkpoint tốt nhất theo validation monitor, không phải mặc định là epoch cuối. Sau khi train xong, `train_core` tự gọi `evaluate_core` trên checkpoint này và ghi report test vào `outputs/reports/`.
 
 Loss chính:
 
@@ -407,22 +412,24 @@ Trong đó:
 
 ## Đánh giá
 
+Nếu đã train bằng `train_core`, core evaluation trên test đã được chạy tự động sau train. Các lệnh dưới đây dùng để chạy lại evaluation hoặc chạy thêm phân tích bổ sung.
+
 Đánh giá core model:
 
 ```powershell
-python -m src.evaluation.evaluate_core --config configs/eval.yaml
+python src\evaluation\evaluate_core.py --config configs\eval.yaml --checkpoint outputs\checkpoints\train_core_best.pt --split test
 ```
 
 Đánh giá safety-aware decoding:
 
 ```powershell
-python -m src.evaluation.evaluate_safety --config configs/eval.yaml
+python src\evaluation\evaluate_safety.py --config configs\eval.yaml --checkpoint outputs\checkpoints\train_core_best.pt --split test
 ```
 
 Đánh giá ablation:
 
 ```powershell
-python -m src.evaluation.evaluate_ablation --config configs/eval.yaml
+python src\evaluation\evaluate_ablation.py --config configs\eval.yaml --checkpoint outputs\checkpoints\train_core_best.pt --split test
 ```
 
 Metric chính:
@@ -439,6 +446,17 @@ Báo cáo được ghi vào:
 outputs/reports/
 outputs/predictions/
 ```
+
+Các report thường dùng trong bản hiện tại:
+
+- `evaluate_core_test.json/csv`: metric chính trên test set.
+- `evaluate_core_test_threshold_comparison.json/csv`: so sánh threshold/top-k/percentile.
+- `evaluate_core_test_tradeoff_accuracy_safety.json/csv`: trade-off accuracy và DDI.
+- `evaluate_core_test_subgroup_metrics.json/csv`: phân tích first/short/long history.
+- `evaluate_safety_test.json/csv`: safety-aware decoding.
+- `evaluate_ablation_test.json/csv`: ablation theo thành phần.
+- `baseline_comparison.json/csv`: so sánh self-only và self-retrieval.
+- `retrieval_mode_comparison.json/csv`: so sánh các chế độ retrieval.
 
 ## Kiểm thử
 
@@ -489,12 +507,14 @@ Sau khi chạy `build_ddi_matrix`, mở `drug_ddi_report.json` và kiểm tra s�
 
 ## Thành viên nhóm
 
-| Thành viên | Vai trò chính |
-|---|---|
-| Bùi Đức Đại | Dữ liệu, đặc trưng và Patient State Encoder |
-| Đỗ Mạnh Cường | Self-history selection và tích hợp lịch sử bệnh nhân |
-| Nguyễn Văn Phúc | Offline cached retrieval, fusion và tích hợp mô hình |
-| Nguyễn Thế Dương | Decoder, huấn luyện, đánh giá và tài liệu |
+| Thành viên | Vai trò chính | Module/file chính |
+|---|---|---|
+| Bùi Đức Đại | Dữ liệu, đặc trưng và Patient State Encoder | `src/data/*`, `src/features/*`, `src/models/patient_state_encoder.py`, `configs/data.yaml` |
+| Đỗ Mạnh Cường | Self-history selection và phân tích lịch sử bệnh nhân | `src/models/history_selector.py` |
+| Nguyễn Văn Phúc | Offline cached retrieval, fusion và ablation | `src/retrieval/*`, `src/data/retrieval_cache.py`, `src/models/fusion.py`, `scripts/check_retrieval_cache.py` |
+| Nguyễn Thế Dương | Decoder, loss, training/evaluation pipeline và tài liệu chạy | `src/models/medication_decoder.py`, `src/training/*`, `src/evaluation/*`, `configs/train.yaml`, `configs/eval.yaml`, `README.md`, `docs/*` |
+
+Các file tích hợp chung như `src/models/full_model.py`, `src/training/runtime_builder.py` và `configs/model.yaml` cần phối hợp khi thay đổi giao diện giữa các module.
 
 ## Quy tắc sử dụng repo
 
