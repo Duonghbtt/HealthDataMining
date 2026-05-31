@@ -26,7 +26,7 @@ Bài toán được mô hình hóa dưới dạng multi-label medication recomme
 - Build ma trận DDI từ RxNorm, DrugBank Vocabulary và DDInter.
 - Tạo trajectory theo bệnh nhân, sau đó export sang dạng tensorized để train nhanh hơn.
 - Train mô hình core gồm Patient State Encoder, Self-History Selector, Fusion và Medication Decoder.
-- Đánh giá bằng Jaccard, F1, PRAUC, DDI Rate và các báo cáo safety.
+- Đánh giá bằng Jaccard, F1, PRAUC, DDI Rate, threshold trade-off và phân tích theo nhóm history.
 
 ## Kiến trúc tổng quan
 
@@ -50,7 +50,7 @@ diag_codes + proc_codes + lab_values + vital_values + med_history
   -> Offline cached retrieval context
   -> Fusion / gated fusion
   -> MedicationDecoder + history/retrieval copy branch
-  -> DDI-aware loss / safety evaluation
+  -> DDI-aware loss / DDI metrics
 ```
 
 Các thành phần chính:
@@ -196,7 +196,7 @@ Các file cấu hình chính:
 - `configs/data.yaml`: đường dẫn dữ liệu, Spark, split train/val/test và tham số feature.
 - `configs/model.yaml`: encoder, selector, fusion, decoder và chế độ core.
 - `configs/train.yaml`: batch size, epoch, optimizer, DDI loss schedule và output checkpoint/log.
-- `configs/eval.yaml`: split đánh giá, checkpoint, threshold search, safety decoding và report.
+- `configs/eval.yaml`: split đánh giá, checkpoint, threshold search, DDI trade-off và report.
 
 Khi chạy CPU, có thể ghi đè trực tiếp:
 
@@ -439,8 +439,8 @@ Các report thường dùng trong bản hiện tại:
 - `evaluate_core_test_threshold_comparison.json/csv`: so sánh threshold/top-k/percentile.
 - `evaluate_core_test_tradeoff_accuracy_safety.json/csv`: trade-off accuracy và DDI.
 - `evaluate_core_test_subgroup_metrics.json/csv`: phân tích first/short/long history.
-- `baseline_comparison.json/csv`: so sánh self-only và self-retrieval.
-- `retrieval_mode_comparison.json/csv`: so sánh các chế độ retrieval.
+- `evaluate_core_test_best_threshold_config.json`: threshold tốt nhất được chọn.
+- `evaluate_core_test_retrieval_policy.json`: chính sách retrieval/cache và leakage policy khi evaluate.
 
 ## Kiểm thử
 
@@ -495,7 +495,7 @@ Sau khi chạy `build_ddi_matrix`, mở `drug_ddi_report.json` và kiểm tra s�
 |---|---|---|
 | Bùi Đức Đại | Dữ liệu, đặc trưng và Patient State Encoder | `src/data/*`, `src/features/*`, `src/models/patient_state_encoder.py`, `configs/data.yaml` |
 | Đỗ Mạnh Cường | Self-history selection và phân tích lịch sử bệnh nhân | `src/models/history_selector.py` |
-| Nguyễn Văn Phúc | Offline cached retrieval, fusion và ablation | `src/retrieval/*`, `src/data/retrieval_cache.py`, `src/models/fusion.py`, `scripts/check_retrieval_cache.py` |
+| Nguyễn Văn Phúc | Offline cached retrieval và fusion | `src/retrieval/*`, `src/data/retrieval_cache.py`, `src/models/fusion.py`, `scripts/check_retrieval_cache.py` |
 | Nguyễn Thế Dương | Decoder, loss, training/evaluation pipeline và tài liệu chạy | `src/models/medication_decoder.py`, `src/training/*`, `src/evaluation/*`, `configs/train.yaml`, `configs/eval.yaml`, `README.md`, `docs/*` |
 
 Các file tích hợp chung như `src/models/full_model.py`, `src/training/runtime_builder.py` và `configs/model.yaml` cần phối hợp khi thay đổi giao diện giữa các module.
