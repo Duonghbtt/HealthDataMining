@@ -38,7 +38,7 @@ MIMIC-IV tables
   -> build_trajectories
   -> export_tensorized_trajectories
   -> train_core
-  -> evaluate_core / evaluate_safety / evaluate_ablation
+  -> evaluate_core
 ```
 
 Luồng mô hình core:
@@ -325,12 +325,10 @@ Nếu retrieval đã bật nhưng `fraction_with_context = 0`, cần dừng lạ
 
 ### Evaluate checkpoint retrieval
 
-`train_core` tự gọi `evaluate_core` trên best checkpoint sau khi huấn luyện xong. Nếu cần chạy lại hoặc chạy thêm safety evaluation, dùng:
+`train_core` tự gọi `evaluate_core` trên best checkpoint sau khi huấn luyện xong. Nếu cần chạy lại evaluation, dùng:
 
 ```powershell
 python src\evaluation\evaluate_core.py --config configs\eval.yaml --checkpoint outputs\checkpoints\train_core_best.pt --split test
-python src\evaluation\evaluate_safety.py --config configs\eval.yaml --checkpoint outputs\checkpoints\train_core_best.pt --split test
-python src\evaluation\evaluate_ablation.py --config configs\eval.yaml --checkpoint outputs\checkpoints\train_core_best.pt --split test
 ```
 
 Retrieval policy trong report cần thể hiện:
@@ -420,18 +418,6 @@ Nếu đã train bằng `train_core`, core evaluation trên test đã được c
 python src\evaluation\evaluate_core.py --config configs\eval.yaml --checkpoint outputs\checkpoints\train_core_best.pt --split test
 ```
 
-Đánh giá safety-aware decoding:
-
-```powershell
-python src\evaluation\evaluate_safety.py --config configs\eval.yaml --checkpoint outputs\checkpoints\train_core_best.pt --split test
-```
-
-Đánh giá ablation:
-
-```powershell
-python src\evaluation\evaluate_ablation.py --config configs\eval.yaml --checkpoint outputs\checkpoints\train_core_best.pt --split test
-```
-
 Metric chính:
 
 - Jaccard
@@ -453,8 +439,6 @@ Các report thường dùng trong bản hiện tại:
 - `evaluate_core_test_threshold_comparison.json/csv`: so sánh threshold/top-k/percentile.
 - `evaluate_core_test_tradeoff_accuracy_safety.json/csv`: trade-off accuracy và DDI.
 - `evaluate_core_test_subgroup_metrics.json/csv`: phân tích first/short/long history.
-- `evaluate_safety_test.json/csv`: safety-aware decoding.
-- `evaluate_ablation_test.json/csv`: ablation theo thành phần.
 - `baseline_comparison.json/csv`: so sánh self-only và self-retrieval.
 - `retrieval_mode_comparison.json/csv`: so sánh các chế độ retrieval.
 
