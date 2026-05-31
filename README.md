@@ -76,7 +76,6 @@ HealthDataMining/
 |   |-- interim/
 |   |-- processed/
 |   `-- artifacts/
-|-- notebooks/
 |-- outputs/
 |   |-- checkpoints/
 |   |-- logs/
@@ -102,7 +101,7 @@ HealthDataMining/
 Ghi chú:
 
 - `src/retrieval/` là đường train mặc định hiện tại qua offline cached retrieval trong `configs/train.yaml`.
-- Một số notebook cũ như temporal similarity hoặc hypergraph có thể dùng cho thử nghiệm, không phải đường chính của pipeline core.
+- Repo hiện không có app/demo UI riêng; các entrypoint chính là CLI trong `scripts/`, `src/training/train_core.py` và `src/evaluation/evaluate_core.py`.
 - `data/` và `outputs/` được ignore trong git để tránh commit dữ liệu MIMIC-IV, checkpoint lớn và artifact sinh ra khi chạy.
 
 ## Dữ liệu cần chuẩn bị
@@ -504,7 +503,7 @@ Các file tích hợp chung như `src/models/full_model.py`, `src/training/runti
 
 - Không commit dữ liệu gốc MIMIC-IV.
 - Không commit checkpoint lớn, log tạm, cache hoặc file nhạy cảm.
-- Giữ logic chính trong `src/` và `scripts/`; notebook chỉ nên dùng để phân tích hoặc thử nghiệm.
+- Giữ logic chính trong `src/` và `scripts/`; các thử nghiệm phụ chỉ nên thêm khi thật sự cần và có tài liệu đi kèm.
 - Khi mở rộng mô hình, ưu tiên giữ pipeline core ổn định trước rồi mới thêm retrieval, graph hoặc hypergraph.
 
 ## Trích dẫn và miễn trừ trách nhiệm

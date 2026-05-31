@@ -29,12 +29,6 @@ evaluation:
   split: test
   save_predictions: true
   save_reports: true
-  compare_retrieval_modes: false
-  retrieval_modes:
-    - self_only
-    - retrieval_only
-  safety_report: true
-  save_curve_data: true
   subgroup_analysis: true
 
 threshold_search:
@@ -68,36 +62,6 @@ threshold_search:
 report:
   save_threshold_comparison: true
   save_tradeoff_curve_data: true
-
-safety_decoding:
-  enabled: true
-  mode: soft_constrained_rerank
-  threshold: 0.30
-  top_m: 20
-  min_drugs: 1
-  max_drugs: null
-  target_avg_drugs: null
-  alpha_utility: 1.0
-  beta_ddi: 0.35
-  gamma_size: 0.10
-  search_thresholds:
-    - 0.25
-    - 0.30
-    - 0.35
-    - 0.40
-  search_topk_values:
-    - 5
-    - 10
-    - 15
-  search_beta_values:
-    - 0.20
-    - 0.35
-    - 0.50
-    - 0.75
-  selection_metric: jaccard
-  selection_strategy: maximize_metric_under_ddi_constraint
-  max_ddi_rate: null
-  utility_floor_relative_to_baseline: 0.98
 
 calibration:
   enabled: false

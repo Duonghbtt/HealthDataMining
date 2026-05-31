@@ -73,11 +73,6 @@ def parse_args() -> argparse.Namespace:
         help="Run a short evaluation path with limited batches for integration checking",
     )
     parser.add_argument("--max-eval-batches", type=int, default=None, help="Optional cap for evaluation batches")
-    parser.add_argument(
-        "--compare-retrieval-modes",
-        action="store_true",
-        help="Evaluate self_only, retrieval_only, and self_retrieval in one run",
-    )
     return parser.parse_args()
 
 
@@ -739,47 +734,6 @@ def _print_subgroup_metrics(subgroup_metrics: Mapping[str, Mapping[str, Any]]) -
         )
 
 
-def _update_baseline_comparison_report(
-    *,
-    report_dir: Path,
-    baseline_row: Mapping[str, Any],
-) -> dict[str, str]:
-    json_path = report_dir / "baseline_comparison.json"
-    csv_path = report_dir / "baseline_comparison.csv"
-
-    rows: list[dict[str, Any]] = []
-    if json_path.exists():
-        existing_rows = read_json(json_path)
-        if isinstance(existing_rows, list):
-            rows = [dict(row) for row in existing_rows]
-
-    updated = False
-    identity = (
-        str(baseline_row.get("baseline_mode", "")),
-        str(baseline_row.get("split", "")),
-        str(baseline_row.get("history_mode", "")),
-    )
-    for row_index, row in enumerate(rows):
-        row_identity = (
-            str(row.get("baseline_mode", "")),
-            str(row.get("split", "")),
-            str(row.get("history_mode", "")),
-        )
-        if row_identity == identity:
-            rows[row_index] = dict(baseline_row)
-            updated = True
-            break
-    if not updated:
-        rows.append(dict(baseline_row))
-
-    write_json(json_path, rows)
-    _write_plain_csv(csv_path, rows)
-    return {
-        "baseline_comparison_json": str(json_path),
-        "baseline_comparison_csv": str(csv_path),
-    }
-
-
 def run_core_evaluation(
     *,
     model: torch.nn.Module,
@@ -885,7 +839,6 @@ def evaluate_checkpoint(
     max_eval_batches: int | None = None,
     eval_config_override: Mapping[str, Any] | None = None,
     model_config_override: Mapping[str, Any] | None = None,
-    update_baseline_comparison: bool = True,
     report_stem_override: str | None = None,
 ) -> dict[str, Any]:
     eval_config = _merge_nested_dicts(load_yaml_config(eval_config_path), eval_config_override)
@@ -1212,163 +1165,11 @@ def evaluate_checkpoint(
         )
         report["artifacts"]["predictions_csv"] = str(prediction_csv_path)
 
-    baseline_row = {
-        "baseline_mode": report["baseline_mode"],
-        "split": report["split"],
-        "history_mode": report["history_mode"],
-        "use_retrieval": report["use_retrieval"],
-        "threshold": report["threshold"],
-        "top_k": report["top_k"],
-        "percentile": report["percentile"],
-        "selection_method": report["selection_method"],
-        "selection_value": report["selection_value"],
-        "checkpoint_path": report["checkpoint_path"],
-        "jaccard": float(report["metrics"]["jaccard"]),
-        "f1": float(report["metrics"]["f1"]),
-        "prauc": float(report["metrics"]["prauc"]),
-        "ddi_rate": float(report["metrics"]["ddi_rate"]),
-        "avg_predicted_drugs": float(report["metrics"]["avg_predicted_drugs"]),
-        "avg_true_drugs": float(report["metrics"]["avg_true_drugs"]),
-        "avg_valid_candidates": float(report["retrieval_summary"]["avg_valid_candidates"]),
-        "avg_retrieved_score": float(report["retrieval_summary"]["avg_retrieved_score"]),
-    }
-    if update_baseline_comparison:
-        report["artifacts"].update(
-            _update_baseline_comparison_report(
-                report_dir=resolved_paths["report_dir"],
-                baseline_row=baseline_row,
-            )
-        )
     if save_reports:
         write_json(resolved_paths["report_dir"] / f"{report_stem}.json", report)
 
     print(json.dumps(report, ensure_ascii=True, indent=2, sort_keys=True))
     return report
-
-
-def _model_config_for_retrieval_mode(
-    model_config: Mapping[str, Any],
-    mode: str,
-) -> dict[str, Any]:
-    resolved_mode = str(mode).strip().lower()
-    if resolved_mode not in {"self_only", "retrieval_only", "self_retrieval"}:
-        raise ValueError(f"Unsupported retrieval comparison mode: {mode!r}")
-    updated = copy.deepcopy(dict(model_config))
-    updated.setdefault("full_model", {})
-    updated["full_model"]["history_mode"] = resolved_mode
-    updated.setdefault("retrieval", {})
-    if resolved_mode in {"retrieval_only", "self_retrieval"}:
-        updated["retrieval"]["enabled"] = True
-    elif "enabled" not in updated["retrieval"]:
-        updated["retrieval"]["enabled"] = False
-    return updated
-
-
-def compare_retrieval_modes(
-    *,
-    checkpoint_path: str | Path,
-    eval_config_path: str | Path = "configs/eval.yaml",
-    split: str | None = None,
-    threshold: float | None = None,
-    device: torch.device | str | None = None,
-    data_config_path: str | None = None,
-    model_config_path: str | None = None,
-    train_config_path: str | None = None,
-    processed_root: str | None = None,
-    vocab_root: str | None = None,
-    ddi_matrix_path: str | None = None,
-    max_eval_batches: int | None = None,
-) -> dict[str, Any]:
-    eval_config = load_yaml_config(eval_config_path)
-    project_root = Path(eval_config["_project_root"]).resolve()
-    checkpoint_path = Path(checkpoint_path).resolve()
-    checkpoint_payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    config_refs = dict(eval_config.get("config_refs", {}))
-    base_model_config = _load_embedded_or_yaml_config(
-        explicit_path=model_config_path,
-        embedded_payload=checkpoint_payload.get("model_config"),
-        fallback_path=resolve_path(project_root, config_refs.get("model", "configs/model.yaml")),
-    )
-    retrieval_modes = [
-        str(value).strip().lower()
-        for value in eval_config.get("evaluation", {}).get(
-            "retrieval_modes",
-            ["self_only", "retrieval_only", "self_retrieval"],
-        )
-    ]
-    resolved_split = str(split or eval_config.get("evaluation", {}).get("split", "test"))
-    comparison_rows: list[dict[str, Any]] = []
-    per_mode_reports: list[dict[str, Any]] = []
-    for mode in retrieval_modes:
-        try:
-            mode_report = evaluate_checkpoint(
-                checkpoint_path=checkpoint_path,
-                eval_config_path=eval_config_path,
-                split=resolved_split,
-                threshold=threshold,
-                device=device,
-                data_config_path=data_config_path,
-                model_config_path=model_config_path,
-                train_config_path=train_config_path,
-                processed_root=processed_root,
-                vocab_root=vocab_root,
-                ddi_matrix_path=ddi_matrix_path,
-                max_eval_batches=max_eval_batches,
-                model_config_override=_model_config_for_retrieval_mode(base_model_config, mode),
-                update_baseline_comparison=False,
-                report_stem_override=f"evaluate_core_{resolved_split}_{mode}",
-            )
-        except RuntimeError as exc:
-            raise RuntimeError(
-                f"Failed to evaluate retrieval comparison mode `{mode}`. "
-                "This usually means the checkpoint was saved without the retrieval branch "
-                "parameters required for retrieval-aware ablations."
-            ) from exc
-        per_mode_reports.append(
-            {
-                "mode": mode,
-                "report_path": mode_report.get("artifacts", {}).get("json"),
-                "retrieval_policy": mode_report.get("retrieval_policy", {}),
-            }
-        )
-        comparison_rows.append(
-            {
-                "mode": mode,
-                "split": mode_report["split"],
-                "selection_method": mode_report["selection_method"],
-                "selection_value": mode_report["selection_value"],
-                "threshold": mode_report["threshold"],
-                "jaccard": float(mode_report["metrics"]["jaccard"]),
-                "f1": float(mode_report["metrics"]["f1"]),
-                "prauc": float(mode_report["metrics"]["prauc"]),
-                "ddi_rate": float(mode_report["metrics"]["ddi_rate"]),
-                "avg_drugs": float(mode_report["metrics"]["avg_predicted_drugs"]),
-                "avg_true_drugs": float(mode_report["metrics"]["avg_true_drugs"]),
-                "avg_valid_candidates": float(mode_report["retrieval_summary"]["avg_valid_candidates"]),
-                "avg_retrieved_score": float(mode_report["retrieval_summary"]["avg_retrieved_score"]),
-                "fraction_with_retrieval_context": float(
-                    mode_report["retrieval_summary"].get("fraction_with_retrieval_context", 0.0)
-                ),
-            }
-        )
-
-    report_dir = ensure_dir(
-        resolve_path(project_root, eval_config.get("paths", {}).get("report_dir", "outputs/reports")).resolve()
-    )
-    comparison_json_path = write_json(report_dir / "retrieval_mode_comparison.json", comparison_rows)
-    comparison_csv_path = _write_plain_csv(report_dir / "retrieval_mode_comparison.csv", comparison_rows)
-    payload = {
-        "checkpoint_path": str(checkpoint_path),
-        "split": resolved_split,
-        "comparison_rows": comparison_rows,
-        "per_mode_reports": per_mode_reports,
-        "artifacts": {
-            "retrieval_mode_comparison_json": str(comparison_json_path),
-            "retrieval_mode_comparison_csv": str(comparison_csv_path),
-        },
-    }
-    print(json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True))
-    return payload
 
 
 def main() -> None:
@@ -1385,26 +1186,6 @@ def main() -> None:
     )
     if smoke_test and max_eval_batches is None:
         max_eval_batches = 2
-
-    compare_retrieval_modes_flag = bool(
-        args.compare_retrieval_modes or eval_config.get("evaluation", {}).get("compare_retrieval_modes", False)
-    )
-    if compare_retrieval_modes_flag:
-        compare_retrieval_modes(
-            checkpoint_path=checkpoint_path,
-            eval_config_path=args.config,
-            split=args.split,
-            threshold=args.threshold,
-            device=args.device,
-            data_config_path=args.data_config,
-            model_config_path=args.model_config,
-            train_config_path=args.train_config,
-            processed_root=args.processed_root,
-            vocab_root=args.vocab_root,
-            ddi_matrix_path=args.ddi_matrix_path,
-            max_eval_batches=max_eval_batches,
-        )
-        return
 
     evaluate_checkpoint(
         checkpoint_path=checkpoint_path,
